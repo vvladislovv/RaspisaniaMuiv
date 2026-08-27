@@ -4,7 +4,6 @@
  */
 import { checkCronSecret } from '@/lib/auth';
 import { deleteWebhook, getWebhookInfo, setWebhook } from '@/lib/telegram';
-import { env } from '@/lib/env';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -26,8 +25,11 @@ export async function GET(request: Request): Promise<Response> {
     return Response.json({ ok: true, deleted: true });
   }
 
-  const base = env.publicBaseUrl ?? `${url.protocol}//${url.host}`;
-  const webhookUrl = `${base}/api/bot`;
+  // Вебхук должен смотреть на стабильный домен, а не на адрес конкретного
+  // деплоя: иначе после следующего деплоя бот продолжит отвечать старым кодом.
+  // Поэтому берём адрес, по которому вызвали setup, а VERCEL_URL не используем.
+  const base = process.env.PUBLIC_BASE_URL?.trim() || `${url.protocol}//${url.host}`;
+  const webhookUrl = `${base.replace(/\/$/, '')}/api/bot`;
   await setWebhook(webhookUrl);
 
   return Response.json({ ok: true, webhook: webhookUrl, info: await getWebhookInfo() });

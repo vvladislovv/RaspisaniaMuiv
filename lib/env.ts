@@ -48,7 +48,12 @@ export const env = {
     }
     return hour;
   },
+  /**
+   * Стабильный публичный адрес деплоя. Специально без запасного варианта на
+   * VERCEL_URL: тот указывает на конкретный деплой, а вебхук должен смотреть
+   * на постоянный домен.
+   */
   get publicBaseUrl() {
-    return optional('PUBLIC_BASE_URL') ?? (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null);
+    return optional('PUBLIC_BASE_URL');
   },
 };
