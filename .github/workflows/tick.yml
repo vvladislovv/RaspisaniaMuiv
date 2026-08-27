@@ -1,0 +1,45 @@
+# Часовой триггер проверки расписания.
+#
+# Vercel Cron на бесплатном тарифе запускается раз в сутки — этого хватает для
+# рассылки, но не для проверки обновлений. Здесь ежечасный запрос к /api/tick.
+# Cron у GitHub Actions опаздывает на 5–20 минут, поэтому рассылка в приложении
+# срабатывает «не раньше 16:00 МСК», а не «ровно в 16:00».
+name: tick
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: tick
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Дёрнуть /api/tick
+        env:
+          TICK_URL: ${{ secrets.TICK_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -z "$TICK_URL" ] || [ -z "$CRON_SECRET" ]; then
+            echo "Не заданы секреты TICK_URL и CRON_SECRET"
+            exit 1
+          fi
+
+          code=$(curl -sS -o response.json -w '%{http_code}' \
+            --max-time 120 --retry 2 --retry-delay 10 \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            "$TICK_URL")
+
+          echo "HTTP $code"
+          cat response.json
+          echo
+
+          if [ "$code" != "200" ]; then
+            echo "Тик завершился ошибкой"
+            exit 1
+          fi

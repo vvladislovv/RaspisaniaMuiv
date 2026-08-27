@@ -246,7 +246,9 @@ export async function tick(force = false): Promise<TickResult> {
       await log('skip', 'Суббота — автоотправку не делаем');
       return out;
     }
-    if (hour !== env.sendHourMsk) {
+    // «Не раньше», а не «ровно в»: если тик в нужный час пропал (крон опоздал,
+    // Vercel был недоступен), рассылка уйдёт на следующем тике, а не потеряется.
+    if (hour < env.sendHourMsk) {
       out.autoSend = 'skipped-hour';
       return out;
     }

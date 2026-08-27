@@ -165,36 +165,27 @@ curl -H "Authorization: Bearer ТВОЙ_CRON_SECRET" https://ТВОЙ-ДОМЕН
 ### 6. Часовой крон
 
 Vercel на бесплатном тарифе запускает cron **раз в сутки** — этого хватает для рассылки
-(она уже настроена в [`vercel.json`](vercel.json) на 13:00 UTC = 16:00 МСК), но не для
-часовой проверки обновлений. Поэтому часовой триггер — внешний:
+(она настроена в [`vercel.json`](vercel.json) на 13:00 UTC = 16:00 МСК), но не для часовой
+проверки обновлений. Часовой триггер сделан на GitHub Actions —
+[`.github/workflows/tick.yml`](.github/workflows/tick.yml), сторонние сервисы не нужны.
 
-1. [cron-job.org](https://cron-job.org) → регистрация → **Create cronjob**
-2. URL: `https://ТВОЙ-ДОМЕН.vercel.app/api/tick`
-3. Schedule: **Every hour at minute 0**
-4. **Advanced → Headers**: `Authorization: Bearer ТВОЙ_CRON_SECRET`
-5. Save
+Задай два секрета репозитория (Settings → Secrets and variables → Actions), или командой:
 
-Альтернатива без сторонних сервисов — GitHub Actions:
-
-```yaml
-# .github/workflows/tick.yml
-name: tick
-on:
-  schedule:
-    - cron: '0 * * * *'
-  workflow_dispatch:
-jobs:
-  tick:
-    runs-on: ubuntu-latest
-    steps:
-      - run: |
-          curl -fsS -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
-            "${{ secrets.TICK_URL }}"
+```bash
+gh secret set CRON_SECRET --repo <владелец>/<репо>
+gh secret set TICK_URL --repo <владелец>/<репо>   # https://<домен>/api/tick
 ```
 
-GitHub Actions бесплатны, но их cron опаздывает на 5–20 минут и отключается,
-если в репозитории 60 дней нет активности. Для рассылки в 16:00 это приемлемо,
-но cron-job.org точнее.
+Проверить вручную: вкладка Actions → tick → Run workflow.
+
+Cron у GitHub Actions опаздывает на 5–20 минут и отключается, если в репозитории 60 дней
+нет активности. Поэтому рассылка в коде срабатывает **не раньше** 16:00 МСК, а не ровно в
+16:00: если тик в нужный час пропал, расписание уйдёт на следующем тике, а не потеряется.
+Отправка за день всё равно одна — она помечается в `app_state`.
+
+Если захочется точный крон без этих оговорок — подойдёт [cron-job.org](https://cron-job.org):
+URL `https://<домен>/api/tick`, расписание «каждый час в минуту 0», заголовок
+`Authorization: Bearer <CRON_SECRET>`.
 
 ### 7. Подключение группы
 
