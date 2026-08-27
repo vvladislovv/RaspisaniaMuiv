@@ -137,6 +137,9 @@ export interface ChatMember {
   status: 'creator' | 'administrator' | 'member' | 'restricted' | 'left' | 'kicked';
 }
 
+/** Служебный аккаунт, от имени которого пишут анонимные админы супергрупп. */
+export const GROUP_ANONYMOUS_BOT_ID = 1087968824;
+
 export function getChatMember(chatId: number, userId: number): Promise<ChatMember> {
   return call<ChatMember>('getChatMember', { chat_id: chatId, user_id: userId }, { retries: 1 });
 }
@@ -145,7 +148,9 @@ export function setWebhook(url: string): Promise<unknown> {
   return call('setWebhook', {
     url,
     secret_token: env.webhookSecret,
-    allowed_updates: ['message', 'callback_query'],
+    // my_chat_member нужен, чтобы поймать момент добавления бота в группу
+    // и сразу показать меню — иначе в группе не с чего начать.
+    allowed_updates: ['message', 'callback_query', 'my_chat_member'],
     drop_pending_updates: true,
   });
 }
@@ -173,6 +178,9 @@ export async function isChatAdmin(chatId: number, userId: number): Promise<boole
   if (userId === env.adminTelegramId) return true;
   // В личке любой пользователь — «админ» своего чата
   if (chatId === userId) return true;
+  // Анонимный админ супергруппы приходит от служебного GroupAnonymousBot,
+  // а от его имени может действовать только админ
+  if (userId === GROUP_ANONYMOUS_BOT_ID) return true;
   try {
     const member = await getChatMember(chatId, userId);
     return member.status === 'creator' || member.status === 'administrator';

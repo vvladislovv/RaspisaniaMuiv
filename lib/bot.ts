@@ -51,9 +51,17 @@ interface TgCallbackQuery {
   message?: TgMessage;
 }
 
+interface TgChatMemberUpdate {
+  chat: TgChat;
+  from: TgUser;
+  new_chat_member: { status: string };
+}
+
 export interface TgUpdate {
   message?: TgMessage;
   callback_query?: TgCallbackQuery;
+  /** Бота добавили в чат или удалили из него. */
+  my_chat_member?: TgChatMemberUpdate;
 }
 
 /** Один экран: текст сообщения и кнопки под ним. */
@@ -391,11 +399,68 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
   await answerCallbackQuery(query.id);
 }
 
+// ─── Бота добавили или удалили ───────────────────────────────────────────────
+
+const PRESENT = new Set(['member', 'administrator', 'creator', 'restricted']);
+
+/**
+ * Реакция на добавление бота в чат: сразу показываем меню.
+ *
+ * Без этого в группе не с чего начать — бот с включённым режимом приватности
+ * ничего не показывает, и нужно знать, что надо вручную написать /start.
+ */
+async function handleMembership(event: TgChatMemberUpdate): Promise<void> {
+  const chatId = event.chat.id;
+  const status = event.new_chat_member.status;
+
+  // Бота убрали из чата — выключаем автоотправку, чтобы не биться об ошибки
+  if (!PRESENT.has(status)) {
+    const known = await getChat(chatId);
+    if (known) {
+      await setChatEnabled(chatId, false);
+      await log('skip', `Бота убрали из чата ${chatId}, автоотправка выключена`, { chatId });
+    }
+    return;
+  }
+
+  const chat = await getChat(chatId);
+  const isOwner = event.from.id === env.adminTelegramId;
+
+  // Подключить новый чат может только владелец бота
+  if (!chat && !isOwner) {
+    await log('skip', `Бота добавили в неразрешённый чат ${chatId}`, {
+      chatId,
+      details: { addedBy: event.from.id, title: event.chat.title },
+    });
+    return;
+  }
+
+  await upsertChat(chatId, event.chat.title ?? null);
+  if (!chat) await setChatEnabled(chatId, true);
+
+  await log('command', `Бота добавили в чат ${chatId}`, {
+    chatId,
+    details: { title: event.chat.title },
+  });
+
+  const screen = menuScreen(await getChat(chatId));
+
+  // В группе напоминаем про право закреплять — без него ежедневное
+  // расписание отправится, но не закрепится
+  const hint =
+    event.chat.type === 'private'
+      ? ''
+      : '\n\n_Чтобы я мог закреплять расписание, дай мне право «Закреплять сообщения»\\._';
+
+  await sendMessage(chatId, screen.text + hint, { silent: true, keyboard: screen.keyboard });
+}
+
 /** Точка входа для вебхука. Никогда не бросает — Telegram не должен ретраить. */
 export async function handleUpdate(update: TgUpdate): Promise<void> {
   try {
     if (update.message) await handleMessage(update.message);
     else if (update.callback_query) await handleCallback(update.callback_query);
+    else if (update.my_chat_member) await handleMembership(update.my_chat_member);
   } catch (error) {
     await logError('Обработка апдейта Telegram', error, {
       update: JSON.stringify(update).slice(0, 1000),

@@ -85,6 +85,17 @@ function message(text: string, from = OWNER, chatId = CHAT): TgUpdate {
   };
 }
 
+/** Событие «бота добавили в чат» или «убрали из чата». */
+function membership(status: string, from = OWNER, chatId = CHAT, type = 'supergroup'): TgUpdate {
+  return {
+    my_chat_member: {
+      chat: { id: chatId, type, title: 'Тестовая группа' },
+      from: { id: from },
+      new_chat_member: { status },
+    },
+  };
+}
+
 function button(data: string, from = OWNER, chatId = CHAT): TgUpdate {
   return {
     callback_query: {
@@ -142,12 +153,47 @@ await handleUpdate(message('/start', STRANGER, -999));
 ok(sent(since(m)).length === 0, 'бот молчит в неизвестном чате');
 
 m = mark();
-await handleUpdate(message('/start', STRANGER));
-ok(sent(since(m)).length === 0, 'обычный участник не подключает чат');
+await handleUpdate(message('/start', STRANGER, -997));
+ok(sent(since(m)).length === 0, 'обычный участник не подключает новый чат');
 
 m = mark();
-await handleUpdate(message('/start', GROUP_ADMIN));
+await handleUpdate(message('/start', GROUP_ADMIN, -996));
 ok(sent(since(m)).length === 0, 'админ группы, но не владелец бота, тоже не подключает');
+
+// ─── Добавление в группу ─────────────────────────────────────────────────────
+
+head('Бота добавили в группу');
+m = mark();
+await handleUpdate(membership('member', STRANGER, -998));
+ok(sent(since(m)).length === 0, 'посторонний не подключает чат добавлением бота');
+
+m = mark();
+await handleUpdate(membership('member', OWNER));
+let added = since(m);
+ok(sent(added).length === 1, 'меню появляется само, без команд');
+ok(texts(added).join('').includes('Расписание колледжа МУИВ'), 'это меню');
+ok(texts(added).join('').includes('Закреплять сообщения'), 'напоминание про право закрепления');
+ok(keyboardOf(added).length > 0, 'под меню есть кнопки');
+ok((await getChat(CHAT))?.enabled === true, 'чат подключён и включён');
+
+// В личке напоминание про закрепление не нужно
+await resetChat();
+m = mark();
+await handleUpdate(membership('member', OWNER, OWNER, 'private'));
+ok(!texts(since(m)).join('').includes('Закреплять сообщения'), 'в личке про закрепление молчим');
+
+// Бота выгнали — автоотправка должна выключиться
+await resetChat();
+await handleUpdate(membership('member', OWNER));
+m = mark();
+await handleUpdate(membership('kicked', OWNER));
+ok((await getChat(CHAT))?.enabled === false, 'после удаления бота автоотправка выключена');
+ok(sent(since(m)).length === 0, 'при удалении бот ничего не пишет');
+
+// Возвращаем чат в рабочее состояние для остальных проверок
+await resetChat();
+await resetRateLimit();
+await handleUpdate(membership('member', OWNER));
 
 // ─── Команд больше нет ───────────────────────────────────────────────────────
 
@@ -176,7 +222,12 @@ ok(texts(menu).join('').includes('Расписание колледжа МУИВ
 let buttons = keyboardOf(menu);
 ok(!!find(buttons, 'Выбрать группу'), 'без группы предлагается её выбрать');
 ok(!find(buttons, 'Завтра'), 'без группы расписание не предлагается');
-ok((await getChat(CHAT))?.enabled === true, 'владелец подключил чат');
+ok((await getChat(CHAT))?.enabled === true, 'чат включён');
+
+// Обычный участник в подключённом чате тоже должен видеть меню
+m = mark();
+await handleUpdate(message('/start', STRANGER));
+ok(sent(since(m)).length === 1, 'участник подключённого чата получает меню');
 
 // ─── Выбор группы кнопками ───────────────────────────────────────────────────
 
