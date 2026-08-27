@@ -85,6 +85,15 @@ function button(data: string, from = OWNER, chatId = CHAT): TgUpdate {
   };
 }
 
+/** Убирает следы прошлого прогона, чтобы тест можно было запускать повторно. */
+async function resetChat(): Promise<void> {
+  const base = process.env.SUPABASE_URL!;
+  await fetch(`${base}/rest/v1/chats?chat_id=eq.${CHAT}`, {
+    method: 'DELETE',
+    headers: { apikey: 'fake', Authorization: 'Bearer fake' },
+  });
+}
+
 /** Обнуляет счётчик частоты — иначе тест сам упирается в собственный лимит. */
 async function resetRateLimit(): Promise<void> {
   const base = process.env.SUPABASE_URL!;
@@ -100,6 +109,8 @@ const texts = (list: Call[]) => sent(list).map((c) => String(c.body.text));
 // ─── Наполняем базу настоящим расписанием ────────────────────────────────────
 
 head('Подготовка: загрузка расписания с сайта');
+await resetChat();
+await resetRateLimit();
 const first = await tick(false);
 ok(first.check !== null && first.check.errors.length === 0, 'сайт проверен без ошибок');
 const groups = await listGroups();
@@ -205,21 +216,49 @@ ok(texts(since(m)).length === 1, 'на /today один ответ');
 
 m = mark();
 await handleUpdate(message('/week'));
-const weekPicker = sent(since(m)).at(-1);
-const dayButtons = (weekPicker?.body.reply_markup as { inline_keyboard: { callback_data: string }[][] })
-  ?.inline_keyboard;
-ok(dayButtons?.flat().length === 7, 'шесть дней плюс «вся неделя»');
-
-m = mark();
-await handleUpdate(button('d:all'));
+const weekCalls = sent(since(m));
 const weekTexts = texts(since(m));
 ok(weekTexts.length >= 1, `неделя пришла ${weekTexts.length} сообщением(-ями)`);
 ok(weekTexts.every((t) => t.length <= 4096), 'все части в лимите Telegram');
 ok(weekTexts.join('').includes('Вторник'), 'в неделе есть будни');
+ok(weekTexts.join('').includes('**>'), 'дни оформлены раскрывающимися цитатами');
 
+const weekKeyboard = (weekCalls.at(-1)?.body.reply_markup as
+  | { inline_keyboard: { text: string; callback_data: string }[][] }
+  | undefined)?.inline_keyboard;
+const weekFlat = weekKeyboard?.flat() ?? [];
+ok(weekFlat.length >= 6, `под неделей ${weekFlat.length} кнопок`);
+ok(
+  weekFlat.every((b) => /^[dw]:\d{4}-\d{2}-\d{2}$/.test(b.callback_data)),
+  'кнопки адресуют дни датами, а не индексами',
+);
+ok(weekFlat.some((b) => b.text.includes('По дням')), 'есть переход в режим дней');
+
+// Нажатие дня должно менять то же сообщение, а не присылать новое
+const dayBtn = weekFlat.find((b) => b.callback_data.startsWith('d:'))!;
+m = mark();
+await handleUpdate(button(dayBtn.callback_data));
+const dayCalls = since(m);
+ok(
+  dayCalls.some((c) => c.method === 'editMessageText'),
+  'день открывается правкой сообщения',
+);
+ok(sent(dayCalls).length === 0, 'новых сообщений при листании не появляется');
+
+const dayKeyboard = (dayCalls.find((c) => c.method === 'editMessageText')?.body.reply_markup as
+  | { inline_keyboard: { text: string; callback_data: string }[][] }
+  | undefined)?.inline_keyboard;
+const dayFlat = dayKeyboard?.flat() ?? [];
+ok(dayFlat.some((b) => b.text.includes('Вся неделя')), 'из дня можно вернуться к неделе');
+ok(dayFlat.some((b) => b.text.startsWith('· ')), 'открытый день отмечен на клавиатуре');
+
+// Старые сообщения могли остаться с кнопками прежнего вида
 m = mark();
 await handleUpdate(button('d:0'));
-ok(texts(since(m)).length === 1 || since(m).length > 0, 'кнопка дня отвечает');
+ok(since(m).some((c) => c.method === 'editMessageText'), 'старая кнопка d:0 ещё работает');
+m = mark();
+await handleUpdate(button('d:all'));
+ok(since(m).some((c) => c.method === 'editMessageText'), 'старая кнопка d:all ещё работает');
 
 await resetRateLimit();
 head('Статус');
@@ -319,8 +358,8 @@ await failMethods(['answerCallbackQuery']);
 m = mark();
 await handleUpdate(button('d:all'));
 ok(
-  sent(since(m)).some((c) => !c.failed),
-  'при отказе answerCallbackQuery неделя всё равно отправлена',
+  since(m).some((c) => c.method === 'editMessageText' && !c.failed),
+  'при отказе answerCallbackQuery расписание всё равно показано',
 );
 
 // сообщение с кнопками удалили — правка не пройдёт, нужен новый ответ

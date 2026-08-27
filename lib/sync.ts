@@ -16,11 +16,13 @@ import {
   touchFile,
   upsertFile,
   getWeek,
+  weekStarts,
   type FileRow,
 } from './db';
 import { log, logError } from './log';
 import { formatDay, formatEmptyDay, esc } from './format';
 import { pinChatMessage, sendMessage, unpinChatMessage } from './telegram';
+import { scheduleKeyboard } from './keyboard';
 import { dayNameOf, isSaturdayMsk, mskDateOffset, mskParts } from './time';
 import { env } from './env';
 
@@ -155,6 +157,7 @@ export async function sendTomorrow(): Promise<{ sent: number; failed: number }> 
   const chats = await activeChats();
   const dateIso = mskDateOffset(1);
   const dayName = dayNameOf(dateIso);
+  const weeks = await weekStarts();
 
   let sent = 0;
   let failed = 0;
@@ -180,7 +183,9 @@ export async function sendTomorrow(): Promise<{ sent: number; failed: number }> 
             heading: 'Расписание на завтра',
           });
 
-      const message = await sendMessage(chat.chat_id, text, { silent: false });
+      // Кнопки и под закреплённым сообщением: можно листать дни, не набирая команды
+      const keyboard = scheduleKeyboard(days, day ? dateIso : null, file?.week_start ?? null, weeks);
+      const message = await sendMessage(chat.chat_id, text, { silent: false, keyboard });
 
       if (chat.pinned_msg_id) {
         try {

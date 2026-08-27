@@ -2,7 +2,6 @@
 import {
   allowRequest,
   getChat,
-  getDay,
   getWeek,
   latestFile,
   listGroups,
@@ -10,11 +9,14 @@ import {
   setChatGroup,
   upsertChat,
   getState,
+  weekStarts,
 } from './db';
 import { log, logError } from './log';
 import { answerCallbackQuery, editMessageText, isChatAdmin, sendMessage, type InlineKeyboard } from './telegram';
 import { esc, formatDay, formatEmptyDay, formatWeek, humanDate } from './format';
+import { scheduleKeyboard } from './keyboard';
 import { dayNameOf, mskDateOffset, mskStamp, mskToday } from './time';
+import type { Day } from './parse';
 import { env } from './env';
 import { LAST_CHECK_KEY } from './sync';
 
@@ -65,6 +67,9 @@ const HELP = [
   '/group — выбрать группу',
   '/status — когда была последняя проверка',
   '/help — эта справка',
+  '',
+  'Под сообщением есть кнопки дней: нажимай — оно меняется на месте,',
+  'новых сообщений не появляется\\. Точка у дня означает «пар нет»\\.',
 ].join('\n');
 
 const GROUPS_PER_PAGE = 24;
@@ -111,20 +116,6 @@ function groupKeyboard(
   return rows;
 }
 
-const DAY_BUTTONS: InlineKeyboard = [
-  [
-    { text: 'Пн', callback_data: 'd:0' },
-    { text: 'Вт', callback_data: 'd:1' },
-    { text: 'Ср', callback_data: 'd:2' },
-  ],
-  [
-    { text: 'Чт', callback_data: 'd:3' },
-    { text: 'Пт', callback_data: 'd:4' },
-    { text: 'Сб', callback_data: 'd:5' },
-  ],
-  [{ text: '📖 Вся неделя', callback_data: 'd:all' }],
-];
-
 /** Кэш соответствия «индекс → группа», чтобы влезть в лимит callback_data. */
 async function groupIndex(): Promise<{ sheets: string[]; groups: { group: string; sheet: string; index: number }[] }> {
   const raw = await listGroups();
@@ -144,34 +135,59 @@ async function requireGroup(chatId: number): Promise<string | null> {
   return chat.group_name;
 }
 
-async function sendDay(chatId: number, offset: number, heading: string): Promise<void> {
-  const group = await requireGroup(chatId);
-  if (!group) return;
-
-  const dateIso = mskDateOffset(offset);
-  const { days, file } = await getWeek(group, dateIso);
+/** Текст и клавиатура для одного дня. */
+async function renderDay(
+  group: string,
+  dateIso: string,
+  heading?: string,
+): Promise<{ text: string; keyboard: InlineKeyboard }> {
+  const [{ days, file }, weeks] = await Promise.all([getWeek(group, dateIso), weekStarts()]);
   const day = days.find((d) => d.date === dateIso) ?? null;
 
   const opts = { group, siteUpdated: file?.site_updated ?? null, heading };
-  const text = day
-    ? formatDay(day, opts)
-    : formatEmptyDay(dateIso, dayNameOf(dateIso), opts);
+  const text = day ? formatDay(day, opts) : formatEmptyDay(dateIso, dayNameOf(dateIso), opts);
 
-  await sendMessage(chatId, text, { silent: true });
+  return {
+    text,
+    keyboard: scheduleKeyboard(days, day ? dateIso : null, file?.week_start ?? null, weeks),
+  };
 }
 
-async function sendWeekMessages(chatId: number): Promise<void> {
-  const group = await requireGroup(chatId);
-  if (!group) return;
+/** Текст (возможно несколько частей) и клавиатура для недели. */
+async function renderWeek(
+  group: string,
+  fromIso: string,
+): Promise<{ chunks: string[]; keyboard: InlineKeyboard }> {
+  const [{ days, file }, weeks] = await Promise.all([getWeek(group, fromIso), weekStarts()]);
 
-  const { days, file } = await getWeek(group, mskToday());
   const chunks = formatWeek(days, {
     group,
     siteUpdated: file?.site_updated ?? null,
     heading: file?.week_start ? `Неделя с ${humanDate(file.week_start)}` : 'Расписание на неделю',
   });
 
-  for (const text of chunks) await sendMessage(chatId, text, { silent: true });
+  return { chunks, keyboard: scheduleKeyboard(days, null, file?.week_start ?? null, weeks) };
+}
+
+async function sendDay(chatId: number, offset: number, heading: string): Promise<void> {
+  const group = await requireGroup(chatId);
+  if (!group) return;
+
+  const { text, keyboard } = await renderDay(group, mskDateOffset(offset), heading);
+  await sendMessage(chatId, text, { silent: true, keyboard });
+}
+
+async function sendWeekMessages(chatId: number): Promise<void> {
+  const group = await requireGroup(chatId);
+  if (!group) return;
+
+  const { chunks, keyboard } = await renderWeek(group, mskToday());
+
+  // Клавиатура нужна только под последней частью, иначе кнопки дублируются
+  for (const [index, text] of chunks.entries()) {
+    const last = index === chunks.length - 1;
+    await sendMessage(chatId, text, { silent: true, keyboard: last ? keyboard : undefined });
+  }
 }
 
 async function sendStatus(chatId: number): Promise<void> {
@@ -296,7 +312,7 @@ async function handleMessage(message: TgMessage): Promise<void> {
       return;
 
     case 'week':
-      await sendMessage(chatId, '*Какой день?*', { silent: true, keyboard: DAY_BUTTONS });
+      await sendWeekMessages(chatId);
       return;
 
     case 'status':
@@ -402,34 +418,49 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
   // Кнопки дней недели
   if (data.startsWith('d:')) {
     const key = data.slice(2);
-    if (key === 'all') {
-      await answerCallbackQuery(query.id);
-      await sendWeekMessages(chatId);
-      return;
-    }
-
     const groupName = chat?.group_name;
     if (!groupName) {
       await answerCallbackQuery(query.id, 'Сначала выбери группу: /group');
       return;
     }
 
-    const { days, file } = await getWeek(groupName, mskToday());
-    const index = Number(key);
-    const day = days[index];
-
     await answerCallbackQuery(query.id);
 
-    if (!day) {
-      await reply(chatId, 'На этот день данных нет\\.');
+    // Старые сообщения могли остаться с кнопками вида `d:0` и `d:all`
+    if (key === 'all') {
+      const { chunks, keyboard } = await renderWeek(groupName, mskToday());
+      await editMessageText(chatId, message.message_id, chunks[0], keyboard);
       return;
     }
 
-    await sendMessage(
-      chatId,
-      formatDay(day, { group: groupName, siteUpdated: file?.site_updated ?? null }),
-      { silent: true },
-    );
+    let dateIso = key;
+    if (/^\d+$/.test(key)) {
+      const { days } = await getWeek(groupName, mskToday());
+      dateIso = days[Number(key)]?.date ?? mskToday();
+    }
+
+    const { text, keyboard } = await renderDay(groupName, dateIso);
+    await editMessageText(chatId, message.message_id, text, keyboard);
+    return;
+  }
+
+  // Неделя: `w:<дата>` — показать неделю, содержащую эту дату
+  if (data.startsWith('w:')) {
+    const groupName = chat?.group_name;
+    if (!groupName) {
+      await answerCallbackQuery(query.id, 'Сначала выбери группу: /group');
+      return;
+    }
+
+    await answerCallbackQuery(query.id);
+
+    const { chunks, keyboard } = await renderWeek(groupName, data.slice(2));
+    await editMessageText(chatId, message.message_id, chunks[0], keyboard);
+
+    // Если неделя не влезла в одно сообщение — остальные части отправляем ниже
+    for (const text of chunks.slice(1)) {
+      await sendMessage(chatId, text, { silent: true });
+    }
     return;
   }
 

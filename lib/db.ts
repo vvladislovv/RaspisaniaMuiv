@@ -366,3 +366,16 @@ export async function logsSince(hours: number): Promise<LogRow[]> {
     .order('ts', { ascending: true });
   return (check(res, 'logsSince') ?? []) as LogRow[];
 }
+
+/** Даты начала недель, для которых есть разобранное расписание. */
+export async function weekStarts(): Promise<string[]> {
+  const res = await db()
+    .from('files')
+    .select('week_start')
+    .eq('parsed_ok', true)
+    .not('week_start', 'is', null)
+    .order('week_start', { ascending: true });
+
+  const rows = (check(res, 'weekStarts') ?? []) as { week_start: string }[];
+  return [...new Set(rows.map((r) => r.week_start))];
+}

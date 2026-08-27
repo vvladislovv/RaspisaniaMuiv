@@ -13,11 +13,26 @@ const MONTHS_GEN = [
   'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря',
 ];
 
+const SHORT_DAYS: Record<string, string> = {
+  Понедельник: 'Пн',
+  Вторник: 'Вт',
+  Среда: 'Ср',
+  Четверг: 'Чт',
+  Пятница: 'Пт',
+  Суббота: 'Сб',
+  Воскресенье: 'Вс',
+};
+
 /** `2026-09-01` → `1 сентября`. */
 export function humanDate(iso: string): string {
   const [y, m, d] = iso.split('-').map(Number);
   if (!y || !m || !d) return iso;
   return `${d} ${MONTHS_GEN[m - 1]}`;
+}
+
+/** «Понедельник» → «Пн». */
+export function shortDay(dayName: string): string {
+  return SHORT_DAYS[dayName] ?? dayName.slice(0, 2);
 }
 
 /** «Соломин Максим Сергеевич» → «Соломин М. С.» */
@@ -33,16 +48,41 @@ function prettyTime(time: string): string {
   return time.replace(/\s*-\s*/, '–');
 }
 
-function lessonLines(lesson: Lesson): string {
-  const head = `*${lesson.pair}\\.* ${esc(prettyTime(lesson.time))}`;
-  const subject = esc(lesson.subject);
+/** «2 пары», «5 пар» — правильная форма после числа. */
+export function pairsWord(count: number): string {
+  const mod100 = count % 100;
+  const mod10 = count % 10;
+  if (mod100 >= 11 && mod100 <= 14) return 'пар';
+  if (mod10 === 1) return 'пара';
+  if (mod10 >= 2 && mod10 <= 4) return 'пары';
+  return 'пар';
+}
 
+/** Строки одной пары внутри цитаты. */
+function lessonLines(lesson: Lesson): string[] {
   const meta: string[] = [];
   if (lesson.teacher) meta.push(esc(shortName(lesson.teacher)));
   if (lesson.room) meta.push(esc(`ауд. ${lesson.room}`));
 
-  const tail = meta.length > 0 ? `\n    _${meta.join(' · ')}_` : '';
-  return `${head}\n    ${subject}${tail}`;
+  const lines = [
+    `*${lesson.pair}\\.* *${esc(prettyTime(lesson.time))}*`,
+    esc(lesson.subject),
+  ];
+  if (meta.length > 0) lines.push(`_${meta.join(' · ')}_`);
+  return lines;
+}
+
+/**
+ * Собирает цитату MarkdownV2. Каждая строка начинается с `>`.
+ * `expandable` делает цитату раскрывающейся: в списке дней видно только
+ * начало, остальное открывается тапом.
+ */
+function quote(lines: string[], expandable = false): string {
+  const body = lines.map((line) => '>' + line);
+  if (!expandable) return body.join('\n');
+  // Пустая жирная разметка перед `>` отделяет цитату от предыдущей,
+  // а `||` в конце помечает её как раскрывающуюся.
+  return '**' + body.join('\n') + '||';
 }
 
 export interface DayMessageOptions {
@@ -57,15 +97,20 @@ export interface DayMessageOptions {
 export function formatDay(day: Day, opts: DayMessageOptions): string {
   const parts: string[] = [];
 
-  if (opts.heading) parts.push(`*${esc(opts.heading)}*`);
+  if (opts.heading) parts.push(`_${esc(opts.heading)}_`);
   parts.push(`📅 *${esc(day.name)}, ${esc(humanDate(day.date))}*`);
-  parts.push(`👥 ${esc(opts.group)}`);
+  parts.push(`👥 *${esc(opts.group)}*`);
   parts.push('');
 
   if (day.lessons.length === 0) {
-    parts.push('_Пар нет_');
+    parts.push(quote(['_Пар нет_']));
   } else {
-    parts.push(day.lessons.map(lessonLines).join('\n\n'));
+    const lines: string[] = [];
+    day.lessons.forEach((lesson, index) => {
+      if (index > 0) lines.push('');
+      lines.push(...lessonLines(lesson));
+    });
+    parts.push(quote(lines));
   }
 
   if (opts.siteUpdated) {
@@ -87,19 +132,34 @@ export function formatEmptyDay(
 
 const TELEGRAM_LIMIT = 4096;
 
-/** Сообщение со всей неделей. Режет на части, если не влезает в лимит. */
+/**
+ * Сообщение со всей неделей: каждый день — раскрывающаяся цитата, поэтому
+ * сообщение читается как список дней, а подробности открываются тапом.
+ * Режет на части, если не влезает в лимит.
+ */
 export function formatWeek(days: Day[], opts: DayMessageOptions): string[] {
-  const header = [`*${esc(opts.heading ?? 'Расписание на неделю')}*`, `👥 ${esc(opts.group)}`, ''];
+  const header = [
+    `*${esc(opts.heading ?? 'Расписание на неделю')}*`,
+    `👥 *${esc(opts.group)}*`,
+    '',
+  ];
 
   const blocks = days.map((day) => {
-    const lines = [`📅 *${esc(day.name)}, ${esc(humanDate(day.date))}*`];
-    lines.push(
-      day.lessons.length === 0 ? '_Пар нет_' : day.lessons.map(lessonLines).join('\n\n'),
-    );
-    return lines.join('\n');
+    const title =
+      `*${esc(day.name)}, ${esc(humanDate(day.date))}* — ` +
+      `${day.lessons.length} ${esc(pairsWord(day.lessons.length))}`;
+
+    if (day.lessons.length === 0) return quote([title, '_Пар нет_'], true);
+
+    const lines = [title];
+    day.lessons.forEach((lesson, index) => {
+      if (index > 0) lines.push('');
+      lines.push(...lessonLines(lesson));
+    });
+    return quote(lines, true);
   });
 
-  if (blocks.length === 0) blocks.push('_Нет данных за эту неделю_');
+  if (blocks.length === 0) blocks.push(quote(['_Нет данных за эту неделю_']));
 
   const footer = opts.siteUpdated ? ['', `_Файл обновлён: ${esc(opts.siteUpdated)}_`] : [];
 
@@ -107,12 +167,12 @@ export function formatWeek(days: Day[], opts: DayMessageOptions): string[] {
   let current = [...header];
 
   for (const block of blocks) {
-    const candidate = [...current, block, ''].join('\n');
+    const candidate = [...current, block].join('\n');
     if (candidate.length > TELEGRAM_LIMIT - 200 && current.length > header.length) {
       chunks.push(current.join('\n').trimEnd());
-      current = [...header, block, ''];
+      current = [...header, block];
     } else {
-      current.push(block, '');
+      current.push(block);
     }
   }
 

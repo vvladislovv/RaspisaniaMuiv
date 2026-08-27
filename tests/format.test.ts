@@ -40,8 +40,33 @@ test('formatDay собирает сообщение и экранирует оп
   assert.match(text, /Вторник/);
   assert.match(text, /ИСП\/П\\-24\\-11/);
   assert.match(text, /Соломин М\\\. С\\\./);
-  // ни один спецсимвол MarkdownV2 не должен остаться неэкранированным вне разметки
-  assert.doesNotMatch(text.replace(/\\./g, '').replace(/\*/g, '').replace(/_/g, ''), /[[\]()~`>#+=|{}]/);
+
+  // Ни один спецсимвол MarkdownV2 не должен остаться неэкранированным.
+  // Снимаем разметку, которую ставим сами: экранирование, жирный, курсив
+  // и `>` в начале строк цитаты.
+  const bare = text
+    .replace(/\\./g, '')
+    .split('\n')
+    .map((line) => line.replace(/^>/, ''))
+    .join('\n')
+    .replace(/\*/g, '')
+    .replace(/_/g, '');
+  assert.doesNotMatch(bare, /[[\]()~`>#+=|{}]/);
+});
+
+test('formatDay кладёт пары в цитату', () => {
+  const text = formatDay(day, { group: 'ИСП/П-24-11' });
+  const quoted = text.split('\n').filter((line) => line.startsWith('>'));
+  assert.ok(quoted.length >= 3, 'пары должны быть строками цитаты');
+  assert.match(quoted.join('\n'), /\*4\\\.\* \*13:45–15:15\*/);
+});
+
+test('formatWeek делает дни раскрывающимися цитатами', () => {
+  const chunks = formatWeek([day], { group: 'ИСП/П-24-11' });
+  assert.equal(chunks.length, 1);
+  assert.match(chunks[0], /\*\*>/, 'должна быть раскрывающаяся цитата');
+  assert.match(chunks[0], /\|\|$/, 'цитата должна закрываться меткой раскрытия');
+  assert.match(chunks[0], /1 пара/);
 });
 
 test('formatDay без пар пишет «Пар нет»', () => {
