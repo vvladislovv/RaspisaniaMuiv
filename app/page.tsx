@@ -68,14 +68,46 @@ export default async function StatusPage({
     );
   }
 
-  const [lastCheck, file, files, chats, logs, dayLogs] = await Promise.all([
-    getState<LastCheck>(LAST_CHECK_KEY),
-    latestFile(),
-    recentFiles(12),
-    allChats(),
-    recentLogs(50),
-    logsSince(24),
-  ]);
+  // База — единственная зависимость страницы. Если она недоступна, страница
+  // должна об этом сказать: именно в такой момент на неё и заходят.
+  let data;
+  try {
+    const [lastCheck, file, files, chats, logs, dayLogs] = await Promise.all([
+      getState<LastCheck>(LAST_CHECK_KEY),
+      latestFile(),
+      recentFiles(12),
+      allChats(),
+      recentLogs(50),
+      logsSince(24),
+    ]);
+    data = { lastCheck, file, files, chats, logs, dayLogs };
+  } catch (error) {
+    return (
+      <div className="shell">
+        <header className="masthead">
+          <h1 className="wordmark">
+            МУИВ<span>·</span>Расписание
+          </h1>
+          <span className="pulse pulse--dead">
+            <span className="pulse-dot" aria-hidden="true" />
+            База недоступна
+          </span>
+        </header>
+        <main>
+          <section className="panel">
+            <h2 className="panel-title">Не удалось прочитать базу</h2>
+            <p className="subline">{error instanceof Error ? error.message : String(error)}</p>
+            <p className="empty">
+              Проверь переменные SUPABASE_URL и SUPABASE_SERVICE_ROLE_KEY в настройках проекта
+              и что схема из supabase/schema.sql выполнена.
+            </p>
+          </section>
+        </main>
+      </div>
+    );
+  }
+
+  const { lastCheck, file, files, chats, logs, dayLogs } = data;
 
   const checkedAt = lastCheck ? new Date(lastCheck.at) : null;
   const minutesAgo = checkedAt ? Math.floor((Date.now() - checkedAt.getTime()) / 60_000) : null;
