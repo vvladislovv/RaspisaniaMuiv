@@ -79,24 +79,46 @@ export function sendMessage(
   });
 }
 
-export function editMessageText(
+/**
+ * Меняет текст сообщения, а если сообщения уже нет (удалили, слишком старое) —
+ * отправляет новое. Иначе нажатие кнопки выглядело бы как «ничего не случилось».
+ */
+export async function editMessageText(
   chatId: number,
   messageId: number,
   text: string,
   keyboard?: InlineKeyboard,
-): Promise<unknown> {
-  return call('editMessageText', {
-    chat_id: chatId,
-    message_id: messageId,
-    text,
-    parse_mode: 'MarkdownV2',
-    link_preview_options: { is_disabled: true },
-    reply_markup: keyboard ? { inline_keyboard: keyboard } : undefined,
-  });
+): Promise<void> {
+  try {
+    await call('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      parse_mode: 'MarkdownV2',
+      link_preview_options: { is_disabled: true },
+      reply_markup: keyboard ? { inline_keyboard: keyboard } : undefined,
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    console.warn('editMessageText не прошёл, отправляю новым сообщением:', reason);
+    await sendMessage(chatId, text, { keyboard, silent: true });
+  }
 }
 
-export function answerCallbackQuery(id: string, text?: string): Promise<unknown> {
-  return call('answerCallbackQuery', { callback_query_id: id, text }, { retries: 1 });
+/**
+ * Гасит «часики» на кнопке. Это только косметика, и Telegram отклоняет запрос,
+ * если нажатие устарело (холодный старт функции, старое сообщение). Поэтому
+ * ошибка здесь никогда не должна прерывать саму работу по нажатию.
+ */
+export async function answerCallbackQuery(id: string, text?: string): Promise<void> {
+  try {
+    await call('answerCallbackQuery', { callback_query_id: id, text }, { retries: 1 });
+  } catch (error) {
+    console.warn(
+      'answerCallbackQuery не прошёл:',
+      error instanceof Error ? error.message : String(error),
+    );
+  }
 }
 
 export function pinChatMessage(chatId: number, messageId: number): Promise<unknown> {

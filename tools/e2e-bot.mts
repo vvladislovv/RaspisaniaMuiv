@@ -39,6 +39,8 @@ function head(title: string) {
 interface Call {
   method: string;
   body: Record<string, unknown>;
+  /** Дублёр отметил вызов как отклонённый. */
+  failed?: boolean;
 }
 
 function calls(): Call[] {
@@ -296,6 +298,41 @@ ok(
   ['skipped-hour', 'skipped-saturday', 'skipped-already', 'sent'].includes(String(notForced.autoSend)),
   `без force решение принято по времени: ${notForced.autoSend}`,
 );
+
+// ─── Отказы Bot API ──────────────────────────────────────────────────────────
+
+/** Заставляет дублёр Telegram отклонять указанные методы. */
+async function failMethods(methods: string[]): Promise<void> {
+  await fetch(`${process.env.TELEGRAM_API_BASE}/bot/__fail`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ methods }),
+  });
+}
+
+await resetRateLimit();
+head('Отказы Telegram не должны терять работу');
+
+// «query is too old» случается при холодном старте функции: гашение кнопки
+// не прошло, но расписание всё равно обязано уйти
+await failMethods(['answerCallbackQuery']);
+m = mark();
+await handleUpdate(button('d:all'));
+ok(
+  sent(since(m)).some((c) => !c.failed),
+  'при отказе answerCallbackQuery неделя всё равно отправлена',
+);
+
+// сообщение с кнопками удалили — правка не пройдёт, нужен новый ответ
+await failMethods(['editMessageText']);
+m = mark();
+await handleUpdate(button('back'));
+ok(
+  sent(since(m)).some((c) => !c.failed),
+  'при отказе editMessageText отправляется новое сообщение',
+);
+
+await failMethods([]);
 
 console.log(failures ? `\nПРОВАЛЕНО ПРОВЕРОК: ${failures}\n` : '\nВсе проверки прошли\n');
 process.exitCode = failures ? 1 : 0;
