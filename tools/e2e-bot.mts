@@ -1,16 +1,17 @@
 /**
- * Проверка поведения бота: команды, кнопки, права, ограничения.
- * Работает на подставной базе и дублёре Telegram — ничего не уходит наружу.
+ * Проверка поведения бота: /start, кнопки, права, ограничения, отказы Bot API.
+ * Работает на подставной базе и дублёре Telegram — наружу уходит только
+ * запрос к сайту МУИВ, чтобы наполнить базу настоящим расписанием.
  *
  * Запуск:
  *   node tools/fake-supabase.mjs 54321 /tmp/e2e.json &
- *   FAKE_TG_ADMINS=111 node tools/fake-telegram.mjs 54322 /tmp/tg.json &
+ *   FAKE_TG_ADMINS=111,333 node tools/fake-telegram.mjs 54322 /tmp/tg.json &
  *   npx tsx tools/e2e-bot.mts
  */
 import { readFileSync } from 'node:fs';
 import { handleUpdate, type TgUpdate } from '../lib/bot';
 import { tick } from '../lib/sync';
-import { getChat, listGroups, setChatEnabled, upsertChat } from '../lib/db';
+import { getChat, listGroups, upsertChat } from '../lib/db';
 
 const LOG = process.env.FAKE_TG_LOG ?? '/tmp/tg.json';
 const CHAT = -100777000;
@@ -36,6 +37,11 @@ function head(title: string) {
   console.log(`\n─── ${title} ${'─'.repeat(Math.max(0, 58 - title.length))}`);
 }
 
+interface Button {
+  text: string;
+  callback_data: string;
+}
+
 interface Call {
   method: string;
   body: Record<string, unknown>;
@@ -51,13 +57,21 @@ function calls(): Call[] {
   }
 }
 
-/** Вызовы Telegram, сделанные после метки. */
-function since(mark: number): Call[] {
-  return calls().slice(mark);
+const mark = (): number => calls().length;
+const since = (from: number): Call[] => calls().slice(from);
+const sent = (list: Call[]) => list.filter((c) => c.method === 'sendMessage');
+const edited = (list: Call[]) => list.filter((c) => c.method === 'editMessageText');
+const texts = (list: Call[]) => [...sent(list), ...edited(list)].map((c) => String(c.body.text));
+
+/** Кнопки из последнего успешного сообщения или правки. */
+function keyboardOf(list: Call[]): Button[] {
+  const last = [...sent(list), ...edited(list)].filter((c) => !c.failed).at(-1);
+  const markup = last?.body.reply_markup as { inline_keyboard: Button[][] } | undefined;
+  return (markup?.inline_keyboard ?? []).flat();
 }
 
-function mark(): number {
-  return calls().length;
+function find(buttons: Button[], fragment: string): Button | undefined {
+  return buttons.find((b) => b.text.includes(fragment));
 }
 
 function message(text: string, from = OWNER, chatId = CHAT): TgUpdate {
@@ -87,8 +101,7 @@ function button(data: string, from = OWNER, chatId = CHAT): TgUpdate {
 
 /** Убирает следы прошлого прогона, чтобы тест можно было запускать повторно. */
 async function resetChat(): Promise<void> {
-  const base = process.env.SUPABASE_URL!;
-  await fetch(`${base}/rest/v1/chats?chat_id=eq.${CHAT}`, {
+  await fetch(`${process.env.SUPABASE_URL}/rest/v1/chats?chat_id=eq.${CHAT}`, {
     method: 'DELETE',
     headers: { apikey: 'fake', Authorization: 'Bearer fake' },
   });
@@ -96,15 +109,20 @@ async function resetChat(): Promise<void> {
 
 /** Обнуляет счётчик частоты — иначе тест сам упирается в собственный лимит. */
 async function resetRateLimit(): Promise<void> {
-  const base = process.env.SUPABASE_URL!;
-  await fetch(`${base}/rest/v1/rate_limit?count=gte.0`, {
+  await fetch(`${process.env.SUPABASE_URL}/rest/v1/rate_limit?count=gte.0`, {
     method: 'DELETE',
     headers: { apikey: 'fake', Authorization: 'Bearer fake' },
   });
 }
 
-const sent = (list: Call[]) => list.filter((c) => c.method === 'sendMessage');
-const texts = (list: Call[]) => sent(list).map((c) => String(c.body.text));
+/** Заставляет дублёр Telegram отклонять указанные методы. */
+async function failMethods(methods: string[]): Promise<void> {
+  await fetch(`${process.env.TELEGRAM_API_BASE}/bot/__fail`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ methods }),
+  });
+}
 
 // ─── Наполняем базу настоящим расписанием ────────────────────────────────────
 
@@ -116,166 +134,171 @@ ok(first.check !== null && first.check.errors.length === 0, 'сайт прове
 const groups = await listGroups();
 ok(groups.length > 50, `в базе ${groups.length} групп`);
 
-// ─── Неразрешённый чат ───────────────────────────────────────────────────────
+// ─── Список разрешённых чатов ────────────────────────────────────────────────
 
-head('Чат не в списке разрешённых');
+head('Список разрешённых чатов');
 let m = mark();
-await handleUpdate(message('/tomorrow', STRANGER, -999));
+await handleUpdate(message('/start', STRANGER, -999));
 ok(sent(since(m)).length === 0, 'бот молчит в неизвестном чате');
 
-// ─── /enable от обычного участника ───────────────────────────────────────────
-
-head('Подключение чата: только владелец бота');
 m = mark();
-await handleUpdate(message('/enable', STRANGER));
-ok(sent(since(m)).length === 0, 'обычный участник не может подключить чат');
+await handleUpdate(message('/start', STRANGER));
+ok(sent(since(m)).length === 0, 'обычный участник не подключает чат');
 
 m = mark();
-await handleUpdate(message('/enable', GROUP_ADMIN));
-ok(sent(since(m)).length === 0, 'админ группы, но не владелец бота, тоже не может');
+await handleUpdate(message('/start', GROUP_ADMIN));
+ok(sent(since(m)).length === 0, 'админ группы, но не владелец бота, тоже не подключает');
 
-m = mark();
-await handleUpdate(message('/enable', OWNER));
-ok(
-  texts(since(m)).some((t) => t.includes('включён')),
-  'владелец бота подключил чат',
-);
-const chatRow = await getChat(CHAT);
-ok(chatRow?.enabled === true, 'чат записан как включённый');
-
-// ─── Команды без выбранной группы ────────────────────────────────────────────
+// ─── Команд больше нет ───────────────────────────────────────────────────────
 
 await resetRateLimit();
-head('Команды до выбора группы');
+head('Из команд остался только /start');
+for (const command of ['/tomorrow', '/today', '/week', '/group', '/status', '/help', '/enable']) {
+  m = mark();
+  await handleUpdate(message(command, OWNER));
+  ok(sent(since(m)).length === 0, `${command} игнорируется`);
+}
+
 m = mark();
-await handleUpdate(message('/tomorrow'));
-ok(
-  texts(since(m)).some((t) => t.includes('Группа не выбрана')),
-  'бот просит выбрать группу',
-);
+await handleUpdate(message('просто текст', OWNER));
+ok(sent(since(m)).length === 0, 'обычный текст игнорируется');
+
+// ─── /start открывает меню ───────────────────────────────────────────────────
+
+await resetRateLimit();
+head('/start открывает меню');
+m = mark();
+await handleUpdate(message('/start', OWNER));
+const menu = since(m);
+ok(sent(menu).length === 1, 'меню пришло одним сообщением');
+ok(texts(menu).join('').includes('Расписание колледжа МУИВ'), 'в меню есть заголовок');
+
+let buttons = keyboardOf(menu);
+ok(!!find(buttons, 'Выбрать группу'), 'без группы предлагается её выбрать');
+ok(!find(buttons, 'Завтра'), 'без группы расписание не предлагается');
+ok((await getChat(CHAT))?.enabled === true, 'владелец подключил чат');
 
 // ─── Выбор группы кнопками ───────────────────────────────────────────────────
 
 await resetRateLimit();
 head('Выбор группы кнопками');
 m = mark();
-await handleUpdate(message('/group'));
-const picker = sent(since(m)).at(-1);
-const sheetButtons = (picker?.body.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] })
-  ?.inline_keyboard;
-ok(!!sheetButtons && sheetButtons.length === 6, `предложено ${sheetButtons?.length} курсов`);
+await handleUpdate(button('grp'));
+buttons = keyboardOf(since(m));
+ok(buttons.filter((b) => b.callback_data.startsWith('s:')).length === 6, 'предложено 6 курсов');
+ok(!!find(buttons, 'Меню'), 'с экрана курсов есть путь назад');
 
-const target = groups.find((g) => g.group === 'ИСП/П-24-11');
+const target = groups.find((g) => g.group === 'ИСП/П-24-11')!;
 const sheets = [...new Set(groups.map((g) => g.sheet))].sort((a, b) =>
   String(a).localeCompare(String(b), 'ru'),
 );
-const sheetIndex = sheets.indexOf(target?.sheet ?? null);
-ok(sheetIndex !== -1, `курс группы найден: ${target?.sheet}`);
+const sheetIndex = sheets.indexOf(target.sheet);
+ok(sheetIndex !== -1, `курс группы найден: ${target.sheet}`);
 
 m = mark();
 await handleUpdate(button(`s:${sheetIndex}`));
-const edited = since(m).find((c) => c.method === 'editMessageText');
-const groupButtons = (edited?.body.reply_markup as { inline_keyboard: { text: string; callback_data: string }[][] })
-  ?.inline_keyboard;
-const flat = groupButtons?.flat() ?? [];
-ok(flat.some((b) => b.text === 'ИСП/П-24-11'), 'кнопка ИСП/П-24-11 есть в списке');
+buttons = keyboardOf(since(m));
+const groupButton = buttons.find((b) => b.text === 'ИСП/П-24-11');
+ok(!!groupButton, 'кнопка ИСП/П-24-11 есть в списке');
 
-const groupButton = flat.find((b) => b.text === 'ИСП/П-24-11')!;
-
-// Посторонний не должен менять группу
 m = mark();
-await handleUpdate(button(groupButton.callback_data, STRANGER));
-const denied = since(m).findLast((c) => c.method === 'answerCallbackQuery');
+await handleUpdate(button(groupButton!.callback_data, STRANGER));
 ok(
-  String(denied?.body.text ?? '').includes('админ'),
+  String(since(m).findLast((c) => c.method === 'answerCallbackQuery')?.body.text ?? '').includes(
+    'админ',
+  ),
   'посторонний не может сменить группу',
 );
 ok((await getChat(CHAT))?.group_name === null, 'группа в базе не изменилась');
 
 m = mark();
-await handleUpdate(button(groupButton.callback_data, GROUP_ADMIN));
-ok(
-  (await getChat(CHAT))?.group_name === 'ИСП/П-24-11',
-  'админ группы выбрал группу, она в базе',
-);
+await handleUpdate(button(groupButton!.callback_data, GROUP_ADMIN));
+ok((await getChat(CHAT))?.group_name === 'ИСП/П-24-11', 'админ группы выбрал группу');
+ok(edited(since(m)).length === 1, 'после выбора сообщение заменяется на меню');
+buttons = keyboardOf(since(m));
+ok(!!find(buttons, 'Завтра') && !!find(buttons, 'Вся неделя'), 'в меню появилось расписание');
 
-// ─── Расписание по командам ──────────────────────────────────────────────────
+// ─── Листание расписания ─────────────────────────────────────────────────────
 
 await resetRateLimit();
-head('Расписание по командам');
+head('Листание расписания');
 m = mark();
-await handleUpdate(message('/tomorrow'));
-const tomorrow = texts(since(m)).at(-1) ?? '';
-ok(tomorrow.includes('ИСП/П\\-24\\-11'), 'в сообщении есть группа');
-ok(/Расписание на завтра/.test(tomorrow), 'есть заголовок «на завтра»');
-ok(tomorrow.length < 4096, `длина ${tomorrow.length} в лимите`);
-
-m = mark();
-await handleUpdate(message('/today'));
-ok(texts(since(m)).length === 1, 'на /today один ответ');
+await handleUpdate(button('day:1'));
+let screen = since(m);
+ok(edited(screen).length === 1, 'завтра открывается правкой сообщения');
+ok(sent(screen).length === 0, 'новых сообщений не появляется');
+ok(texts(screen).join('').includes('Расписание на завтра'), 'заголовок «на завтра»');
 
 m = mark();
-await handleUpdate(message('/week'));
-const weekCalls = sent(since(m));
-const weekTexts = texts(since(m));
-ok(weekTexts.length >= 1, `неделя пришла ${weekTexts.length} сообщением(-ями)`);
-ok(weekTexts.every((t) => t.length <= 4096), 'все части в лимите Telegram');
-ok(weekTexts.join('').includes('Вторник'), 'в неделе есть будни');
-ok(weekTexts.join('').includes('**>'), 'дни оформлены раскрывающимися цитатами');
+await handleUpdate(button('week'));
+screen = since(m);
+ok(edited(screen).length === 1, 'неделя открывается правкой');
+ok(texts(screen).join('').includes('**>'), 'дни оформлены раскрывающимися цитатами');
 
-const weekKeyboard = (weekCalls.at(-1)?.body.reply_markup as
-  | { inline_keyboard: { text: string; callback_data: string }[][] }
-  | undefined)?.inline_keyboard;
-const weekFlat = weekKeyboard?.flat() ?? [];
-ok(weekFlat.length >= 6, `под неделей ${weekFlat.length} кнопок`);
-ok(
-  weekFlat.every((b) => /^[dw]:\d{4}-\d{2}-\d{2}$/.test(b.callback_data)),
-  'кнопки адресуют дни датами, а не индексами',
-);
-ok(weekFlat.some((b) => b.text.includes('По дням')), 'есть переход в режим дней');
+buttons = keyboardOf(screen);
+const dayButtons = buttons.filter((b) => /^d:\d{4}-\d{2}-\d{2}$/.test(b.callback_data));
+ok(dayButtons.length >= 5, `кнопок дней ${dayButtons.length}, адресуют датами`);
+ok(!!find(buttons, 'По дням'), 'из недели можно перейти к дням');
+ok(!!find(buttons, 'Меню'), 'из недели есть путь в меню');
 
-// Нажатие дня должно менять то же сообщение, а не присылать новое
-const dayBtn = weekFlat.find((b) => b.callback_data.startsWith('d:'))!;
 m = mark();
-await handleUpdate(button(dayBtn.callback_data));
-const dayCalls = since(m);
-ok(
-  dayCalls.some((c) => c.method === 'editMessageText'),
-  'день открывается правкой сообщения',
-);
-ok(sent(dayCalls).length === 0, 'новых сообщений при листании не появляется');
+await handleUpdate(button(dayButtons[1].callback_data));
+screen = since(m);
+ok(edited(screen).length === 1, 'день открывается правкой');
+buttons = keyboardOf(screen);
+ok(!!find(buttons, 'Вся неделя'), 'из дня можно вернуться к неделе');
+ok(buttons.some((b) => b.text.startsWith('· ')), 'открытый день отмечен');
 
-const dayKeyboard = (dayCalls.find((c) => c.method === 'editMessageText')?.body.reply_markup as
-  | { inline_keyboard: { text: string; callback_data: string }[][] }
-  | undefined)?.inline_keyboard;
-const dayFlat = dayKeyboard?.flat() ?? [];
-ok(dayFlat.some((b) => b.text.includes('Вся неделя')), 'из дня можно вернуться к неделе');
-ok(dayFlat.some((b) => b.text.startsWith('· ')), 'открытый день отмечен на клавиатуре');
+m = mark();
+await handleUpdate(button('m'));
+buttons = keyboardOf(since(m));
+ok(!!find(buttons, 'Завтра'), 'кнопка «Меню» возвращает в меню');
 
 // Старые сообщения могли остаться с кнопками прежнего вида
 m = mark();
 await handleUpdate(button('d:0'));
-ok(since(m).some((c) => c.method === 'editMessageText'), 'старая кнопка d:0 ещё работает');
+ok(edited(since(m)).length === 1, 'старая кнопка d:0 ещё работает');
 m = mark();
 await handleUpdate(button('d:all'));
-ok(since(m).some((c) => c.method === 'editMessageText'), 'старая кнопка d:all ещё работает');
+ok(edited(since(m)).length === 1, 'старая кнопка d:all ещё работает');
+
+// ─── Статус и переключатель автоотправки ─────────────────────────────────────
 
 await resetRateLimit();
-head('Статус');
+head('Статус и автоотправка');
 m = mark();
-await handleUpdate(message('/status'));
-const status = texts(since(m)).at(-1) ?? '';
-ok(status.includes('Последняя проверка') || status.includes('проверка'), 'статус содержит время проверки');
-ok(status.includes('ИСП'), 'статус показывает группу чата');
+await handleUpdate(button('st'));
+screen = since(m);
+ok(texts(screen).join('').includes('Последняя проверка'), 'статус показывает время проверки');
+ok(texts(screen).join('').includes('ИСП'), 'статус показывает группу');
+buttons = keyboardOf(screen);
+const offButton = find(buttons, 'Выключить');
+ok(!!offButton, 'есть переключатель автоотправки');
 
-// ─── Устаревшие кнопки и мусор ───────────────────────────────────────────────
+m = mark();
+await handleUpdate(button(offButton!.callback_data, STRANGER));
+ok((await getChat(CHAT))?.enabled === true, 'посторонний не выключает автоотправку');
+
+m = mark();
+await handleUpdate(button(offButton!.callback_data, GROUP_ADMIN));
+ok((await getChat(CHAT))?.enabled === false, 'админ выключил автоотправку');
+buttons = keyboardOf(since(m));
+ok(!!find(buttons, 'Включить'), 'переключатель сменил надпись');
+
+m = mark();
+await handleUpdate(button('on', GROUP_ADMIN));
+ok((await getChat(CHAT))?.enabled === true, 'админ включил обратно');
+
+// ─── Устойчивость ────────────────────────────────────────────────────────────
 
 await resetRateLimit();
 head('Устойчивость к мусору');
 m = mark();
 await handleUpdate(button('g:99999'));
 ok(
-  String(since(m).find((c) => c.method === 'answerCallbackQuery')?.body.text ?? '').includes('устарел'),
+  String(since(m).findLast((c) => c.method === 'answerCallbackQuery')?.body.text ?? '').includes(
+    'устарел',
+  ),
   'на устаревший индекс группы — понятный ответ',
 );
 
@@ -283,11 +306,6 @@ m = mark();
 await handleUpdate(button('чтотоневалидное'));
 ok(since(m).length > 0, 'неизвестная кнопка не роняет обработчик');
 
-m = mark();
-await handleUpdate(message('обычное сообщение без команды'));
-ok(sent(since(m)).length === 0, 'на обычный текст бот не отвечает');
-
-m = mark();
 await handleUpdate({} as TgUpdate);
 ok(true, 'пустой апдейт не роняет обработчик');
 
@@ -296,82 +314,67 @@ ok(true, 'пустой апдейт не роняет обработчик');
 head('Ограничение частоты');
 await resetRateLimit();
 m = mark();
-for (let i = 0; i < 15; i++) await handleUpdate(message('/today'));
-const answered = sent(since(m)).length;
-ok(answered === 10, `из 15 команд обработано ${answered} — лимит ровно 10 в минуту`);
-
-// ─── Выключенный чат ─────────────────────────────────────────────────────────
-
-await resetRateLimit();
-head('Выключенный чат');
-await setChatEnabled(CHAT, false);
-m = mark();
-await handleUpdate(message('/tomorrow', STRANGER));
-ok(sent(since(m)).length === 0, 'в выключенном чате бот молчит');
-await setChatEnabled(CHAT, true);
-
-// ─── Автоотправка с закреплением ─────────────────────────────────────────────
-
-await resetRateLimit();
-head('Автоотправка на завтра и закрепление');
-await upsertChat(CHAT, 'Тестовая группа');
-m = mark();
-const forced = await tick(true);
-const after = since(m);
-ok(forced.autoSend === 'sent', `рассылка выполнена: отправлено ${forced.sent}, ошибок ${forced.failed}`);
-ok(sent(after).length >= 1, 'сообщение отправлено');
-ok(after.some((c) => c.method === 'pinChatMessage'), 'сообщение закреплено');
-ok((await getChat(CHAT))?.pinned_msg_id !== null, 'id закреплённого сообщения сохранён');
-
-m = mark();
-const second = await tick(true);
-const secondCalls = since(m);
-ok(second.autoSend === 'sent', 'повторная рассылка выполнена');
-ok(secondCalls.some((c) => c.method === 'unpinChatMessage'), 'прошлое закрепление снято');
-
-// ─── Пропуск субботы ─────────────────────────────────────────────────────────
-
-head('Правила расписания рассылки');
-const notForced = await tick(false);
-ok(
-  ['skipped-hour', 'skipped-saturday', 'skipped-already', 'sent'].includes(String(notForced.autoSend)),
-  `без force решение принято по времени: ${notForced.autoSend}`,
-);
+for (let i = 0; i < 30; i++) await handleUpdate(button('m'));
+const answered = edited(since(m)).length;
+ok(answered === 20, `из 30 нажатий обработано ${answered} — лимит 20 в минуту`);
 
 // ─── Отказы Bot API ──────────────────────────────────────────────────────────
-
-/** Заставляет дублёр Telegram отклонять указанные методы. */
-async function failMethods(methods: string[]): Promise<void> {
-  await fetch(`${process.env.TELEGRAM_API_BASE}/bot/__fail`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ methods }),
-  });
-}
 
 await resetRateLimit();
 head('Отказы Telegram не должны терять работу');
 
 // «query is too old» случается при холодном старте функции: гашение кнопки
-// не прошло, но расписание всё равно обязано уйти
+// не прошло, но расписание всё равно обязано показаться
 await failMethods(['answerCallbackQuery']);
 m = mark();
-await handleUpdate(button('d:all'));
+await handleUpdate(button('week'));
 ok(
-  since(m).some((c) => c.method === 'editMessageText' && !c.failed),
+  edited(since(m)).some((c) => !c.failed),
   'при отказе answerCallbackQuery расписание всё равно показано',
 );
 
 // сообщение с кнопками удалили — правка не пройдёт, нужен новый ответ
 await failMethods(['editMessageText']);
 m = mark();
-await handleUpdate(button('back'));
+await handleUpdate(button('m'));
 ok(
   sent(since(m)).some((c) => !c.failed),
   'при отказе editMessageText отправляется новое сообщение',
 );
 
 await failMethods([]);
+
+// ─── Автоотправка ────────────────────────────────────────────────────────────
+
+await resetRateLimit();
+head('Автоотправка на завтра и закрепление');
+await upsertChat(CHAT, 'Тестовая группа');
+m = mark();
+const forced = await tick(true);
+let after = since(m);
+ok(
+  forced.autoSend === 'sent',
+  `рассылка выполнена: отправлено ${forced.sent}, ошибок ${forced.failed}`,
+);
+ok(sent(after).length >= 1, 'сообщение отправлено');
+ok(after.some((c) => c.method === 'pinChatMessage'), 'сообщение закреплено');
+ok(keyboardOf(after).length > 0, 'под закреплённым сообщением есть кнопки');
+ok((await getChat(CHAT))?.pinned_msg_id !== null, 'id закреплённого сообщения сохранён');
+
+m = mark();
+const second = await tick(true);
+after = since(m);
+ok(second.autoSend === 'sent', 'повторная рассылка выполнена');
+ok(after.some((c) => c.method === 'unpinChatMessage'), 'прошлое закрепление снято');
+
+head('Правила расписания рассылки');
+const notForced = await tick(false);
+ok(
+  ['skipped-hour', 'skipped-saturday', 'skipped-already', 'sent'].includes(
+    String(notForced.autoSend),
+  ),
+  `без force решение принято по времени: ${notForced.autoSend}`,
+);
 
 console.log(failures ? `\nПРОВАЛЕНО ПРОВЕРОК: ${failures}\n` : '\nВсе проверки прошли\n');
 process.exitCode = failures ? 1 : 0;

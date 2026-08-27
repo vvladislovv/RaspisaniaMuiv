@@ -1,19 +1,45 @@
 /**
- * Клавиатура листания расписания. Отдельным модулем, потому что нужна и боту
- * (ответы на команды), и автоотправке — под закреплённым сообщением тоже
- * должны быть кнопки.
+ * Клавиатуры бота. Отдельным модулем, потому что нужны и обработчику нажатий,
+ * и автоотправке — под закреплённым сообщением тоже должны быть кнопки.
+ *
+ * Единственная команда бота — /start. Всё остальное живёт в кнопках, поэтому
+ * каждый экран обязан давать путь назад в меню.
  */
 import type { Day } from './parse';
 import { shortDay } from './format';
 import type { InlineKeyboard } from './telegram';
 
-function chunk<T>(items: T[], size: number): T[][] {
+export function chunk<T>(items: T[], size: number): T[][] {
   const out: T[][] = [];
   for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
   return out;
 }
 
+const TO_MENU = { text: '↩︎ Меню', callback_data: 'm' };
+
+/** Главное меню. Без выбранной группы показывать расписание нечего. */
+export function menuKeyboard(group: string | null): InlineKeyboard {
+  if (!group) {
+    return [
+      [{ text: '👥 Выбрать группу', callback_data: 'grp' }],
+      [{ text: '⚙️ Статус', callback_data: 'st' }],
+    ];
+  }
+
+  return [
+    [
+      { text: '📅 Завтра', callback_data: 'day:1' },
+      { text: '📅 Сегодня', callback_data: 'day:0' },
+    ],
+    [{ text: '📖 Вся неделя', callback_data: 'week' }],
+    [{ text: '👥 Сменить группу', callback_data: 'grp' }],
+    [{ text: '⚙️ Статус', callback_data: 'st' }],
+  ];
+}
+
 /**
+ * Клавиатура листания расписания.
+ *
  * Даты в `callback_data` вместо индексов: кнопка остаётся рабочей и после того,
  * как колледж выложит новый файл. Активный день помечен точками, день без пар —
  * точкой после названия.
@@ -59,5 +85,55 @@ export function scheduleKeyboard(
     if (nav.length > 0) rows.push(nav);
   }
 
+  rows.push([TO_MENU]);
   return rows;
+}
+
+/** Выбор курса (листа файла). */
+export function sheetKeyboard(sheets: string[]): InlineKeyboard {
+  const rows: InlineKeyboard = sheets.map((sheet, i) => [
+    { text: sheet, callback_data: `s:${i}` },
+  ]);
+  rows.push([TO_MENU]);
+  return rows;
+}
+
+const GROUPS_PER_PAGE = 24;
+
+/** Список групп курса с постраничной прокруткой. */
+export function groupKeyboard(
+  groups: { group: string; index: number }[],
+  sheetIndex: number,
+  page: number,
+): InlineKeyboard {
+  const pages = chunk(groups, GROUPS_PER_PAGE);
+  const current = pages[page] ?? [];
+
+  const rows: InlineKeyboard = chunk(
+    current.map((g) => ({ text: g.group, callback_data: `g:${g.index}` })),
+    3,
+  );
+
+  const nav: InlineKeyboard[number] = [];
+  if (page > 0) nav.push({ text: '◀︎', callback_data: `p:${sheetIndex}:${page - 1}` });
+  nav.push({ text: '↩︎ Курсы', callback_data: 'grp' });
+  if (page + 1 < pages.length) {
+    nav.push({ text: '▶︎', callback_data: `p:${sheetIndex}:${page + 1}` });
+  }
+  rows.push(nav);
+  rows.push([TO_MENU]);
+
+  return rows;
+}
+
+/** Экран статуса: переключатель автоотправки и путь назад. */
+export function statusKeyboard(enabled: boolean): InlineKeyboard {
+  return [
+    [
+      enabled
+        ? { text: '🔕 Выключить автоотправку', callback_data: 'off' }
+        : { text: '🔔 Включить автоотправку', callback_data: 'on' },
+    ],
+    [TO_MENU],
+  ];
 }

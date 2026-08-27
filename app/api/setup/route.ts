@@ -3,7 +3,7 @@
  *   curl -H "Authorization: Bearer $CRON_SECRET" https://<домен>/api/setup
  */
 import { checkCronSecret } from '@/lib/auth';
-import { deleteWebhook, getWebhookInfo, setWebhook } from '@/lib/telegram';
+import { deleteWebhook, getWebhookInfo, setMyCommands, setWebhook } from '@/lib/telegram';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -31,6 +31,7 @@ export async function GET(request: Request): Promise<Response> {
   const base = process.env.PUBLIC_BASE_URL?.trim() || `${url.protocol}//${url.host}`;
   const webhookUrl = `${base.replace(/\/$/, '')}/api/bot`;
   await setWebhook(webhookUrl);
+  await setMyCommands();
 
   return Response.json({ ok: true, webhook: webhookUrl, info: await getWebhookInfo() });
 }

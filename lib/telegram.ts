@@ -150,6 +150,16 @@ export function setWebhook(url: string): Promise<unknown> {
   });
 }
 
+/**
+ * Список команд бота в интерфейсе Telegram. У бота одна команда — /start,
+ * остальное живёт в кнопках, поэтому меню команд должно быть коротким.
+ */
+export function setMyCommands(): Promise<unknown> {
+  return call('setMyCommands', {
+    commands: [{ command: 'start', description: 'Открыть меню расписания' }],
+  });
+}
+
 export function getWebhookInfo(): Promise<unknown> {
   return call('getWebhookInfo', {});
 }
