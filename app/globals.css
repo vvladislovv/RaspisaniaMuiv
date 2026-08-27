@@ -1,0 +1,430 @@
+/*
+  Статус-страница построена как лист расписания: узкая «колонка дня» слева,
+  сетка часов вместо колонок пар, канцелярские линейки-волосинки.
+  Цвета — фирменные МУИВ: тёмно-синий и красный, больше ничего.
+*/
+
+:root {
+  --ink: #12294a;
+  --ink-soft: #4d5f7d;
+  --ink-faint: #8794a9;
+  --accent: #e2001a;
+  --paper: #f5f6f8;
+  --card: #ffffff;
+  --rule: #dde1e9;
+
+  --step-0: 0.9375rem;
+  --step-1: 1.0625rem;
+  --step-2: 1.375rem;
+  --step-3: clamp(1.75rem, 4vw, 2.5rem);
+  --step-4: clamp(2.25rem, 7vw, 4rem);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-body), system-ui, sans-serif;
+  font-size: var(--step-0);
+  line-height: 1.5;
+}
+
+a {
+  color: var(--ink);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ─── Каркас ──────────────────────────────────────────────────────────────── */
+
+.shell {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 0 1.25rem 4rem;
+}
+
+/* Шапка — плотный синий блок, как заголовок раздела на сайте МУИВ */
+.masthead {
+  background: var(--ink);
+  color: #fff;
+  margin: 0 -1.25rem 2rem;
+  padding: 1.5rem 1.25rem 1.375rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.wordmark {
+  font-family: var(--font-display), system-ui, sans-serif;
+  font-weight: 700;
+  font-size: var(--step-2);
+  letter-spacing: -0.02em;
+  margin: 0;
+}
+
+.wordmark span {
+  color: var(--accent);
+}
+
+.masthead-note {
+  font-size: 0.8125rem;
+  color: #a9b6cc;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ─── Индикатор живости ───────────────────────────────────────────────────── */
+
+.pulse {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 600;
+  padding: 0.3125rem 0.625rem;
+  border: 1px solid currentColor;
+}
+
+.pulse--alive {
+  color: #fff;
+}
+
+.pulse--dead {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.pulse-dot {
+  width: 7px;
+  height: 7px;
+  background: currentColor;
+  border-radius: 50%;
+}
+
+/* ─── Главный блок: колонка-корешок + факт ────────────────────────────────── */
+
+.headline {
+  display: grid;
+  grid-template-columns: 2.75rem 1fr;
+  border: 1px solid var(--rule);
+  background: var(--card);
+  margin-bottom: 1.25rem;
+}
+
+/* «Корешок» повторяет объединённую колонку дня недели в файле расписания */
+.spine {
+  background: var(--ink);
+  color: #fff;
+  display: grid;
+  place-items: center;
+  font-family: var(--font-display), system-ui, sans-serif;
+  font-size: 0.6875rem;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  padding: 1rem 0;
+}
+
+.headline-body {
+  padding: 1.25rem 1.375rem 1.5rem;
+}
+
+.stamp {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: var(--step-3);
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  margin: 0;
+}
+
+.stamp--muted {
+  color: var(--ink-faint);
+}
+
+.subline {
+  margin: 0.375rem 0 0;
+  color: var(--ink-soft);
+}
+
+/* ─── Подпись-надстрочник ─────────────────────────────────────────────────── */
+
+.eyebrow {
+  font-family: var(--font-display), system-ui, sans-serif;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin: 0 0 0.5rem;
+}
+
+/* ─── Лента часов: 24 клетки, как колонки пар в расписании ────────────────── */
+
+.ribbon {
+  margin-top: 1.5rem;
+}
+
+.ribbon-track {
+  display: grid;
+  grid-template-columns: repeat(24, 1fr);
+  gap: 2px;
+}
+
+.hour {
+  position: relative;
+  height: 2.25rem;
+  border: 1px solid var(--rule);
+  background: repeating-linear-gradient(
+    135deg,
+    transparent 0 3px,
+    #eef0f4 3px 4px
+  );
+}
+
+.hour--ok {
+  background: var(--ink);
+  border-color: var(--ink);
+}
+
+.hour--err {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Час рассылки помечен засечкой снизу; на красной клетке — синей, чтобы читалась */
+.hour--send::after {
+  content: '';
+  position: absolute;
+  inset: auto 0 -6px;
+  height: 3px;
+  background: var(--accent);
+}
+
+.hour--err.hour--send::after {
+  background: var(--ink);
+}
+
+.ribbon-track {
+  margin-bottom: 6px;
+}
+
+.ribbon-scale {
+  display: grid;
+  grid-template-columns: repeat(24, 1fr);
+  gap: 2px;
+  margin-top: 0.75rem;
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 0.625rem;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.ribbon-scale span {
+  text-align: center;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-top: 0.875rem;
+  font-size: 0.75rem;
+  color: var(--ink-soft);
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+
+.swatch {
+  width: 12px;
+  height: 12px;
+  border: 1px solid var(--rule);
+}
+
+.swatch--ok {
+  background: var(--ink);
+  border-color: var(--ink);
+}
+
+.swatch--err {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.swatch--none {
+  background: repeating-linear-gradient(135deg, transparent 0 3px, #eef0f4 3px 4px);
+}
+
+/* ─── Панели ──────────────────────────────────────────────────────────────── */
+
+.columns {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: 1fr;
+}
+
+@media (min-width: 48rem) {
+  .columns {
+    grid-template-columns: 1.35fr 1fr;
+  }
+}
+
+.panel {
+  border: 1px solid var(--rule);
+  background: var(--card);
+  padding: 1.125rem 1.25rem 1.25rem;
+}
+
+.panel + .panel {
+  margin-top: 1.25rem;
+}
+
+.panel-title {
+  font-family: var(--font-display), system-ui, sans-serif;
+  font-size: var(--step-1);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 0 0 0.875rem;
+}
+
+/* ─── Пары «поле — значение» ──────────────────────────────────────────────── */
+
+.facts {
+  margin: 0;
+  display: grid;
+  grid-template-columns: minmax(7rem, auto) 1fr;
+  column-gap: 1rem;
+}
+
+.facts dt {
+  color: var(--ink-soft);
+  padding: 0.4375rem 0;
+  border-top: 1px solid var(--rule);
+}
+
+.facts dd {
+  margin: 0;
+  padding: 0.4375rem 0;
+  border-top: 1px solid var(--rule);
+  overflow-wrap: anywhere;
+}
+
+.facts dt:first-of-type,
+.facts dd:first-of-type {
+  border-top: 0;
+}
+
+.mono {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.875em;
+}
+
+/* ─── Таблицы ─────────────────────────────────────────────────────────────── */
+
+.scroller {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+
+th {
+  text-align: left;
+  font-family: var(--font-display), system-ui, sans-serif;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  padding: 0 0.75rem 0.5rem 0;
+  white-space: nowrap;
+}
+
+td {
+  padding: 0.5rem 0.75rem 0.5rem 0;
+  border-top: 1px solid var(--rule);
+  vertical-align: top;
+}
+
+tr td:last-child,
+tr th:last-child {
+  padding-right: 0;
+}
+
+.kind {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.kind--error {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+.empty {
+  color: var(--ink-faint);
+  margin: 0;
+}
+
+.dot-on,
+.dot-off {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 0.4375rem;
+  vertical-align: 0.05em;
+}
+
+.dot-on {
+  background: var(--ink);
+}
+
+.dot-off {
+  background: var(--rule);
+}
+
+footer {
+  margin-top: 2rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--rule);
+  font-size: 0.8125rem;
+  color: var(--ink-faint);
+}
+
+.gate {
+  max-width: 32rem;
+  margin: 20vh auto;
+  padding: 0 1.25rem;
+}
