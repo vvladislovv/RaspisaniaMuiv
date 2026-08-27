@@ -15,13 +15,19 @@ interface CallOptions {
 
 const TIMEOUT_MS = 12_000;
 
+/**
+ * Адрес Bot API. Переопределяется только для локальных проверок
+ * (tools/e2e-bot.mts поднимает дублёр вместо настоящего Telegram).
+ */
+const API_BASE = process.env.TELEGRAM_API_BASE ?? 'https://api.telegram.org';
+
 async function call<T>(method: string, body: unknown, opts: CallOptions = {}): Promise<T> {
   const retries = opts.retries ?? 3;
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const res = await fetch(`https://api.telegram.org/bot${env.botToken}/${method}`, {
+      const res = await fetch(`${API_BASE}/bot${env.botToken}/${method}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),

@@ -7,7 +7,11 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/*.test.ts"
+    "test": "tsx --test tests/*.test.ts",
+    "fake:db": "node tools/fake-supabase.mjs 54321 /tmp/e2e.json",
+    "fake:tg": "node tools/fake-telegram.mjs 54322 /tmp/tg.json",
+    "e2e": "tsx tools/e2e-local.mts",
+    "e2e:bot": "tsx tools/e2e-bot.mts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.4",

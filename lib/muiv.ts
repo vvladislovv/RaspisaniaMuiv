@@ -94,24 +94,62 @@ class Session {
   }
 }
 
-/** Проходит защиту и возвращает HTML страницы расписания вместе с сессией. */
-async function openSession(): Promise<{ session: Session; html: string }> {
+const MAX_REDIRECTS = 4;
+const SESSION_RETRIES = 3;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Одна попытка пройти защиту. Редиректы не тратят попытки решения задачи:
+ * после установки куки сайт отвечает 302 на тот же URL, и это нормальный шаг.
+ */
+async function tryOpenSession(): Promise<{ session: Session; html: string } | string> {
   const session = new Session();
+  const trace: string[] = [];
+  let redirects = 0;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const res = await session.fetch(SCHEDULE_URL, 'text/html,application/xhtml+xml,*/*');
+    let res = await session.fetch(SCHEDULE_URL, 'text/html,application/xhtml+xml,*/*');
 
-    if (res.status >= 300 && res.status < 400) continue; // редирект — повторяем тот же URL
+    while (res.status >= 300 && res.status < 400) {
+      trace.push(`${res.status}`);
+      if (++redirects > MAX_REDIRECTS) return `слишком много редиректов (${trace.join(',')})`;
+      res = await session.fetch(SCHEDULE_URL, 'text/html,application/xhtml+xml,*/*');
+    }
 
-    if (!res.ok) throw new Error(`Сайт ответил ${res.status}`);
+    if (!res.ok) return `сайт ответил ${res.status} (${trace.join(',')})`;
 
     const html = await res.text();
+    trace.push(`${res.status}/${html.length}`);
+
     if (!isChallenge(html)) return { session, html };
 
-    session.solve();
+    try {
+      session.solve();
+    } catch (error) {
+      return `${error instanceof Error ? error.message : String(error)} (${trace.join(',')})`;
+    }
+
+    // Сайт иногда отдаёт заглушку повторно — небольшая пауза помогает
+    await sleep(250 * attempt);
   }
 
-  throw new Error(`Не удалось пройти JS-защиту за ${MAX_ATTEMPTS} попыток`);
+  return `защита не пройдена за ${MAX_ATTEMPTS} попыток (${trace.join(',')})`;
+}
+
+/** Проходит защиту, при неудаче начинает заново с чистой сессией. */
+async function openSession(): Promise<{ session: Session; html: string }> {
+  const failures: string[] = [];
+
+  for (let round = 1; round <= SESSION_RETRIES; round++) {
+    const outcome = await tryOpenSession();
+    if (typeof outcome !== 'string') return outcome;
+
+    failures.push(`сессия ${round}: ${outcome}`);
+    if (round < SESSION_RETRIES) await sleep(1500 * round);
+  }
+
+  throw new Error(`Не удалось пройти JS-защиту сайта. ${failures.join('; ')}`);
 }
 
 export interface SiteFile {
