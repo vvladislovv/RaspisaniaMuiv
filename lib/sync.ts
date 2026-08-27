@@ -15,7 +15,7 @@ import {
   getState,
   touchFile,
   upsertFile,
-  getDay,
+  getWeek,
   type FileRow,
 } from './db';
 import { log, logError } from './log';
@@ -153,7 +153,6 @@ async function notifyUpdate(titles: string[]): Promise<void> {
 /** Отправляет расписание на завтра во все активные чаты и закрепляет сообщение. */
 export async function sendTomorrow(): Promise<{ sent: number; failed: number }> {
   const chats = await activeChats();
-  const file = await latestFile();
   const dateIso = mskDateOffset(1);
   const dayName = dayNameOf(dateIso);
 
@@ -164,7 +163,10 @@ export async function sendTomorrow(): Promise<{ sent: number; failed: number }> 
     if (!chat.group_name) continue;
 
     try {
-      const day = await getDay(chat.group_name, dateIso);
+      // Берём неделю, содержащую завтрашний день: так подпись «файл обновлён»
+      // относится к тому файлу, из которого взято расписание.
+      const { days, file } = await getWeek(chat.group_name, dateIso);
+      const day = days.find((d) => d.date === dateIso) ?? null;
 
       const text = day
         ? formatDay(day, {

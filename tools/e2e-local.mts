@@ -56,7 +56,7 @@ ok(groups.length > 50, 'групп больше пятидесяти');
 ok(groups.some((g) => g.group === GROUP), `группа ${GROUP} есть в списке`);
 
 head(`Неделя группы ${GROUP} из базы`);
-const week = await getWeek(GROUP);
+const week = await getWeek(GROUP, '2026-08-31');
 ok(week.days.length > 0, 'дни в базе есть');
 for (const day of week.days) {
   const pairs = day.lessons.map((l) => l.pair).join(',');
@@ -97,6 +97,27 @@ if (CHAT_ID !== -1) {
 } else {
   console.log('  пропущено: не задан E2E_CHAT_ID');
 }
+
+head('Выбор недели, когда на сайте лежит несколько файлов');
+const weekStarts = [
+  ...new Set(
+    (await Promise.all(
+      week.days.map(async (d) => (await getWeek(GROUP, d.date)).file?.week_start ?? null),
+    )).filter(Boolean),
+  ),
+];
+console.log(`  недели в базе: ${weekStarts.join(', ')}`);
+for (const day of week.days) {
+  const picked = await getWeek(GROUP, day.date);
+  const inside = picked.days.some((d) => d.date === day.date);
+  ok(inside, `${day.date}: показывается неделя, содержащая эту дату`);
+}
+const lastDay = week.days.at(-1)!.date;
+const afterWeek = await getWeek(GROUP, lastDay);
+ok(
+  afterWeek.days.some((d) => d.date === lastDay),
+  'в последний учебный день неделя ещё текущая, а не следующая',
+);
 
 head('Поиск дня, которого нет в файле');
 const missing = await getDay(GROUP, '2030-01-01');

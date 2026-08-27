@@ -216,40 +216,73 @@ export async function listGroups(): Promise<{ group: string; sheet: string | nul
     .sort((a, b) => a.group.localeCompare(b.group, 'ru'));
 }
 
-/** Расписание группы на конкретный день из самого свежего файла. */
+/**
+ * Расписание группы на конкретный день.
+ *
+ * Ищем по дате во всех файлах, а не в «самом свежем»: когда колледж выкладывает
+ * следующую неделю, файл текущей никуда не девается, и расписание на завтра
+ * должно браться именно из него. Если день есть в нескольких файлах —
+ * побеждает тот, который заметили позже.
+ */
 export async function getDay(groupName: string, dateIso: string): Promise<Day | null> {
-  const file = await latestFile();
-  if (!file) return null;
-
   const res = await db()
     .from('schedules')
-    .select('day_date, day_name, lessons')
-    .eq('file_id', file.id)
+    .select('day_date, day_name, lessons, file_id')
     .eq('group_name', groupName)
     .eq('day_date', dateIso)
+    .order('file_id', { ascending: false })
+    .limit(1)
     .maybeSingle();
 
-  const row = check(res, 'getDay') as { day_date: string; day_name: string; lessons: Lesson[] } | null;
+  const row = check(res, 'getDay') as
+    | { day_date: string; day_name: string; lessons: Lesson[] }
+    | null;
   if (!row) return null;
   return { date: row.day_date, name: row.day_name, lessons: row.lessons };
 }
 
-/** Вся неделя группы из самого свежего файла. */
-export async function getWeek(groupName: string): Promise<{ days: Day[]; file: FileRow | null }> {
-  const file = await latestFile();
-  if (!file) return { days: [], file: null };
-
-  const res = await db()
+/**
+ * Неделя группы: та, в которой ближайший учебный день начиная с `fromIso`.
+ * В воскресенье это уже следующая неделя, в середине недели — текущая.
+ */
+export async function getWeek(
+  groupName: string,
+  fromIso: string,
+): Promise<{ days: Day[]; file: FileRow | null }> {
+  const upcoming = await db()
     .from('schedules')
-    .select('day_date, day_name, lessons')
-    .eq('file_id', file.id)
+    .select('file_id')
     .eq('group_name', groupName)
-    .order('day_date', { ascending: true });
+    .gte('day_date', fromIso)
+    .order('day_date', { ascending: true })
+    .limit(1)
+    .maybeSingle();
 
-  const rows = (check(res, 'getWeek') ?? []) as { day_date: string; day_name: string; lessons: Lesson[] }[];
+  const picked = check(upcoming, 'getWeek.pick') as { file_id: number } | null;
+
+  // Впереди учебных дней нет — показываем последнюю известную неделю
+  const fileId = picked?.file_id ?? (await latestFile())?.id;
+  if (fileId === undefined) return { days: [], file: null };
+
+  const [rowsRes, fileRes] = await Promise.all([
+    db()
+      .from('schedules')
+      .select('day_date, day_name, lessons')
+      .eq('file_id', fileId)
+      .eq('group_name', groupName)
+      .order('day_date', { ascending: true }),
+    db().from('files').select('*').eq('id', fileId).maybeSingle(),
+  ]);
+
+  const rows = (check(rowsRes, 'getWeek.rows') ?? []) as {
+    day_date: string;
+    day_name: string;
+    lessons: Lesson[];
+  }[];
+
   return {
     days: rows.map((r) => ({ date: r.day_date, name: r.day_name, lessons: r.lessons })),
-    file,
+    file: check(fileRes, 'getWeek.file') as FileRow | null,
   };
 }
 

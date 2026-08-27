@@ -14,7 +14,7 @@ import {
 import { log, logError } from './log';
 import { answerCallbackQuery, editMessageText, isChatAdmin, sendMessage, type InlineKeyboard } from './telegram';
 import { esc, formatDay, formatEmptyDay, formatWeek, humanDate } from './format';
-import { dayNameOf, mskDateOffset, mskStamp } from './time';
+import { dayNameOf, mskDateOffset, mskStamp, mskToday } from './time';
 import { env } from './env';
 import { LAST_CHECK_KEY } from './sync';
 
@@ -149,8 +149,8 @@ async function sendDay(chatId: number, offset: number, heading: string): Promise
   if (!group) return;
 
   const dateIso = mskDateOffset(offset);
-  const file = await latestFile();
-  const day = await getDay(group, dateIso);
+  const { days, file } = await getWeek(group, dateIso);
+  const day = days.find((d) => d.date === dateIso) ?? null;
 
   const opts = { group, siteUpdated: file?.site_updated ?? null, heading };
   const text = day
@@ -164,7 +164,7 @@ async function sendWeekMessages(chatId: number): Promise<void> {
   const group = await requireGroup(chatId);
   if (!group) return;
 
-  const { days, file } = await getWeek(group);
+  const { days, file } = await getWeek(group, mskToday());
   const chunks = formatWeek(days, {
     group,
     siteUpdated: file?.site_updated ?? null,
@@ -414,7 +414,7 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
       return;
     }
 
-    const { days, file } = await getWeek(groupName);
+    const { days, file } = await getWeek(groupName, mskToday());
     const index = Number(key);
     const day = days[index];
 
