@@ -10,6 +10,7 @@ import {
   getWeek,
   latestFile,
   listGroups,
+  migrateChat,
   setChatEnabled,
   setChatGroup,
   upsertChat,
@@ -42,6 +43,8 @@ interface TgMessage {
   from?: TgUser;
   chat: TgChat;
   text?: string;
+  /** Группа превратилась в супергруппу: чат переехал на новый идентификатор. */
+  migrate_to_chat_id?: number;
 }
 
 interface TgCallbackQuery {
@@ -179,6 +182,19 @@ function isStart(text: string): boolean {
 async function handleMessage(message: TgMessage): Promise<void> {
   const chatId = message.chat.id;
   const userId = message.from?.id;
+
+  // Служебное сообщение о переезде приходит в старый чат — переносим настройки,
+  // иначе бот замолчит в группе и перестанет слать расписание
+  if (message.migrate_to_chat_id) {
+    const moved = await migrateChat(chatId, message.migrate_to_chat_id);
+    if (moved) {
+      await log('command', `Чат переехал: ${chatId} → ${message.migrate_to_chat_id}`, {
+        chatId: message.migrate_to_chat_id,
+      });
+    }
+    return;
+  }
+
   if (!isStart(message.text ?? '')) return;
 
   const chat = await getChat(chatId);
@@ -225,7 +241,8 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
     return;
   }
 
-  if (!(await allowRequest(chatId, 20))) {
+  // В группе кнопки жмут все участники сразу, поэтому лимит выше, чем на команды
+  if (!(await allowRequest(chatId, 60))) {
     await answerCallbackQuery(query.id, 'Слишком часто, подожди минуту');
     return;
   }
@@ -436,11 +453,15 @@ async function handleMembership(event: TgChatMemberUpdate): Promise<void> {
   }
 
   await upsertChat(chatId, event.chat.title ?? null);
-  if (!chat) await setChatEnabled(chatId, true);
+
+  // Бота добавляют, чтобы он работал. Если чат был выключен — в том числе
+  // потому, что бота до этого удалили, — включаем обратно, иначе расписание
+  // молча перестало бы приходить.
+  if (!chat?.enabled) await setChatEnabled(chatId, true);
 
   await log('command', `Бота добавили в чат ${chatId}`, {
     chatId,
-    details: { title: event.chat.title },
+    details: { title: event.chat.title, wasEnabled: chat?.enabled ?? null },
   });
 
   const screen = menuScreen(await getChat(chatId));

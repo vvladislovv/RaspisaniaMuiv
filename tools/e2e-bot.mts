@@ -96,6 +96,17 @@ function membership(status: string, from = OWNER, chatId = CHAT, type = 'supergr
   };
 }
 
+/** Служебное сообщение: обычная группа превратилась в супергруппу. */
+function migration(oldId: number, newId: number): TgUpdate {
+  return {
+    message: {
+      message_id: Math.floor(Math.random() * 100000),
+      chat: { id: oldId, type: 'group', title: 'Тестовая группа' },
+      migrate_to_chat_id: newId,
+    },
+  };
+}
+
 function button(data: string, from = OWNER, chatId = CHAT): TgUpdate {
   return {
     callback_query: {
@@ -190,10 +201,42 @@ await handleUpdate(membership('kicked', OWNER));
 ok((await getChat(CHAT))?.enabled === false, 'после удаления бота автоотправка выключена');
 ok(sent(since(m)).length === 0, 'при удалении бот ничего не пишет');
 
+// Бота вернули — автоотправка должна ожить, иначе расписание молча пропадёт
+m = mark();
+await handleUpdate(membership('member', OWNER));
+ok((await getChat(CHAT))?.enabled === true, 'после возвращения бота автоотправка включена');
+ok(sent(since(m)).length === 1, 'при возвращении снова показывается меню');
+
 // Возвращаем чат в рабочее состояние для остальных проверок
 await resetChat();
 await resetRateLimit();
 await handleUpdate(membership('member', OWNER));
+
+// ─── Переезд группы в супергруппу ────────────────────────────────────────────
+
+head('Группа превратилась в супергруппу');
+const OLD_ID = -400111;
+const NEW_ID = -1004001110000;
+await handleUpdate(membership('member', OWNER, OLD_ID, 'group'));
+await handleUpdate(button('grp', OWNER, OLD_ID));
+{
+  const before = await getChat(OLD_ID);
+  ok(before?.enabled === true, 'старая группа подключена');
+
+  m = mark();
+  await handleUpdate(migration(OLD_ID, NEW_ID));
+  ok(sent(since(m)).length === 0, 'при переезде бот не пишет лишнего');
+
+  const moved = await getChat(NEW_ID);
+  ok(moved?.enabled === true, 'настройки переехали на новый id');
+  ok((await getChat(OLD_ID)) === null, 'старая запись удалена');
+
+  // После переезда кнопки должны работать по новому id
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(button('m', OWNER, NEW_ID));
+  ok(edited(since(m)).length === 1, 'кнопки работают в переехавшей группе');
+}
 
 // ─── Команд больше нет ───────────────────────────────────────────────────────
 
@@ -313,6 +356,43 @@ m = mark();
 await handleUpdate(button('d:all'));
 ok(edited(since(m)).length === 1, 'старая кнопка d:all ещё работает');
 
+// ─── Обычный участник группы ─────────────────────────────────────────────────
+
+await resetRateLimit();
+head('Обычный участник группы пользуется расписанием');
+m = mark();
+await handleUpdate(button('day:1', STRANGER));
+ok(edited(since(m)).length === 1, 'участник открывает расписание на завтра');
+
+m = mark();
+await handleUpdate(button('week', STRANGER));
+ok(edited(since(m)).length === 1, 'участник открывает неделю');
+
+buttons = keyboardOf(since(m));
+const someDay = buttons.find((b) => /^d:\d{4}-\d{2}-\d{2}$/.test(b.callback_data))!;
+m = mark();
+await handleUpdate(button(someDay.callback_data, STRANGER));
+ok(edited(since(m)).length === 1, 'участник листает дни');
+
+m = mark();
+await handleUpdate(button('st', STRANGER));
+ok(edited(since(m)).length === 1, 'участник смотрит статус');
+
+// Смотреть можно всем, менять настройки — только админам
+m = mark();
+await handleUpdate(button('grp', STRANGER));
+ok(edited(since(m)).length === 1, 'участник видит список курсов');
+const someGroup = keyboardOf(since(m)).find((b) => b.callback_data.startsWith('s:'))!;
+m = mark();
+await handleUpdate(button(someGroup.callback_data, STRANGER));
+const groupBtn = keyboardOf(since(m)).find((b) => b.callback_data.startsWith('g:'))!;
+m = mark();
+await handleUpdate(button(groupBtn.callback_data, STRANGER));
+ok(
+  (await getChat(CHAT))?.group_name === 'ИСП/П-24-11',
+  'но подтвердить смену группы участник не может',
+);
+
 // ─── Статус и переключатель автоотправки ─────────────────────────────────────
 
 await resetRateLimit();
@@ -365,9 +445,9 @@ ok(true, 'пустой апдейт не роняет обработчик');
 head('Ограничение частоты');
 await resetRateLimit();
 m = mark();
-for (let i = 0; i < 30; i++) await handleUpdate(button('m'));
+for (let i = 0; i < 70; i++) await handleUpdate(button('m'));
 const answered = edited(since(m)).length;
-ok(answered === 20, `из 30 нажатий обработано ${answered} — лимит 20 в минуту`);
+ok(answered === 60, `из 70 нажатий обработано ${answered} — лимит 60 в минуту`);
 
 // ─── Отказы Bot API ──────────────────────────────────────────────────────────
 

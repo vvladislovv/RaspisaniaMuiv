@@ -379,3 +379,36 @@ export async function weekStarts(): Promise<string[]> {
   const rows = (check(res, 'weekStarts') ?? []) as { week_start: string }[];
   return [...new Set(rows.map((r) => r.week_start))];
 }
+
+/**
+ * Переносит настройки чата на новый идентификатор.
+ *
+ * Обычная группа при превращении в супергруппу меняет chat_id, и без переноса
+ * бот потерял бы и выбранную группу, и право слать в этот чат.
+ */
+export async function migrateChat(oldId: number, newId: number): Promise<boolean> {
+  const previous = await getChat(oldId);
+  if (!previous) return false;
+
+  const res = await db()
+    .from('chats')
+    .upsert(
+      {
+        chat_id: newId,
+        title: previous.title,
+        group_name: previous.group_name,
+        enabled: previous.enabled,
+        // id закреплённого сообщения при переезде не переносится
+        pinned_msg_id: null,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'chat_id' },
+    )
+    .select('chat_id');
+  check(res, 'migrateChat.insert');
+
+  const del = await db().from('chats').delete().eq('chat_id', oldId).select('chat_id');
+  check(del, 'migrateChat.delete');
+
+  return true;
+}
