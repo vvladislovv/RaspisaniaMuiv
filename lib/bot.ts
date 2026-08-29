@@ -335,11 +335,19 @@ async function handleMessage(message: TgMessage): Promise<void> {
 
 // ─── Кнопки ──────────────────────────────────────────────────────────────────
 
-async function handleCallback(query: TgCallbackQuery): Promise<void> {
+/**
+ * Разбор нажатия. Гашение «часиков» передаётся отдельной функцией: его нельзя
+ * ждать перед работой — это лишний круг до Telegram, а замеры показали, что
+ * два последовательных вызова Bot API дают больше секунды задержки.
+ */
+async function runCallback(
+  query: TgCallbackQuery,
+  ack: (text?: string) => void,
+): Promise<void> {
   const data = query.data ?? '';
   const message = query.message;
   if (!message) {
-    await answerCallbackQuery(query.id);
+    ack();
     return;
   }
 
@@ -348,7 +356,7 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
 
   // В группе кнопки жмут все участники сразу, поэтому лимит выше, чем на команды
   if (!(await allowRequest(chatId, 60))) {
-    await answerCallbackQuery(query.id, 'Слишком часто, подожди минуту');
+    ack('Слишком часто, подожди минуту');
     return;
   }
 
@@ -358,7 +366,7 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
   /** Возвращает группу чата либо возвращает в меню с подсказкой. */
   const requireGroup = async (): Promise<string | null> => {
     if (chat?.group_name) return chat.group_name;
-    await answerCallbackQuery(query.id, 'Сначала выбери группу');
+    ack('Сначала выбери группу');
     await edit(menuScreen(chat, ctx));
     return null;
   };
@@ -366,7 +374,7 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
   // ─── Меню и статус ─────────────────────────────────────────────────────────
 
   if (data === 'm') {
-    await answerCallbackQuery(query.id);
+    ack();
     await edit(menuScreen(chat, ctx));
     return;
   }
@@ -374,29 +382,29 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
   // Сводка — только владельцу бота
   if (data === 'adm') {
     if (query.from.id !== env.adminTelegramId) {
-      await answerCallbackQuery(query.id, 'Недоступно');
+      ack('Недоступно');
       return;
     }
-    await answerCallbackQuery(query.id);
+    ack();
     await edit(await adminScreen());
     return;
   }
 
   if (data === 'st') {
-    await answerCallbackQuery(query.id);
+    ack();
     await edit(await statusScreen(chat));
     return;
   }
 
   if (data === 'about') {
-    await answerCallbackQuery(query.id);
+    ack();
     await edit(aboutScreen());
     return;
   }
 
   if (data === 'off' || data === 'on') {
     if (!(await isChatAdmin(chatId, query.from.id))) {
-      await answerCallbackQuery(query.id, 'Только админ чата может это менять');
+      ack('Только админ чата может это менять');
       return;
     }
     const enable = data === 'on';
@@ -418,7 +426,7 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
     if (!group) return;
 
     const offset = Number(data.slice(4));
-    await answerCallbackQuery(query.id);
+    ack();
     await edit(
       await dayScreen(
         group,
@@ -435,7 +443,7 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
     if (!group) return;
 
     const key = data.slice(2);
-    await answerCallbackQuery(query.id);
+    ack();
 
     if (key === 'all') {
       const { chunks, keyboard } = await weekScreen(group, mskToday());
@@ -458,7 +466,7 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
     const group = await requireGroup();
     if (!group) return;
 
-    await answerCallbackQuery(query.id);
+    ack();
 
     const from = data === 'week' ? mskToday() : data.slice(2);
     const { chunks, keyboard } = await weekScreen(group, from);
@@ -476,7 +484,7 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
   const { sheets, groups } = await groupIndex();
 
   if (data === 'grp' || data === 'back') {
-    await answerCallbackQuery(query.id);
+    ack();
 
     if (sheets.length === 0) {
       await edit({
@@ -501,12 +509,12 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
     const sheet = sheets[sheetIndex];
 
     if (!sheet) {
-      await answerCallbackQuery(query.id, 'Список устарел');
+      ack('Список устарел');
       await edit({ text: '*Выбери курс:*', keyboard: sheetKeyboard(sheets) });
       return;
     }
 
-    await answerCallbackQuery(query.id);
+    ack();
     await edit({
       text: `*${esc(sheet)}*\nВыбери группу:`,
       keyboard: groupKeyboard(
@@ -520,27 +528,27 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
 
   if (data.startsWith('g:')) {
     if (!(await isChatAdmin(chatId, query.from.id))) {
-      await answerCallbackQuery(query.id, 'Только админ чата может менять группу');
+      ack('Только админ чата может менять группу');
       return;
     }
 
     const group = groups[Number(data.slice(2))];
     if (!group) {
-      await answerCallbackQuery(query.id, 'Список устарел');
+      ack('Список устарел');
       await edit({ text: '*Выбери курс:*', keyboard: sheetKeyboard(sheets) });
       return;
     }
 
     await upsertChat(chatId, message.chat.title ?? null);
     await setChatGroup(chatId, group.group);
-    await answerCallbackQuery(query.id, `Выбрано: ${group.group}`);
+    ack(`Выбрано: ${group.group}`);
     await log('command', `Группа чата установлена: ${group.group}`, { chatId });
 
     await edit(menuScreen(await getChat(chatId), ctx));
     return;
   }
 
-  await answerCallbackQuery(query.id);
+  ack();
 }
 
 // ─── Бота добавили или удалили ───────────────────────────────────────────────
@@ -591,6 +599,21 @@ async function handleMembership(event: TgChatMemberUpdate): Promise<void> {
       : `\n\n_${esc('Чтобы я мог закреплять расписание, дай мне право «Закрепление сообщений».')}_`;
 
   await sendMessage(chatId, screen.text + hint, { silent: true, keyboard: screen.keyboard });
+}
+
+/** Гасит «часики» параллельно с работой и дожидается обоих. */
+async function handleCallback(query: TgCallbackQuery): Promise<void> {
+  let acking: Promise<void> | null = null;
+  const ack = (text?: string) => {
+    acking ??= answerCallbackQuery(query.id, text);
+  };
+
+  try {
+    await runCallback(query, ack);
+  } finally {
+    ack();
+    await acking;
+  }
 }
 
 /** Точка входа для вебхука. Никогда не бросает — Telegram не должен ретраить. */
