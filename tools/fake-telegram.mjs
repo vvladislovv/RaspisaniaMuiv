@@ -36,6 +36,9 @@ function result(method, body) {
       return { status: admins.has(String(body.user_id)) ? 'administrator' : 'member' };
     case 'getMe':
       return { id: 1, is_bot: true, username: 'fake_bot' };
+    case 'setMyDescription':
+    case 'setMyShortDescription':
+      return true;
     case 'getWebhookInfo':
       return { url: 'https://example.test/api/bot', has_custom_certificate: false };
     default:

@@ -10,6 +10,8 @@ import {
   getWeek,
   latestFile,
   listGroups,
+  chatStats,
+  errorCount,
   migrateChat,
   setChatEnabled,
   setChatGroup,
@@ -19,7 +21,14 @@ import {
   type Chat,
 } from './db';
 import { log, logError } from './log';
-import { answerCallbackQuery, editMessageText, isChatAdmin, sendMessage, type InlineKeyboard } from './telegram';
+import {
+  answerCallbackQuery,
+  botUsername,
+  editMessageText,
+  isChatAdmin,
+  sendMessage,
+  type InlineKeyboard,
+} from './telegram';
 import { esc, formatDay, formatEmptyDay, formatWeek, humanDate } from './format';
 import { groupKeyboard, menuKeyboard, scheduleKeyboard, sheetKeyboard, statusKeyboard } from './keyboard';
 import { dayNameOf, mskDateOffset, mskStamp, mskToday } from './time';
@@ -75,23 +84,82 @@ interface Screen {
 
 // ─── Экраны ──────────────────────────────────────────────────────────────────
 
-function menuScreen(chat: Chat | null): Screen {
+interface Context {
+  isPrivate: boolean;
+  isOwner: boolean;
+  username: string | null;
+}
+
+function menuScreen(chat: Chat | null, ctx: Context): Screen {
   const lines = ['*Расписание колледжа МУИВ*', ''];
 
   if (chat?.group_name) {
     lines.push(`👥 Группа: *${esc(chat.group_name)}*`);
     lines.push('');
-    lines.push('Проверяю сайт каждый час и сообщаю, когда расписание меняется\\.');
+    lines.push(esc('Проверяю сайт каждый час и обновляю закреплённое расписание.'));
     lines.push(
       chat.enabled
-        ? 'Каждый день в 16:00 присылаю расписание на завтра и закрепляю его \\(кроме субботы\\)\\.'
-        : '_Автоотправка выключена\\. Включить — в разделе «Статус»\\._',
+        ? esc('Каждый день в 16:00 присылаю расписание на завтра и закрепляю его, кроме субботы.')
+        : `_${esc('Автоотправка выключена. Включить — в разделе «Статус».')}_`,
     );
   } else {
-    lines.push('Группа ещё не выбрана\\. Нажми «Выбрать группу» — дальше всё кнопками\\.');
+    lines.push(esc('Группа ещё не выбрана. Нажми «Выбрать группу» — дальше всё кнопками.'));
   }
 
-  return { text: lines.join('\n'), keyboard: menuKeyboard(chat?.group_name ?? null) };
+  if (ctx.isPrivate) {
+    lines.push('');
+    lines.push(`*${esc('Как добавить в группу')}*`);
+    lines.push(esc('1. Нажми «Добавить в группу» и выбери чат.'));
+    lines.push(esc('2. Сделай меня администратором.'));
+    lines.push(esc('3. Из прав нужно одно — «Закрепление сообщений».'));
+    lines.push(esc('Меню появится в группе само, писать команды не нужно.'));
+  }
+
+  return {
+    text: lines.join('\n'),
+    keyboard: menuKeyboard({
+      group: chat?.group_name ?? null,
+      isPrivate: ctx.isPrivate,
+      isOwner: ctx.isOwner,
+      username: ctx.username,
+    }),
+  };
+}
+
+/** Сводка для владельца бота: сколько чатов, какие группы, есть ли ошибки. */
+async function adminScreen(): Promise<Screen> {
+  const [stats, errors, check, file] = await Promise.all([
+    chatStats(),
+    errorCount(24),
+    getState<{ at: string; filesOnSite: number; errors: string[] }>(LAST_CHECK_KEY),
+    latestFile(),
+  ]);
+
+  const lines = ['*Сводка*', ''];
+  lines.push(`Чатов: *${stats.total}*, включено ${stats.enabled}, с группой ${stats.withGroup}`);
+  lines.push(`Ошибок за сутки: ${errors === 0 ? '*0*' : `*${errors}*`}`);
+
+  if (check) {
+    lines.push(`Проверка сайта: ${esc(mskStamp(new Date(check.at)))}`);
+    if (check.errors.length > 0) lines.push(`⚠️ ${esc(check.errors.join('; ').slice(0, 200))}`);
+  }
+  if (file) lines.push(`Файл: ${esc(file.title)}`);
+
+  if (stats.topGroups.length > 0) {
+    lines.push('');
+    lines.push(`*${esc('Группы')}*`);
+    for (const row of stats.topGroups) {
+      lines.push(`${esc(row.group)} — ${row.chats}`);
+    }
+  }
+
+  return {
+    text: lines.join('\n'),
+    keyboard: [
+      [{ text: '🔄 Обновить', callback_data: 'adm' }],
+      [{ text: '↩︎ Меню', callback_data: 'm' }],
+    ],
+  };
 }
 
 /** Экран одного дня. */
@@ -204,6 +272,21 @@ async function groupIndex(): Promise<{
   return { sheets, groups };
 }
 
+/** Что показывать в меню: личка это или группа, и кто нажал. */
+async function contextOf(chat: TgChat, userId?: number): Promise<Context> {
+  let username: string | null = null;
+  try {
+    username = await botUsername();
+  } catch {
+    // без имени просто не покажем кнопку «Добавить в группу»
+  }
+  return {
+    isPrivate: chat.type === 'private',
+    isOwner: userId === env.adminTelegramId,
+    username,
+  };
+}
+
 // ─── Команда /start ──────────────────────────────────────────────────────────
 
 function isStart(text: string): boolean {
@@ -228,29 +311,25 @@ async function handleMessage(message: TgMessage): Promise<void> {
 
   if (!isStart(message.text ?? '')) return;
 
-  const chat = await getChat(chatId);
-  const isOwner = userId === env.adminTelegramId;
-
-  // Список разрешённых чатов: подключить новый чат может только владелец бота
-  if (!chat && !isOwner) {
-    await log('skip', `/start из неразрешённого чата ${chatId}`, { chatId });
-    return;
-  }
-
-  if (chat && !chat.enabled && !isOwner) return;
-
   if (!(await allowRequest(chatId))) {
     await log('skip', `Rate limit в чате ${chatId}`, { chatId });
     return;
   }
 
-  await log('command', '/start', { chatId, details: { userId } });
+  const chat = await getChat(chatId);
+  const isNew = !chat;
 
   await upsertChat(chatId, message.chat.title ?? null);
-  // Новый чат подключает владелец бота — сразу включаем автоотправку
-  if (!chat && isOwner) await setChatEnabled(chatId, true);
+  // Бот публичный: любой чат подключается сам. Выключенный чат включаем
+  // обратно только по /start — то есть по явному действию человека.
+  if (!chat?.enabled) await setChatEnabled(chatId, true);
 
-  const screen = menuScreen(await getChat(chatId));
+  await log('command', '/start', {
+    chatId,
+    details: { userId, isNew, type: message.chat.type, title: message.chat.title },
+  });
+
+  const screen = menuScreen(await getChat(chatId), await contextOf(message.chat, userId));
   await sendMessage(chatId, screen.text, { silent: true, keyboard: screen.keyboard });
 }
 
@@ -265,12 +344,7 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
   }
 
   const chatId = message.chat.id;
-  const chat = await getChat(chatId);
-
-  if (!chat && query.from.id !== env.adminTelegramId) {
-    await answerCallbackQuery(query.id, 'Чат не подключён');
-    return;
-  }
+  const [chat, ctx] = await Promise.all([getChat(chatId), contextOf(message.chat, query.from.id)]);
 
   // В группе кнопки жмут все участники сразу, поэтому лимит выше, чем на команды
   if (!(await allowRequest(chatId, 60))) {
@@ -285,7 +359,7 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
   const requireGroup = async (): Promise<string | null> => {
     if (chat?.group_name) return chat.group_name;
     await answerCallbackQuery(query.id, 'Сначала выбери группу');
-    await edit(menuScreen(chat));
+    await edit(menuScreen(chat, ctx));
     return null;
   };
 
@@ -293,7 +367,18 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
 
   if (data === 'm') {
     await answerCallbackQuery(query.id);
-    await edit(menuScreen(chat));
+    await edit(menuScreen(chat, ctx));
+    return;
+  }
+
+  // Сводка — только владельцу бота
+  if (data === 'adm') {
+    if (query.from.id !== env.adminTelegramId) {
+      await answerCallbackQuery(query.id, 'Недоступно');
+      return;
+    }
+    await answerCallbackQuery(query.id);
+    await edit(await adminScreen());
     return;
   }
 
@@ -395,8 +480,13 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
 
     if (sheets.length === 0) {
       await edit({
-        text: 'Расписание ещё не загружено\\. Попробуй через час\\.',
-        keyboard: menuKeyboard(chat?.group_name ?? null),
+        text: esc('Расписание ещё не загружено. Попробуй через час.'),
+        keyboard: menuKeyboard({
+          group: chat?.group_name ?? null,
+          isPrivate: ctx.isPrivate,
+          isOwner: ctx.isOwner,
+          username: ctx.username,
+        }),
       });
       return;
     }
@@ -446,7 +536,7 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
     await answerCallbackQuery(query.id, `Выбрано: ${group.group}`);
     await log('command', `Группа чата установлена: ${group.group}`, { chatId });
 
-    await edit(menuScreen(await getChat(chatId)));
+    await edit(menuScreen(await getChat(chatId), ctx));
     return;
   }
 
@@ -478,16 +568,6 @@ async function handleMembership(event: TgChatMemberUpdate): Promise<void> {
   }
 
   const chat = await getChat(chatId);
-  const isOwner = event.from.id === env.adminTelegramId;
-
-  // Подключить новый чат может только владелец бота
-  if (!chat && !isOwner) {
-    await log('skip', `Бота добавили в неразрешённый чат ${chatId}`, {
-      chatId,
-      details: { addedBy: event.from.id, title: event.chat.title },
-    });
-    return;
-  }
 
   await upsertChat(chatId, event.chat.title ?? null);
 
@@ -501,14 +581,14 @@ async function handleMembership(event: TgChatMemberUpdate): Promise<void> {
     details: { title: event.chat.title, wasEnabled: chat?.enabled ?? null },
   });
 
-  const screen = menuScreen(await getChat(chatId));
+  const screen = menuScreen(await getChat(chatId), await contextOf(event.chat, event.from.id));
 
   // В группе напоминаем про право закреплять — без него ежедневное
   // расписание отправится, но не закрепится
   const hint =
     event.chat.type === 'private'
       ? ''
-      : '\n\n_Чтобы я мог закреплять расписание, дай мне право «Закреплять сообщения»\\._';
+      : `\n\n_${esc('Чтобы я мог закреплять расписание, дай мне право «Закрепление сообщений».')}_`;
 
   await sendMessage(chatId, screen.text + hint, { silent: true, keyboard: screen.keyboard });
 }

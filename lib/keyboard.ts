@@ -17,30 +17,46 @@ export function chunk<T>(items: T[], size: number): T[][] {
 
 const TO_MENU = { text: '↩︎ Меню', callback_data: 'm' };
 
-/** Главное меню. Без выбранной группы показывать расписание нечего. */
-export function menuKeyboard(group: string | null): InlineKeyboard {
-  if (!group) {
-    return [
-      [{ text: '👥 Выбрать группу', callback_data: 'grp' }],
-      [
-        { text: '⚙️ Статус', callback_data: 'st' },
-        { text: 'ℹ️ О боте', callback_data: 'about' },
-      ],
-    ];
-  }
+export interface MenuOptions {
+  group: string | null;
+  /** В личке предлагаем добавить бота в группу; в самой группе это не нужно. */
+  isPrivate: boolean;
+  /** Владельцу бота показываем вход в сводку. */
+  isOwner: boolean;
+  /** Имя бота для ссылки «добавить в группу». */
+  username: string | null;
+}
 
-  return [
-    [
+/** Главное меню. Без выбранной группы показывать расписание нечего. */
+export function menuKeyboard(opts: MenuOptions): InlineKeyboard {
+  const rows: InlineKeyboard = [];
+
+  if (opts.group) {
+    rows.push([
       { text: '📅 Завтра', callback_data: 'day:1' },
       { text: '📅 Сегодня', callback_data: 'day:0' },
-    ],
-    [{ text: '📖 Вся неделя', callback_data: 'week' }],
-    [{ text: '👥 Сменить группу', callback_data: 'grp' }],
-    [
-      { text: '⚙️ Статус', callback_data: 'st' },
-      { text: 'ℹ️ О боте', callback_data: 'about' },
-    ],
-  ];
+    ]);
+    rows.push([{ text: '📖 Вся неделя', callback_data: 'week' }]);
+    rows.push([{ text: '👥 Сменить группу', callback_data: 'grp' }]);
+  } else {
+    rows.push([{ text: '👥 Выбрать группу', callback_data: 'grp' }]);
+  }
+
+  // Ссылка открывает выбор группы прямо в Telegram — руками добавлять не нужно
+  if (opts.isPrivate && opts.username) {
+    rows.push([
+      { text: '➕ Добавить в группу', url: `https://t.me/${opts.username}?startgroup=true` },
+    ]);
+  }
+
+  rows.push([
+    { text: '⚙️ Статус', callback_data: 'st' },
+    { text: 'ℹ️ О боте', callback_data: 'about' },
+  ]);
+
+  if (opts.isOwner) rows.push([{ text: '🛠 Сводка', callback_data: 'adm' }]);
+
+  return rows;
 }
 
 /**

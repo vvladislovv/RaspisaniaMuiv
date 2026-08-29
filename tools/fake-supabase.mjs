@@ -83,6 +83,15 @@ function applyFilters(rows, params) {
           return String(cell) < String(value);
         case 'in':
           return String(value).split(',').includes(String(cell));
+        case 'like':
+        case 'ilike': {
+          // PostgREST использует * как подстановочный знак
+          const pattern = new RegExp(
+            '^' + String(value).replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$',
+            op === 'ilike' ? 'i' : '',
+          );
+          return pattern.test(String(cell));
+        }
         default:
           return true;
       }

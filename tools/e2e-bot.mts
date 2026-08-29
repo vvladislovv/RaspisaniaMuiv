@@ -86,12 +86,20 @@ function find(buttons: Button[], fragment: string): Button | undefined {
   return buttons.find((b) => b.text.includes(fragment));
 }
 
-function message(text: string, from = OWNER, chatId = CHAT): TgUpdate {
+function message(
+  text: string,
+  from = OWNER,
+  chatId = CHAT,
+  type: 'supergroup' | 'private' = 'supergroup',
+): TgUpdate {
   return {
     message: {
       message_id: Math.floor(Math.random() * 100000),
       from: { id: from },
-      chat: { id: chatId, type: 'supergroup', title: 'Тестовая группа' },
+      chat:
+        type === 'private'
+          ? { id: chatId, type: 'private' }
+          : { id: chatId, type: 'supergroup', title: 'Тестовая группа' },
       text,
     },
   };
@@ -157,6 +165,14 @@ async function forgetFiles(): Promise<void> {
   });
 }
 
+/** Забывает отметки о разосланных алертах — иначе повтор прогона их подавит. */
+async function resetAlerts(): Promise<void> {
+  await fetch(`${process.env.SUPABASE_URL}/rest/v1/app_state?key=like.alert:*`, {
+    method: 'DELETE',
+    headers: { apikey: 'fake', Authorization: 'Bearer fake' },
+  });
+}
+
 /** Заставляет дублёр Telegram отклонять указанные методы. */
 async function failMethods(methods: string[]): Promise<void> {
   await fetch(`${process.env.TELEGRAM_API_BASE}/bot/__fail`, {
@@ -203,6 +219,7 @@ async function seedFromFixture(marker = ''): Promise<boolean> {
 head('Подготовка: загрузка расписания');
 await resetChat();
 await resetRateLimit();
+await resetAlerts();
 const first = await tick(false);
 const siteReachable = first.check !== null && first.check.errors.length === 0;
 
@@ -218,32 +235,47 @@ ok(groups.length > 50, `в базе ${groups.length} групп`);
 
 // ─── Список разрешённых чатов ────────────────────────────────────────────────
 
-head('Список разрешённых чатов');
+head('Публичный доступ');
 let m = mark();
 await handleUpdate(message('/start', STRANGER, -999));
-ok(sent(since(m)).length === 0, 'бот молчит в неизвестном чате');
+ok(sent(since(m)).length === 1, 'любой чат подключается сам');
+ok((await getChat(-999))?.enabled === true, 'новый чат сразу включён');
 
 m = mark();
-await handleUpdate(message('/start', STRANGER, -997));
-ok(sent(since(m)).length === 0, 'обычный участник не подключает новый чат');
+await handleUpdate(message('/start', STRANGER, STRANGER, 'private'));
+const dm = since(m);
+ok(sent(dm).length === 1, 'в личке тоже отвечает');
+ok(
+  texts(dm).join('').includes('Как добавить в группу'),
+  'в личке есть инструкция по добавлению в группу',
+);
+ok(
+  texts(dm).join('').includes('Закрепление сообщений'),
+  'сказано, какое право нужно дать',
+);
+ok(
+  keyboardOf(dm).some((b) => String(b.url ?? '').includes('startgroup')),
+  'есть кнопка-ссылка «Добавить в группу»',
+);
+ok(!find(keyboardOf(dm), 'Сводка'), 'постороннему сводка не предлагается');
 
 m = mark();
-await handleUpdate(message('/start', GROUP_ADMIN, -996));
-ok(sent(since(m)).length === 0, 'админ группы, но не владелец бота, тоже не подключает');
+await handleUpdate(message('/start', OWNER, OWNER, 'private'));
+ok(!!find(keyboardOf(since(m)), 'Сводка'), 'владельцу предлагается сводка');
 
 // ─── Добавление в группу ─────────────────────────────────────────────────────
 
 head('Бота добавили в группу');
 m = mark();
 await handleUpdate(membership('member', STRANGER, -998));
-ok(sent(since(m)).length === 0, 'посторонний не подключает чат добавлением бота');
+ok(sent(since(m)).length === 1, 'бота может добавить любой — меню появляется');
 
 m = mark();
 await handleUpdate(membership('member', OWNER));
 let added = since(m);
 ok(sent(added).length === 1, 'меню появляется само, без команд');
 ok(texts(added).join('').includes('Расписание колледжа МУИВ'), 'это меню');
-ok(texts(added).join('').includes('Закреплять сообщения'), 'напоминание про право закрепления');
+ok(texts(added).join('').includes('Закрепление сообщений'), 'напоминание про право закрепления');
 ok(keyboardOf(added).length > 0, 'под меню есть кнопки');
 ok((await getChat(CHAT))?.enabled === true, 'чат подключён и включён');
 
@@ -251,7 +283,10 @@ ok((await getChat(CHAT))?.enabled === true, 'чат подключён и вкл
 await resetChat();
 m = mark();
 await handleUpdate(membership('member', OWNER, OWNER, 'private'));
-ok(!texts(since(m)).join('').includes('Закреплять сообщения'), 'в личке про закрепление молчим');
+ok(
+  !texts(since(m)).join('').includes('дай мне право'),
+  'в личке напоминания про закрепление нет',
+);
 
 // Бота выгнали — автоотправка должна выключиться
 await resetChat();
@@ -505,6 +540,32 @@ const bare = about
   .replace(/[*_]/g, '');
 ok(!/[.!()\-]/.test(bare), `в тексте нет неэкранированных символов: ${bare.slice(0, 60)}`);
 
+// ─── Подавление повторных алертов ────────────────────────────────────────────
+
+head('Повторные алерты владельцу');
+await resetAlerts();
+{
+  const { logError } = await import('../lib/log');
+  m = mark();
+  await logError('Проверка подавления', new Error('первая'));
+  const firstAlert = sent(since(m)).filter((c) => c.body.chat_id === OWNER).length;
+  ok(firstAlert === 1, 'первая ошибка уходит владельцу');
+
+  m = mark();
+  await logError('Проверка подавления', new Error('вторая'));
+  ok(
+    sent(since(m)).filter((c) => c.body.chat_id === OWNER).length === 0,
+    'та же ошибка повторно не беспокоит',
+  );
+
+  m = mark();
+  await logError('Другая ошибка', new Error('третья'));
+  ok(
+    sent(since(m)).filter((c) => c.body.chat_id === OWNER).length === 1,
+    'но другая ошибка приходит',
+  );
+}
+
 // ─── Устойчивость ────────────────────────────────────────────────────────────
 
 await resetRateLimit();
@@ -580,7 +641,18 @@ ok((await getChat(CHAT))?.pinned_msg_id !== null, 'id закреплённого
 m = mark();
 const second = await tick(true);
 after = since(m);
-ok(second.autoSend === 'sent', 'повторная рассылка выполнена');
+ok(second.sent === 0, 'повторный тик не шлёт расписание второй раз');
+ok(
+  sent(after).filter((c) => c.body.chat_id === CHAT).length === 0,
+  'в чат ничего не ушло',
+);
+
+// Наступил следующий день: дата закреплённого другая, значит шлём заново
+await setPinnedMessage(CHAT, 900, '2020-01-01');
+m = mark();
+const third = await tick(true);
+after = since(m);
+ok(third.sent === 1, 'на новый день расписание уходит');
 ok(after.some((c) => c.method === 'unpinChatMessage'), 'прошлое закрепление снято');
 
 // ─── Обновление расписания на сайте ──────────────────────────────────────────

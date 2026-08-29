@@ -3,7 +3,10 @@ import { env } from './env';
 
 export interface InlineButton {
   text: string;
-  callback_data: string;
+  /** Обычная кнопка: присылает нажатие боту. */
+  callback_data?: string;
+  /** Кнопка-ссылка: например, «добавить бота в группу». */
+  url?: string;
 }
 
 export type InlineKeyboard = InlineButton[][];
@@ -14,6 +17,27 @@ interface CallOptions {
 }
 
 const TIMEOUT_MS = 12_000;
+
+/** Ошибка Bot API с кодом: по нему видно, что чат потерян навсегда. */
+export class TelegramError extends Error {
+  constructor(
+    readonly method: string,
+    readonly code: number,
+    readonly description: string,
+  ) {
+    super(`Telegram ${method}: ${description}`);
+    this.name = 'TelegramError';
+  }
+
+  /** Чат недоступен безвозвратно: бота выгнали, заблокировали, чат удалён. */
+  get chatIsGone(): boolean {
+    if (this.code === 403) return true;
+    return (
+      this.code === 400 &&
+      /chat not found|group chat was deactivated|PEER_ID_INVALID/i.test(this.description)
+    );
+  }
+}
 
 /**
  * Адрес Bot API. Переопределяется только для локальных проверок
@@ -43,7 +67,7 @@ async function call<T>(method: string, body: unknown, opts: CallOptions = {}): P
         await new Promise((r) => setTimeout(r, 1000 * attempt));
         continue;
       }
-      throw new Error(`Telegram ${method}: ${json.description ?? 'неизвестная ошибка'}`);
+      throw new TelegramError(method, json.error_code ?? 0, json.description ?? 'неизвестная ошибка');
     } catch (error) {
       lastError = error;
       if (attempt === retries) break;
@@ -208,6 +232,16 @@ export async function setMyDescriptions(): Promise<{ description: boolean; short
   if (short) await call('setMyShortDescription', { short_description: short });
 
   return { description: Boolean(description), short: Boolean(short) };
+}
+
+let cachedUsername: string | null = null;
+
+/** Имя бота — нужно для ссылки «добавить в группу». Спрашиваем один раз. */
+export async function botUsername(): Promise<string> {
+  if (cachedUsername) return cachedUsername;
+  const me = await call<{ username: string }>('getMe', {}, { retries: 2 });
+  cachedUsername = me.username;
+  return cachedUsername;
 }
 
 export function getWebhookInfo(): Promise<unknown> {

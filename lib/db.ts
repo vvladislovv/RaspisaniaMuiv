@@ -434,3 +434,42 @@ export async function migrateChat(oldId: number, newId: number): Promise<boolean
 
   return true;
 }
+
+export interface ChatStats {
+  total: number;
+  enabled: number;
+  withGroup: number;
+  topGroups: { group: string; chats: number }[];
+}
+
+/** Сводка по подключённым чатам — для админского экрана. */
+export async function chatStats(): Promise<ChatStats> {
+  const res = await db().from('chats').select('group_name, enabled');
+  const rows = (check(res, 'chatStats') ?? []) as { group_name: string | null; enabled: boolean }[];
+
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    if (row.group_name) counts.set(row.group_name, (counts.get(row.group_name) ?? 0) + 1);
+  }
+
+  return {
+    total: rows.length,
+    enabled: rows.filter((r) => r.enabled).length,
+    withGroup: rows.filter((r) => r.group_name).length,
+    topGroups: [...counts]
+      .map(([group, chats]) => ({ group, chats }))
+      .sort((a, b) => b.chats - a.chats || a.group.localeCompare(b.group, 'ru'))
+      .slice(0, 8),
+  };
+}
+
+/** Сколько ошибок записано за последние сутки. */
+export async function errorCount(hours = 24): Promise<number> {
+  const since = new Date(Date.now() - hours * 3_600_000).toISOString();
+  const res = await db()
+    .from('logs')
+    .select('id')
+    .eq('kind', 'error')
+    .gte('ts', since);
+  return ((check(res, 'errorCount') ?? []) as unknown[]).length;
+}

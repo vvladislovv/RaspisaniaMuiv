@@ -7,6 +7,7 @@ import { fetchSite, type SiteFile } from './muiv';
 import { parseSchedule } from './parse';
 import {
   activeChats,
+  setChatEnabled,
   fileNameOf,
   getFileByName,
   latestFile,
@@ -18,11 +19,18 @@ import {
   upsertFile,
   getWeek,
   weekStarts,
+  type Chat,
   type FileRow,
 } from './db';
 import { log, logError } from './log';
 import { formatDay, formatEmptyDay } from './format';
-import { editMessageText, pinChatMessage, sendMessage, unpinChatMessage } from './telegram';
+import {
+  TelegramError,
+  editMessageText,
+  pinChatMessage,
+  sendMessage,
+  unpinChatMessage,
+} from './telegram';
 import { scheduleKeyboard } from './keyboard';
 import { dayNameOf, isSaturdayMsk, mskDateOffset, mskParts } from './time';
 import { env } from './env';
@@ -210,72 +218,140 @@ export async function refreshPinned(): Promise<number> {
   return updated;
 }
 
-/** Отправляет расписание на завтра во все активные чаты и закрепляет сообщение. */
-export async function sendTomorrow(): Promise<{ sent: number; failed: number }> {
-  const chats = await activeChats();
+/** Сколько чатов обслуживаем одновременно. Telegram допускает ~30 сообщений в секунду. */
+const SEND_CONCURRENCY = 8;
+
+/**
+ * Сколько времени отводим рассылке. Лимит функции — 60 секунд; останавливаемся
+ * заранее, чтобы успеть записать состояние и вернуть ответ.
+ */
+const SEND_BUDGET_MS = 45_000;
+
+/** Отправляет расписание одному чату. Возвращает, удалось ли. */
+async function sendToChat(
+  chat: Chat,
+  dateIso: string,
+  dayName: string,
+  weeks: string[],
+): Promise<'sent' | 'failed' | 'disabled'> {
+  if (!chat.group_name) return 'failed';
+
+  try {
+    // Берём неделю, содержащую завтрашний день: так подпись «файл обновлён»
+    // относится к тому файлу, из которого взято расписание.
+    const { days, file } = await getWeek(chat.group_name, dateIso);
+    const day = days.find((d) => d.date === dateIso) ?? null;
+
+    const opts = {
+      group: chat.group_name,
+      siteUpdated: file?.site_updated ?? null,
+      heading: 'Расписание на завтра',
+    };
+    const text = day ? formatDay(day, opts) : formatEmptyDay(dateIso, dayName, opts);
+
+    // Кнопки и под закреплённым сообщением: можно листать дни, не набирая команды
+    const keyboard = scheduleKeyboard(days, day ? dateIso : null, file?.week_start ?? null, weeks);
+    const message = await sendMessage(chat.chat_id, text, { silent: false, keyboard });
+
+    // Дату помечаем сразу после отправки, до закрепления: она означает
+    // «за этот день уже отправлено», и по ней рассылка продолжается с места
+    // обрыва, а не начинает всё заново.
+    await setPinnedMessage(chat.chat_id, message.message_id, dateIso);
+
+    if (chat.pinned_msg_id) {
+      try {
+        await unpinChatMessage(chat.chat_id, chat.pinned_msg_id);
+      } catch {
+        // старое сообщение могли удалить вручную — это не ошибка
+      }
+    }
+
+    try {
+      await pinChatMessage(chat.chat_id, message.message_id);
+    } catch (error) {
+      // без прав на закрепление сообщение всё равно отправлено
+      await log('skip', `Не удалось закрепить сообщение в чате ${chat.chat_id}`, {
+        chatId: chat.chat_id,
+        details: { reason: error instanceof Error ? error.message : String(error) },
+      });
+    }
+
+    await log('send', `Расписание на ${dateIso} отправлено`, {
+      chatId: chat.chat_id,
+      details: { group: chat.group_name, lessons: day?.lessons.length ?? 0 },
+    });
+    return 'sent';
+  } catch (error) {
+    // Бота выгнали или заблокировали — выключаем чат, иначе он будет
+    // впустую отъедать время рассылки каждый день
+    if (error instanceof TelegramError && error.chatIsGone) {
+      await setChatEnabled(chat.chat_id, false);
+      await log('skip', `Чат ${chat.chat_id} недоступен, выключен`, {
+        chatId: chat.chat_id,
+        details: { reason: error.description },
+      });
+      return 'disabled';
+    }
+
+    await logError(`Отправка расписания в чат ${chat.chat_id}`, error);
+    return 'failed';
+  }
+}
+
+export interface SendResult {
+  sent: number;
+  failed: number;
+  disabled: number;
+  /** Чаты, до которых не дошли из-за нехватки времени. */
+  pending: number;
+}
+
+/**
+ * Рассылает расписание на завтра.
+ *
+ * Чаты обслуживаются пачками: последовательный цикл при полусотне чатов
+ * упирался в лимит функции, и остаток молча оставался без расписания.
+ * Если время всё же кончается, работа прерывается штатно — уже отправленные
+ * чаты помечены датой, и следующий тик продолжит с места обрыва.
+ */
+export async function sendTomorrow(): Promise<SendResult> {
   const dateIso = mskDateOffset(1);
   const dayName = dayNameOf(dateIso);
   const weeks = await weekStarts();
+  const deadline = Date.now() + SEND_BUDGET_MS;
 
-  let sent = 0;
-  let failed = 0;
+  const all = await activeChats();
+  const queue = all.filter((chat) => chat.group_name && chat.pinned_date !== dateIso);
 
-  for (const chat of chats) {
-    if (!chat.group_name) continue;
+  const result: SendResult = { sent: 0, failed: 0, disabled: 0, pending: 0 };
+  let next = 0;
 
-    try {
-      // Берём неделю, содержащую завтрашний день: так подпись «файл обновлён»
-      // относится к тому файлу, из которого взято расписание.
-      const { days, file } = await getWeek(chat.group_name, dateIso);
-      const day = days.find((d) => d.date === dateIso) ?? null;
+  const worker = async () => {
+    while (true) {
+      if (Date.now() > deadline) return;
+      const index = next++;
+      if (index >= queue.length) return;
 
-      const text = day
-        ? formatDay(day, {
-            group: chat.group_name,
-            siteUpdated: file?.site_updated ?? null,
-            heading: 'Расписание на завтра',
-          })
-        : formatEmptyDay(dateIso, dayName, {
-            group: chat.group_name,
-            siteUpdated: file?.site_updated ?? null,
-            heading: 'Расписание на завтра',
-          });
-
-      // Кнопки и под закреплённым сообщением: можно листать дни, не набирая команды
-      const keyboard = scheduleKeyboard(days, day ? dateIso : null, file?.week_start ?? null, weeks);
-      const message = await sendMessage(chat.chat_id, text, { silent: false, keyboard });
-
-      if (chat.pinned_msg_id) {
-        try {
-          await unpinChatMessage(chat.chat_id, chat.pinned_msg_id);
-        } catch {
-          // старое сообщение могли удалить вручную — это не ошибка
-        }
-      }
-
-      try {
-        await pinChatMessage(chat.chat_id, message.message_id);
-        await setPinnedMessage(chat.chat_id, message.message_id, dateIso);
-      } catch (error) {
-        // без прав на закрепление сообщение всё равно отправлено
-        await log('skip', `Не удалось закрепить сообщение в чате ${chat.chat_id}`, {
-          chatId: chat.chat_id,
-          details: { reason: error instanceof Error ? error.message : String(error) },
-        });
-      }
-
-      sent++;
-      await log('send', `Расписание на ${dateIso} отправлено`, {
-        chatId: chat.chat_id,
-        details: { group: chat.group_name, lessons: day?.lessons.length ?? 0 },
-      });
-    } catch (error) {
-      failed++;
-      await logError(`Отправка расписания в чат ${chat.chat_id}`, error);
+      const outcome = await sendToChat(queue[index], dateIso, dayName, weeks);
+      if (outcome === 'sent') result.sent++;
+      else if (outcome === 'disabled') result.disabled++;
+      else result.failed++;
     }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(SEND_CONCURRENCY, queue.length) }, () => worker()),
+  );
+
+  result.pending = Math.max(0, queue.length - result.sent - result.failed - result.disabled);
+
+  if (result.pending > 0) {
+    await log('skip', `Не хватило времени: ${result.pending} чатов ждут следующего тика`, {
+      details: { queue: queue.length, ...result },
+    });
   }
 
-  return { sent, failed };
+  return result;
 }
 
 export interface TickResult {
@@ -283,6 +359,8 @@ export interface TickResult {
   autoSend: 'sent' | 'skipped-saturday' | 'skipped-hour' | 'skipped-already' | 'skipped-parse-error' | null;
   sent?: number;
   failed?: number;
+  disabled?: number;
+  pending?: number;
 }
 
 /** Один часовой тик: проверить сайт, при необходимости разослать. */
@@ -331,11 +409,16 @@ export async function tick(force = false): Promise<TickResult> {
     return out;
   }
 
-  const { sent, failed } = await sendTomorrow();
+  const outcome = await sendTomorrow();
   out.autoSend = 'sent';
-  out.sent = sent;
-  out.failed = failed;
-  await setState(LAST_SEND_KEY, today);
+  out.sent = outcome.sent;
+  out.failed = outcome.failed;
+  out.disabled = outcome.disabled;
+  out.pending = outcome.pending;
+
+  // День помечаем отправленным, только когда очередь разошлась полностью,
+  // иначе остаток чатов никогда не получит расписание
+  if (outcome.pending === 0) await setState(LAST_SEND_KEY, today);
 
   return out;
 }
