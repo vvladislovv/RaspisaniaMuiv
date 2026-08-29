@@ -183,28 +183,39 @@ curl -H "Authorization: Bearer ТВОЙ_CRON_SECRET" https://ТВОЙ-ДОМЕН
 
 ### 6. Часовой крон
 
-Vercel на бесплатном тарифе запускает cron **раз в сутки** — этого хватает для рассылки
-(она настроена в [`vercel.json`](vercel.json) на 13:00 UTC = 16:00 МСК), но не для часовой
-проверки обновлений. Часовой триггер сделан на GitHub Actions —
-[`.github/workflows/tick.yml`](.github/workflows/tick.yml), сторонние сервисы не нужны.
+Часовую проверку планирует **сама Supabase** через `pg_cron` и `pg_net` — никаких
+сторонних сервисов и регистраций. Выполнить один раз в SQL Editor, подставив свои
+домен и `CRON_SECRET` (готовый блок есть в конце [`supabase/schema.sql`](supabase/schema.sql)):
 
-Задай два секрета репозитория (Settings → Secrets and variables → Actions), или командой:
+```sql
+create extension if not exists pg_cron;
+create extension if not exists pg_net;
 
-```bash
-gh secret set CRON_SECRET --repo <владелец>/<репо>
-gh secret set TICK_URL --repo <владелец>/<репо>   # https://<домен>/api/tick
+select cron.schedule(
+  'muiv-tick-hourly',
+  '0 * * * *',
+  $$ select net.http_get(
+       url := 'https://<домен>/api/tick',
+       headers := jsonb_build_object('Authorization', 'Bearer <CRON_SECRET>'),
+       timeout_milliseconds := 120000
+     ) $$
+);
 ```
 
-Проверить вручную: вкладка Actions → tick → Run workflow.
+Проверить, что стреляет: `select status_code, content from net._http_response order by created desc;`
 
-Cron у GitHub Actions опаздывает на 5–20 минут и отключается, если в репозитории 60 дней
-нет активности. Поэтому рассылка в коде срабатывает **не раньше** 16:00 МСК, а не ровно в
-16:00: если тик в нужный час пропал, расписание уйдёт на следующем тике, а не потеряется.
-Отправка за день всё равно одна — она помечается в `app_state`.
+**Почему не иначе.** Пробовались оба очевидных варианта, и оба оказались негодны для
+часовой проверки:
 
-Если захочется точный крон без этих оговорок — подойдёт [cron-job.org](https://cron-job.org):
-URL `https://<домен>/api/tick`, расписание «каждый час в минуту 0», заголовок
-`Authorization: Bearer <CRON_SECRET>`.
+| Способ | Что показала практика |
+|---|---|
+| GitHub Actions `cron: '0 * * * *'` | бесплатный тариф выбрасывает большинство запусков: **6 за двое суток вместо 48**, промежутки до 12 часов |
+| Vercel Cron на Hobby | один запуск в сутки, срабатывал стабильно, но с опозданием ~40 минут |
+| Supabase `pg_cron` | стреляет по расписанию, минутная точность, входит в бесплатный тариф |
+
+Оба запасных пути оставлены как подстраховка: [`.github/workflows/tick.yml`](.github/workflows/tick.yml)
+и `crons` в [`vercel.json`](vercel.json). Лишние вызовы безвредны — проверка идемпотентна,
+а отправка за день помечается в `app_state` и второй раз не уходит.
 
 ### 7. Подключение группы
 

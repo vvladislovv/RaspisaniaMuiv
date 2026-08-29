@@ -107,3 +107,28 @@ begin
   return new_count;
 end;
 $$;
+
+-- ─── Часовой запуск проверки прямо из базы ───────────────────────────────────
+--
+-- GitHub Actions на бесплатном тарифе выбрасывает большинство часовых запусков
+-- (наблюдалось 6 запусков за двое суток вместо 48), а Vercel Cron на Hobby даёт
+-- один запуск в сутки. Поэтому часовую проверку планирует сама Supabase.
+--
+-- Выполнить один раз, подставив свой CRON_SECRET и домен:
+--
+--   create extension if not exists pg_cron;
+--   create extension if not exists pg_net;
+--
+--   select cron.schedule(
+--     'muiv-tick-hourly',
+--     '0 * * * *',
+--     $$ select net.http_get(
+--          url := 'https://<домен>/api/tick',
+--          headers := jsonb_build_object('Authorization', 'Bearer <CRON_SECRET>'),
+--          timeout_milliseconds := 120000
+--        ) $$
+--   );
+--
+-- Проверить: select * from cron.job;
+-- Ответы:    select status_code, content from net._http_response order by created desc;
+-- Снять:     select cron.unschedule('muiv-tick-hourly');
