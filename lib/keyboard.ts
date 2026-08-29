@@ -22,7 +22,10 @@ export function menuKeyboard(group: string | null): InlineKeyboard {
   if (!group) {
     return [
       [{ text: '👥 Выбрать группу', callback_data: 'grp' }],
-      [{ text: '⚙️ Статус', callback_data: 'st' }],
+      [
+        { text: '⚙️ Статус', callback_data: 'st' },
+        { text: 'ℹ️ О боте', callback_data: 'about' },
+      ],
     ];
   }
 
@@ -33,7 +36,10 @@ export function menuKeyboard(group: string | null): InlineKeyboard {
     ],
     [{ text: '📖 Вся неделя', callback_data: 'week' }],
     [{ text: '👥 Сменить группу', callback_data: 'grp' }],
-    [{ text: '⚙️ Статус', callback_data: 'st' }],
+    [
+      { text: '⚙️ Статус', callback_data: 'st' },
+      { text: 'ℹ️ О боте', callback_data: 'about' },
+    ],
   ];
 }
 

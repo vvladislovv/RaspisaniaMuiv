@@ -162,6 +162,37 @@ async function statusScreen(chat: Chat | null): Promise<Screen> {
   return { text: lines.join('\n'), keyboard: statusKeyboard(chat?.enabled ?? false) };
 }
 
+/**
+ * Экран «О боте».
+ *
+ * Текст пропущен через esc(): писать обратные слэши руками нельзя — в строке
+ * TypeScript `\.` превращается в обычную точку, экранирование теряется,
+ * и Telegram отказывается разбирать разметку.
+ */
+function aboutScreen(): Screen {
+  const source = 'https://www.muiv.ru/studentu/spo/raspisanie/';
+  const author = 'https://hacktaika.ru';
+
+  const lines = [
+    '*О боте*',
+    '',
+    esc('Присылаю расписание колледжа МУИВ в этот чат.'),
+    '',
+    `${esc('Беру его с сайта')} [${esc('muiv.ru')}](${source}) ${esc(
+      '— проверяю каждый час и показываю то, что там сейчас. Если расписание меняют, закреплённое сообщение обновляется само.',
+    )}`,
+    '',
+    esc('Каждый день в 16:00 присылаю расписание на завтра и закрепляю его, кроме субботы.'),
+    '',
+    `⚡ ${esc('Сделано в')} [${esc('hacktaika.ru')}](${author})`,
+  ];
+
+  return {
+    text: lines.join('\n'),
+    keyboard: [[{ text: '↩︎ Меню', callback_data: 'm' }]],
+  };
+}
+
 /** Соответствие «индекс → группа»: в callback_data влезает только номер. */
 async function groupIndex(): Promise<{
   sheets: string[];
@@ -269,6 +300,12 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
   if (data === 'st') {
     await answerCallbackQuery(query.id);
     await edit(await statusScreen(chat));
+    return;
+  }
+
+  if (data === 'about') {
+    await answerCallbackQuery(query.id);
+    await edit(aboutScreen());
     return;
   }
 

@@ -480,6 +480,31 @@ m = mark();
 await handleUpdate(button('on', GROUP_ADMIN));
 ok((await getChat(CHAT))?.enabled === true, 'админ включил обратно');
 
+// ─── О боте ──────────────────────────────────────────────────────────────────
+
+await resetRateLimit();
+head('Экран «О боте»');
+m = mark();
+await handleUpdate(button('m'));
+ok(!!find(keyboardOf(since(m)), 'О боте'), 'в меню есть кнопка «О боте»');
+
+m = mark();
+await handleUpdate(button('about', STRANGER));
+screen = since(m);
+ok(edited(screen).length === 1, 'экран открывается правкой сообщения');
+const about = texts(screen).join('');
+ok(about.includes('hacktaika'), 'указан автор — hacktaika.ru');
+ok(about.includes('О боте'), 'есть заголовок');
+ok(!!find(keyboardOf(screen), 'Меню'), 'есть путь назад в меню');
+
+// Ни один спецсимвол не должен остаться неэкранированным, иначе Telegram
+// откажется разбирать разметку
+const bare = about
+  .replace(/\\./g, '')
+  .replace(/\[[^\]]*\]\([^)]*\)/g, '')
+  .replace(/[*_]/g, '');
+ok(!/[.!()\-]/.test(bare), `в тексте нет неэкранированных символов: ${bare.slice(0, 60)}`);
+
 // ─── Устойчивость ────────────────────────────────────────────────────────────
 
 await resetRateLimit();

@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!--
+    Логотип бота расписания МУИВ.
+
+    Мотив тот же, что на статус-странице: строки расписания — плашка с номером
+    пары и полоса с названием предмета, один ряд выделен фирменным красным.
+
+    Композиция рассчитана на круглую обрезку: Telegram показывает аватарки
+    кругом, поэтому фон залит без скруглений, а всё содержимое умещается
+    в круг радиусом 190 от центра — углы можно резать без потерь.
+  -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.3" y2="1">
+      <stop offset="0" stop-color="#1b3760"/>
+      <stop offset="1" stop-color="#0c1e3a"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" fill="url(#bg)"/>
+
+  <!-- Три строки расписания; средняя — выделенная пара -->
+  <g>
+    <rect x="136" y="140" width="66" height="66" rx="19" fill="#ffffff" opacity="0.24"/>
+    <rect x="222" y="160" width="136" height="26" rx="13" fill="#ffffff" opacity="0.70"/>
+  </g>
+
+  <g>
+    <rect x="136" y="223" width="66" height="66" rx="19" fill="#e2001a"/>
+    <rect x="222" y="243" width="154" height="26" rx="13" fill="#ffffff"/>
+  </g>
+
+  <g>
+    <rect x="136" y="306" width="66" height="66" rx="19" fill="#ffffff" opacity="0.24"/>
+    <rect x="222" y="326" width="112" height="26" rx="13" fill="#ffffff" opacity="0.70"/>
+  </g>
+</svg>
