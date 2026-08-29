@@ -178,23 +178,36 @@ export function setMyCommands(): Promise<unknown> {
   });
 }
 
+const DESCRIPTION_LIMIT = 512;
+const SHORT_DESCRIPTION_LIMIT = 120;
+
 /**
  * Описание бота в его профиле и в пустом чате. Обычный текст, без разметки.
+ *
+ * Берётся из переменных окружения. Если переменная пуста — код ничего не
+ * трогает: правка через @BotFather не должна пропадать при следующем деплое.
+ *
  * Аватарку через Bot API поставить нельзя — только через @BotFather.
  */
-export function setMyDescriptions(): Promise<unknown[]> {
-  return Promise.all([
-    call('setMyDescription', {
-      description:
-        'Расписание колледжа МУИВ. Проверяю сайт каждый час и показываю то, ' +
-        'что там сейчас. Каждый день в 16:00 присылаю расписание на завтра ' +
-        'и закрепляю его, кроме субботы. Всё управление — кнопками. ' +
-        'Сделано в hacktaika.ru',
-    }),
-    call('setMyShortDescription', {
-      short_description: 'Расписание колледжа МУИВ · hacktaika.ru',
-    }),
-  ]);
+export async function setMyDescriptions(): Promise<{ description: boolean; short: boolean }> {
+  const description = env.botDescription;
+  const short = env.botShortDescription;
+
+  if (description && description.length > DESCRIPTION_LIMIT) {
+    throw new Error(
+      `BOT_DESCRIPTION длиннее ${DESCRIPTION_LIMIT} символов (${description.length})`,
+    );
+  }
+  if (short && short.length > SHORT_DESCRIPTION_LIMIT) {
+    throw new Error(
+      `BOT_SHORT_DESCRIPTION длиннее ${SHORT_DESCRIPTION_LIMIT} символов (${short.length})`,
+    );
+  }
+
+  if (description) await call('setMyDescription', { description });
+  if (short) await call('setMyShortDescription', { short_description: short });
+
+  return { description: Boolean(description), short: Boolean(short) };
 }
 
 export function getWebhookInfo(): Promise<unknown> {

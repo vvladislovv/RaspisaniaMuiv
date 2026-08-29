@@ -35,6 +35,17 @@ export const env = {
     if (!Number.isSafeInteger(id)) throw new Error('ADMIN_TELEGRAM_ID должен быть числом');
     return id;
   },
+  /**
+   * Описание бота в карточке профиля (до 512 символов). Пусто — код не трогает
+   * то, что стоит у бота: так правки через @BotFather переживают деплой.
+   */
+  get botDescription() {
+    return optional('BOT_DESCRIPTION');
+  },
+  /** Короткое описание под именем бота (до 120 символов). */
+  get botShortDescription() {
+    return optional('BOT_SHORT_DESCRIPTION');
+  },
   /** Если задан — статус-страница требует `?t=<токен>`. */
   get statusToken() {
     return optional('STATUS_TOKEN');

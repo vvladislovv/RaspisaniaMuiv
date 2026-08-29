@@ -38,7 +38,12 @@ export async function GET(request: Request): Promise<Response> {
   const webhookUrl = `${base.replace(/\/$/, '')}/api/bot`;
   await setWebhook(webhookUrl);
   await setMyCommands();
-  await setMyDescriptions();
+  const descriptions = await setMyDescriptions();
 
-  return Response.json({ ok: true, webhook: webhookUrl, info: await getWebhookInfo() });
+  return Response.json({
+    ok: true,
+    webhook: webhookUrl,
+    descriptions,
+    info: await getWebhookInfo(),
+  });
 }
