@@ -178,6 +178,25 @@ export function setMyCommands(): Promise<unknown> {
   });
 }
 
+/**
+ * Описание бота в его профиле и в пустом чате. Обычный текст, без разметки.
+ * Аватарку через Bot API поставить нельзя — только через @BotFather.
+ */
+export function setMyDescriptions(): Promise<unknown[]> {
+  return Promise.all([
+    call('setMyDescription', {
+      description:
+        'Расписание колледжа МУИВ. Проверяю сайт каждый час и показываю то, ' +
+        'что там сейчас. Каждый день в 16:00 присылаю расписание на завтра ' +
+        'и закрепляю его, кроме субботы. Всё управление — кнопками. ' +
+        'Сделано в hacktaika.ru',
+    }),
+    call('setMyShortDescription', {
+      short_description: 'Расписание колледжа МУИВ · hacktaika.ru',
+    }),
+  ]);
+}
+
 export function getWebhookInfo(): Promise<unknown> {
   return call('getWebhookInfo', {});
 }
