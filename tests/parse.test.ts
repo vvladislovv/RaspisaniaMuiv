@@ -85,3 +85,13 @@ test('parseSchedule: реальный файл расписания', { skip: !e
     }
   }
 });
+
+test('имя файла берётся из адреса и не зависит от пути', async () => {
+  const { fileNameOf } = await import('../lib/db');
+  // МУИВ меняет хеш в пути при каждой перезаливке, имя остаётся прежним
+  const a = 'https://www.muiv.ru/upload/iblock/72a/pojsgqq2/Raspisanie-kolledzh.xlsx';
+  const b = 'https://www.muiv.ru/upload/iblock/629/2war0pls/Raspisanie-kolledzh.xlsx';
+  assert.equal(fileNameOf(a), 'Raspisanie-kolledzh.xlsx');
+  assert.equal(fileNameOf(a), fileNameOf(b));
+  assert.equal(fileNameOf('/x/%D0%A0%D0%B0%D1%81.xlsx'), 'Рас.xlsx');
+});

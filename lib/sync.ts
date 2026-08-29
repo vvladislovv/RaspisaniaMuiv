@@ -7,7 +7,8 @@ import { fetchSite, type SiteFile } from './muiv';
 import { parseSchedule } from './parse';
 import {
   activeChats,
-  getFileByUrl,
+  fileNameOf,
+  getFileByName,
   latestFile,
   replaceSchedules,
   setPinnedMessage,
@@ -44,18 +45,20 @@ async function ingest(
   file: SiteFile,
   download: (f: SiteFile) => Promise<Buffer>,
 ): Promise<{ changed: boolean; row: FileRow | null; error?: string }> {
-  const existing = await getFileByUrl(file.url);
+  const name = fileNameOf(file.url);
+  const existing = await getFileByName(name);
   const buf = await download(file);
   const hash = sha256(buf);
 
   if (existing && existing.sha256 === hash && existing.parsed_ok) {
-    await touchFile(file.url);
+    await touchFile(name);
     return { changed: false, row: existing };
   }
 
   try {
     const workbook = parseSchedule(buf);
     const row = await upsertFile({
+      name,
       url: file.url,
       title: file.title,
       sha256: hash,
@@ -78,6 +81,7 @@ async function ingest(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await upsertFile({
+      name,
       url: file.url,
       title: file.title,
       sha256: hash,

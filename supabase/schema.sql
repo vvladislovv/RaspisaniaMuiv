@@ -18,6 +18,9 @@ alter table chats add column if not exists pinned_date date;
 
 create table if not exists files (
   id           bigserial primary key,
+  -- МУИВ меняет путь при каждой перезаливке (/upload/iblock/<хеш>/...),
+  -- поэтому файл опознаётся по имени, а не по адресу
+  name         text not null,
   url          text not null unique,
   title        text not null,
   sha256       text not null,
@@ -30,6 +33,10 @@ create table if not exists files (
   last_seen    timestamptz not null default now(),
   changed_at   timestamptz not null default now()
 );
+
+alter table files add column if not exists name text;
+update files set name = regexp_replace(url, '^.*/', '') where name is null;
+create unique index if not exists files_name_key on files (name);
 
 create index if not exists files_changed_at_idx on files (changed_at desc);
 

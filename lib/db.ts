@@ -95,6 +95,8 @@ export async function allChats(): Promise<Chat[]> {
 
 export interface FileRow {
   id: number;
+  /** Имя файла — устойчивый ключ: путь меняется при каждой перезаливке. */
+  name: string;
   url: string;
   title: string;
   sha256: string;
@@ -108,21 +110,32 @@ export interface FileRow {
   changed_at: string;
 }
 
-export async function getFileByUrl(url: string): Promise<FileRow | null> {
-  const res = await db().from('files').select('*').eq('url', url).maybeSingle();
-  return check(res, 'getFileByUrl') as FileRow | null;
+/** Имя файла из адреса: `/upload/iblock/629/xxx/Raspisanie.xlsx` → `Raspisanie.xlsx`. */
+export function fileNameOf(url: string): string {
+  const last = url.split('?')[0].split('/').pop() ?? url;
+  try {
+    return decodeURIComponent(last);
+  } catch {
+    return last;
+  }
 }
 
-export async function touchFile(url: string): Promise<void> {
+export async function getFileByName(name: string): Promise<FileRow | null> {
+  const res = await db().from('files').select('*').eq('name', name).maybeSingle();
+  return check(res, 'getFileByName') as FileRow | null;
+}
+
+export async function touchFile(name: string): Promise<void> {
   const res = await db()
     .from('files')
     .update({ last_seen: new Date().toISOString() })
-    .eq('url', url)
+    .eq('name', name)
     .select('id');
   check(res, 'touchFile');
 }
 
 export interface FileUpsert {
+  name: string;
   url: string;
   title: string;
   sha256: string;
@@ -139,6 +152,7 @@ export async function upsertFile(input: FileUpsert): Promise<FileRow> {
     .from('files')
     .upsert(
       {
+        name: input.name,
         url: input.url,
         title: input.title,
         sha256: input.sha256,
@@ -150,7 +164,8 @@ export async function upsertFile(input: FileUpsert): Promise<FileRow> {
         last_seen: now,
         changed_at: now,
       },
-      { onConflict: 'url' },
+      // Ключ — имя файла: адрес меняется при каждой перезаливке
+      { onConflict: 'name' },
     )
     .select('*')
     .single();

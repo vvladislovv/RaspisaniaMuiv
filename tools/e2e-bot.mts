@@ -183,6 +183,7 @@ async function seedFromFixture(marker = ''): Promise<boolean> {
   const buf = readFileSync(fixture);
   const workbook = parseSchedule(buf);
   const row = await upsertFile({
+    name: 'week1.xlsx',
     url: 'https://www.muiv.ru/upload/fixture/week1.xlsx',
     title: 'Расписание из фикстуры',
     // marker меняет хеш — так изображается «файл на сайте поменялся»
