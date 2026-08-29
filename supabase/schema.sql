@@ -7,9 +7,14 @@ create table if not exists chats (
   group_name    text,
   enabled       boolean not null default true,
   pinned_msg_id bigint,
+  -- какой день показывает закреплённое сообщение: нужно, чтобы при обновлении
+  -- файла перерисовать его тем же днём, а не «завтрашним» от текущей даты
+  pinned_date   date,
   created_at    timestamptz not null default now(),
   updated_at    timestamptz not null default now()
 );
+
+alter table chats add column if not exists pinned_date date;
 
 create table if not exists files (
   id           bigserial primary key,

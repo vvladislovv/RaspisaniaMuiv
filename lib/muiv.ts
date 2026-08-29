@@ -109,12 +109,25 @@ async function tryOpenSession(): Promise<{ session: Session; html: string } | st
   let redirects = 0;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    let res = await session.fetch(SCHEDULE_URL, 'text/html,application/xhtml+xml,*/*');
+    let res: Response;
+    try {
+      res = await session.fetch(SCHEDULE_URL, 'text/html,application/xhtml+xml,*/*');
+    } catch (error) {
+      // Обрыв соединения или таймаут — это повод попробовать ещё раз,
+      // а не уронить всю проверку
+      const cause = (error as { cause?: { code?: string } })?.cause?.code;
+      return `сеть недоступна: ${cause ?? (error instanceof Error ? error.message : String(error))}`;
+    }
 
     while (res.status >= 300 && res.status < 400) {
       trace.push(`${res.status}`);
       if (++redirects > MAX_REDIRECTS) return `слишком много редиректов (${trace.join(',')})`;
-      res = await session.fetch(SCHEDULE_URL, 'text/html,application/xhtml+xml,*/*');
+      try {
+        res = await session.fetch(SCHEDULE_URL, 'text/html,application/xhtml+xml,*/*');
+      } catch (error) {
+        const cause = (error as { cause?: { code?: string } })?.cause?.code;
+        return `сеть недоступна на редиректе: ${cause ?? String(error)}`;
+      }
     }
 
     if (!res.ok) return `сайт ответил ${res.status} (${trace.join(',')})`;

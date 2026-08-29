@@ -80,15 +80,20 @@ export function sendMessage(
 }
 
 /**
- * Меняет текст сообщения, а если сообщения уже нет (удалили, слишком старое) —
- * отправляет новое. Иначе нажатие кнопки выглядело бы как «ничего не случилось».
+ * Меняет текст сообщения.
+ *
+ * По умолчанию, если сообщения уже нет (удалили, слишком старое), отправляет
+ * новое — иначе нажатие кнопки выглядело бы как «ничего не случилось».
+ * Для фоновой перерисовки закреплённого сообщения запасной вариант выключают:
+ * там новое сообщение было бы спамом в группе.
  */
 export async function editMessageText(
   chatId: number,
   messageId: number,
   text: string,
   keyboard?: InlineKeyboard,
-): Promise<void> {
+  opts: { fallbackToSend?: boolean } = {},
+): Promise<boolean> {
   try {
     await call('editMessageText', {
       chat_id: chatId,
@@ -98,10 +103,18 @@ export async function editMessageText(
       link_preview_options: { is_disabled: true },
       reply_markup: keyboard ? { inline_keyboard: keyboard } : undefined,
     });
+    return true;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+
+    if (opts.fallbackToSend === false) {
+      console.warn('editMessageText не прошёл, новое сообщение слать не будем:', reason);
+      return false;
+    }
+
     console.warn('editMessageText не прошёл, отправляю новым сообщением:', reason);
     await sendMessage(chatId, text, { keyboard, silent: true });
+    return false;
   }
 }
 

@@ -28,6 +28,8 @@ export interface Chat {
   group_name: string | null;
   enabled: boolean;
   pinned_msg_id: number | null;
+  /** Какой день показывает закреплённое сообщение. */
+  pinned_date: string | null;
 }
 
 export async function getChat(chatId: number): Promise<Chat | null> {
@@ -61,10 +63,14 @@ export async function setChatEnabled(chatId: number, enabled: boolean): Promise<
   check(res, 'setChatEnabled');
 }
 
-export async function setPinnedMessage(chatId: number, messageId: number | null): Promise<void> {
+export async function setPinnedMessage(
+  chatId: number,
+  messageId: number | null,
+  dateIso: string | null = null,
+): Promise<void> {
   const res = await db()
     .from('chats')
-    .update({ pinned_msg_id: messageId })
+    .update({ pinned_msg_id: messageId, pinned_date: dateIso })
     .eq('chat_id', chatId)
     .select('chat_id');
   check(res, 'setPinnedMessage');
@@ -400,6 +406,7 @@ export async function migrateChat(oldId: number, newId: number): Promise<boolean
         enabled: previous.enabled,
         // id закреплённого сообщения при переезде не переносится
         pinned_msg_id: null,
+        pinned_date: null,
         updated_at: new Date().toISOString(),
       },
       { onConflict: 'chat_id' },

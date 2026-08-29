@@ -20,8 +20,8 @@ import {
   type FileRow,
 } from './db';
 import { log, logError } from './log';
-import { formatDay, formatEmptyDay, esc } from './format';
-import { pinChatMessage, sendMessage, unpinChatMessage } from './telegram';
+import { formatDay, formatEmptyDay } from './format';
+import { editMessageText, pinChatMessage, sendMessage, unpinChatMessage } from './telegram';
 import { scheduleKeyboard } from './keyboard';
 import { dayNameOf, isSaturdayMsk, mskDateOffset, mskParts } from './time';
 import { env } from './env';
@@ -97,7 +97,31 @@ export async function checkSite(): Promise<CheckResult> {
   const started = Date.now();
   const result: CheckResult = { filesOnSite: 0, changed: [], errors: [] };
 
-  const site = await fetchSite();
+  // Отметку о проверке пишем в любом случае — даже если сайт не ответил.
+  // Иначе на статус-странице выглядело бы, будто крон умер, хотя недоступен сайт.
+  const record = async () => {
+    await setState(LAST_CHECK_KEY, {
+      at: new Date().toISOString(),
+      filesOnSite: result.filesOnSite,
+      changed: result.changed,
+      errors: result.errors,
+      durationMs: Date.now() - started,
+    });
+  };
+
+  let site: Awaited<ReturnType<typeof fetchSite>>;
+  try {
+    site = await fetchSite();
+  } catch (error) {
+    result.errors.push(error instanceof Error ? error.message : String(error));
+    await record();
+    await log('check', 'Проверка сайта не удалась', {
+      durationMs: Date.now() - started,
+      details: { errors: result.errors },
+    });
+    throw error;
+  }
+
   result.filesOnSite = site.files.length;
 
   if (site.files.length === 0) {
@@ -117,13 +141,7 @@ export async function checkSite(): Promise<CheckResult> {
     }
   }
 
-  await setState(LAST_CHECK_KEY, {
-    at: new Date().toISOString(),
-    filesOnSite: result.filesOnSite,
-    changed: result.changed,
-    errors: result.errors,
-    durationMs: Date.now() - started,
-  });
+  await record();
 
   await log('check', `Проверка сайта: файлов ${result.filesOnSite}, изменилось ${result.changed.length}`, {
     durationMs: Date.now() - started,
@@ -133,23 +151,59 @@ export async function checkSite(): Promise<CheckResult> {
   return result;
 }
 
-/** Рассылает уведомление об обновлении расписания. */
-async function notifyUpdate(titles: string[]): Promise<void> {
+/**
+ * Перерисовывает закреплённое расписание, когда колледж поменял файл.
+ *
+ * Раньше здесь уходило отдельное сообщение «расписание обновилось» — в группе
+ * это спам, да ещё и со ссылками на команды, которых больше нет. Теперь просто
+ * правим уже закреплённое сообщение: там всегда актуальные пары, а новых
+ * сообщений в чате не появляется. Если править нечего или не вышло — молчим.
+ */
+export async function refreshPinned(): Promise<number> {
   const chats = await activeChats();
-  const list = titles.map((t) => `• ${esc(t)}`).join('\n');
+  const today = mskDateOffset(0);
+  const weeks = await weekStarts();
+  let updated = 0;
 
   for (const chat of chats) {
+    if (!chat.group_name || !chat.pinned_msg_id || !chat.pinned_date) continue;
+    // День уже прошёл — перерисовывать нечего
+    if (chat.pinned_date < today) continue;
+
     try {
-      await sendMessage(
+      const { days, file } = await getWeek(chat.group_name, chat.pinned_date);
+      const day = days.find((d) => d.date === chat.pinned_date) ?? null;
+
+      const opts = {
+        group: chat.group_name,
+        siteUpdated: file?.site_updated ?? null,
+        heading: chat.pinned_date === today ? 'Расписание на сегодня' : 'Расписание на завтра',
+      };
+      const text = day
+        ? formatDay(day, opts)
+        : formatEmptyDay(chat.pinned_date, dayNameOf(chat.pinned_date), opts);
+
+      const ok = await editMessageText(
         chat.chat_id,
-        `⚠️ *Расписание обновилось*\n\n${list}\n\nАктуальное на завтра — /tomorrow, вся неделя — /week`,
-        { silent: true },
+        chat.pinned_msg_id,
+        text,
+        scheduleKeyboard(days, day ? chat.pinned_date : null, file?.week_start ?? null, weeks),
+        { fallbackToSend: false },
       );
-      await log('send', 'Уведомление об обновлении', { chatId: chat.chat_id });
+
+      if (ok) {
+        updated++;
+        await log('send', 'Закреплённое расписание обновлено', {
+          chatId: chat.chat_id,
+          details: { date: chat.pinned_date },
+        });
+      }
     } catch (error) {
-      await logError(`Уведомление об обновлении в чат ${chat.chat_id}`, error);
+      await logError(`Обновление закреплённого сообщения в чате ${chat.chat_id}`, error);
     }
   }
+
+  return updated;
 }
 
 /** Отправляет расписание на завтра во все активные чаты и закрепляет сообщение. */
@@ -197,7 +251,7 @@ export async function sendTomorrow(): Promise<{ sent: number; failed: number }> 
 
       try {
         await pinChatMessage(chat.chat_id, message.message_id);
-        await setPinnedMessage(chat.chat_id, message.message_id);
+        await setPinnedMessage(chat.chat_id, message.message_id, dateIso);
       } catch (error) {
         // без прав на закрепление сообщение всё равно отправлено
         await log('skip', `Не удалось закрепить сообщение в чате ${chat.chat_id}`, {
@@ -233,7 +287,7 @@ export async function tick(force = false): Promise<TickResult> {
 
   try {
     out.check = await checkSite();
-    if (out.check.changed.length > 0) await notifyUpdate(out.check.changed);
+    if (out.check.changed.length > 0) await refreshPinned();
   } catch (error) {
     await logError('Проверка сайта', error);
     out.check = {

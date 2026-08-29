@@ -8,10 +8,22 @@
  *   FAKE_TG_ADMINS=111,333 node tools/fake-telegram.mjs 54322 /tmp/tg.json &
  *   npx tsx tools/e2e-bot.mts
  */
-import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { handleUpdate, type TgUpdate } from '../lib/bot';
-import { tick } from '../lib/sync';
-import { getChat, listGroups, upsertChat } from '../lib/db';
+import { refreshPinned, tick } from '../lib/sync';
+import {
+  getChat,
+  listGroups,
+  replaceSchedules,
+  setPinnedMessage,
+  upsertChat,
+  upsertFile,
+} from '../lib/db';
+import { parseSchedule } from '../lib/parse';
+import { mskDateOffset } from '../lib/time';
 
 const LOG = process.env.FAKE_TG_LOG ?? '/tmp/tg.json';
 const CHAT = -100777000;
@@ -137,6 +149,14 @@ async function resetRateLimit(): Promise<void> {
   });
 }
 
+/** Забывает скачанные файлы — следующая проверка сочтёт расписание изменившимся. */
+async function forgetFiles(): Promise<void> {
+  await fetch(`${process.env.SUPABASE_URL}/rest/v1/files?id=gte.0`, {
+    method: 'DELETE',
+    headers: { apikey: 'fake', Authorization: 'Bearer fake' },
+  });
+}
+
 /** Заставляет дублёр Telegram отклонять указанные методы. */
 async function failMethods(methods: string[]): Promise<void> {
   await fetch(`${process.env.TELEGRAM_API_BASE}/bot/__fail`, {
@@ -146,13 +166,52 @@ async function failMethods(methods: string[]): Promise<void> {
   });
 }
 
-// ─── Наполняем базу настоящим расписанием ────────────────────────────────────
+/**
+ * Наполняет базу из локального файла-фикстуры. Нужен, когда сайт МУИВ
+ * недоступен: проверки поведения бота не должны зависеть от чужого сервера.
+ */
+async function seedFromFixture(marker = ''): Promise<boolean> {
+  const fixture = join(
+    dirname(fileURLToPath(import.meta.url)),
+    '..',
+    'tests',
+    'fixtures',
+    'week1.xlsx',
+  );
+  if (!existsSync(fixture)) return false;
 
-head('Подготовка: загрузка расписания с сайта');
+  const buf = readFileSync(fixture);
+  const workbook = parseSchedule(buf);
+  const row = await upsertFile({
+    url: 'https://www.muiv.ru/upload/fixture/week1.xlsx',
+    title: 'Расписание из фикстуры',
+    // marker меняет хеш — так изображается «файл на сайте поменялся»
+    sha256: createHash('sha256').update(buf).update(marker).digest('hex'),
+    size: buf.byteLength,
+    siteUpdated: '25.08.2026',
+    weekStart: workbook.weekStart,
+    parsedOk: true,
+    parseError: null,
+  });
+  await replaceSchedules(row.id, workbook);
+  return true;
+}
+
+// ─── Наполняем базу расписанием ──────────────────────────────────────────────
+
+head('Подготовка: загрузка расписания');
 await resetChat();
 await resetRateLimit();
 const first = await tick(false);
-ok(first.check !== null && first.check.errors.length === 0, 'сайт проверен без ошибок');
+const siteReachable = first.check !== null && first.check.errors.length === 0;
+
+if (siteReachable) {
+  ok(true, 'сайт проверен без ошибок');
+} else {
+  console.log(`  ⚠ сайт недоступен (${first.check?.errors[0] ?? '—'}), беру локальный файл`);
+  ok(await seedFromFixture(), 'база наполнена из фикстуры');
+}
+
 const groups = await listGroups();
 ok(groups.length > 50, `в базе ${groups.length} групп`);
 
@@ -497,6 +556,56 @@ const second = await tick(true);
 after = since(m);
 ok(second.autoSend === 'sent', 'повторная рассылка выполнена');
 ok(after.some((c) => c.method === 'unpinChatMessage'), 'прошлое закрепление снято');
+
+// ─── Обновление расписания на сайте ──────────────────────────────────────────
+
+await resetRateLimit();
+head('Колледж поменял файл');
+const pinnedBefore = await getChat(CHAT);
+ok(!!pinnedBefore?.pinned_msg_id, 'закреплённое сообщение есть');
+ok(!!pinnedBefore?.pinned_date, 'дата закреплённого дня сохранена');
+
+m = mark();
+const updated = await refreshPinned();
+after = since(m);
+ok(updated === 1, 'закреплённое сообщение перерисовано');
+ok(sent(after).length === 0, 'НИ ОДНОГО нового сообщения в чат при обновлении');
+ok(
+  !texts(after).join('').includes('обновилось'),
+  'сообщения «расписание обновилось» больше нет',
+);
+ok(
+  edited(after).some((c) => c.body.message_id === pinnedBefore!.pinned_msg_id),
+  'правится именно закреплённое сообщение',
+);
+ok(
+  !texts(after).join('').includes('/tomorrow') && !texts(after).join('').includes('/week'),
+  'в текстах нет упоминаний несуществующих команд',
+);
+ok(keyboardOf(after).length > 0, 'кнопки под закреплённым сохранились');
+
+// Если правка не прошла (сообщение удалили) — новое слать нельзя, это спам
+await failMethods(['editMessageText']);
+m = mark();
+await refreshPinned();
+ok(sent(since(m)).length === 0, 'при неудачной правке новое сообщение не отправляется');
+await failMethods([]);
+
+// Если закреплённого сообщения нет — просто молчим
+await setPinnedMessage(CHAT, null, null);
+m = mark();
+ok((await refreshPinned()) === 0, 'без закреплённого сообщения обновлять нечего');
+ok(sent(since(m)).length === 0, 'и ничего не отправляется');
+
+// Полный тик при изменении файла тоже не должен писать в чат
+if (siteReachable) {
+  await setPinnedMessage(CHAT, 900, mskDateOffset(1));
+  await forgetFiles();
+  m = mark();
+  const changedTick = await tick(false);
+  ok(changedTick.check!.changed.length > 0, 'проверка увидела изменение файлов');
+  ok(sent(since(m)).length === 0, 'при обновлении файла тик не пишет в чат');
+}
 
 head('Правила расписания рассылки');
 const notForced = await tick(false);
