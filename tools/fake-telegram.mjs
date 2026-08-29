@@ -20,6 +20,9 @@ let messageId = 1000;
  */
 let failing = new Set();
 
+/** Последний текст правки на чат — чтобы изображать «message is not modified». */
+const lastEdit = new Map();
+
 /** Кто считается админом чата — задаётся через переменную окружения. */
 const admins = new Set(
   (process.env.FAKE_TG_ADMINS ?? '')
@@ -77,6 +80,22 @@ http
         );
         return;
       }
+      // Повтор той же правки: Telegram отвечает ошибкой, а не успехом
+      if (method === 'editMessageText' && lastEdit.get(String(body.chat_id)) === body.text) {
+        calls.push({ method, body, notModified: true });
+        writeFileSync(logPath, JSON.stringify(calls, null, 2));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            ok: false,
+            error_code: 400,
+            description: 'Bad Request: message is not modified',
+          }),
+        );
+        return;
+      }
+      if (method === 'editMessageText') lastEdit.set(String(body.chat_id), body.text);
+
       calls.push({ method, body });
       writeFileSync(logPath, JSON.stringify(calls, null, 2));
       res.writeHead(200, { 'Content-Type': 'application/json' });

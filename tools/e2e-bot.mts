@@ -540,6 +540,24 @@ const bare = about
   .replace(/[*_]/g, '');
 ok(!/[.!()\-]/.test(bare), `в тексте нет неэкранированных символов: ${bare.slice(0, 60)}`);
 
+// ─── Повторное нажатие той же кнопки ─────────────────────────────────────────
+
+await resetRateLimit();
+head('Повторное нажатие не плодит сообщения');
+m = mark();
+await handleUpdate(button('about'));
+await handleUpdate(button('about'));
+await handleUpdate(button('about'));
+const repeats = since(m);
+ok(
+  sent(repeats).filter((c) => c.body.chat_id === CHAT).length === 0,
+  'три нажатия подряд — ни одного нового сообщения в чате',
+);
+ok(
+  edited(repeats).length === 3,
+  `на три нажатия ровно три обращения к API, а не повторы: ${edited(repeats).length}`,
+);
+
 // ─── Подавление повторных алертов ────────────────────────────────────────────
 
 head('Повторные алерты владельцу');

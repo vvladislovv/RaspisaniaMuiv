@@ -618,10 +618,17 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
 
 /** Точка входа для вебхука. Никогда не бросает — Telegram не должен ретраить. */
 export async function handleUpdate(update: TgUpdate): Promise<void> {
+  const started = Date.now();
   try {
     if (update.message) await handleMessage(update.message);
-    else if (update.callback_query) await handleCallback(update.callback_query);
-    else if (update.my_chat_member) await handleMembership(update.my_chat_member);
+    else if (update.callback_query) {
+      await handleCallback(update.callback_query);
+      // Длительность пишем в журнал: по ней видно, тормозит бот или сеть
+      await log('command', `Нажатие ${update.callback_query.data ?? '—'}`, {
+        chatId: update.callback_query.message?.chat.id ?? null,
+        durationMs: Date.now() - started,
+      });
+    } else if (update.my_chat_member) await handleMembership(update.my_chat_member);
   } catch (error) {
     await logError('Обработка апдейта Telegram', error, {
       update: JSON.stringify(update).slice(0, 1000),

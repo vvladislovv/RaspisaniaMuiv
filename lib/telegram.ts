@@ -70,6 +70,12 @@ async function call<T>(method: string, body: unknown, opts: CallOptions = {}): P
       throw new TelegramError(method, json.error_code ?? 0, json.description ?? 'неизвестная ошибка');
     } catch (error) {
       lastError = error;
+
+      // Отказ по вине запроса повторять бессмысленно: ответ будет тот же,
+      // а три круга втрое увеличивают и задержку, и нагрузку на API.
+      // Повторяем только сетевые сбои и ошибки сервера Telegram.
+      if (error instanceof TelegramError && error.code >= 400 && error.code < 500) break;
+
       if (attempt === retries) break;
       await new Promise((r) => setTimeout(r, 400 * 2 ** (attempt - 1)));
     }
@@ -130,6 +136,11 @@ export async function editMessageText(
     return true;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+
+    // Нажали ту же кнопку ещё раз — Telegram отвечает «message is not modified».
+    // Экран уже показывает то, что нужно: это успех, а не повод слать новое
+    // сообщение, иначе повторное нажатие плодило бы дубликаты в чате.
+    if (/message is not modified/i.test(reason)) return true;
 
     if (opts.fallbackToSend === false) {
       console.warn('editMessageText не прошёл, новое сообщение слать не будем:', reason);
