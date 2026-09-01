@@ -750,3 +750,28 @@ export async function fileForDate(dateIso: string): Promise<FileRow | null> {
 
   return check(upcoming, 'fileForDate.upcoming') as FileRow | null;
 }
+
+/**
+ * Дни группы внутри конкретного файла-недели.
+ *
+ * Отличается от `getWeek` тем, что неделя задана явно, а не выводится из
+ * «ближайшего учебного дня». У двух групп дни недели разные, и вывод по
+ * ближайшему дню приводил к тому, что при переключении групп менялась ещё
+ * и неделя.
+ */
+export async function getWeekOfFile(groupName: string, fileId: number): Promise<Day[]> {
+  const res = await db()
+    .from('schedules')
+    .select('day_date, day_name, lessons')
+    .eq('file_id', fileId)
+    .eq('group_name', groupName)
+    .order('day_date', { ascending: true });
+
+  const rows = (check(res, 'getWeekOfFile') ?? []) as {
+    day_date: string;
+    day_name: string;
+    lessons: Lesson[];
+  }[];
+
+  return rows.map((r) => ({ date: r.day_date, name: r.day_name, lessons: r.lessons }));
+}

@@ -592,10 +592,44 @@ ok(
 const other = weekButtons.find((b) => b.callback_data.startsWith('wg:') && !b.text.startsWith('· '))!;
 m = mark();
 await handleUpdate(button(other.callback_data));
+const switched = since(m);
 ok(
-  texts(since(m)).join('').includes(esc(other.text)),
+  texts(switched).join('').includes(esc(other.text)),
   'переключение показывает неделю второй группы',
 );
+
+// Переключатель обязан остаться, иначе обратно не вернуться
+const backButtons = keyboardOf(switched);
+ok(
+  backButtons.filter((b) => b.callback_data.startsWith('wg:')).length === 2,
+  'после переключения переключатель на месте',
+);
+ok(
+  backButtons.filter((b) => /^d:\d{4}/.test(b.callback_data)).length >= 5,
+  'и дни недели тоже',
+);
+
+// Якорь недели одинаков у обеих кнопок: неделя не должна съезжать
+const anchors = new Set(
+  backButtons.filter((b) => b.callback_data.startsWith('wg:')).map((b) => b.callback_data.split(':')[2]),
+);
+ok(anchors.size === 1, `обе кнопки указывают на одну неделю: ${[...anchors].join(', ')}`);
+
+// Группа без пар на этой неделе не должна ломать клавиатуру
+{
+  const { db } = await import('../lib/db');
+  const empty = 'ГРУППА-БЕЗ-ПАР';
+  await db().from('chats').update({ groups: [chosen[0], empty] }).eq('chat_id', CHAT);
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(button('week'));
+  const wb = keyboardOf(since(m));
+  ok(
+    wb.filter((b) => /^d:\d{4}/.test(b.callback_data)).length >= 5,
+    'дни на месте даже с потерянной второй группой',
+  );
+  await db().from('chats').update({ groups: chosen }).eq('chat_id', CHAT);
+}
 
 // ─── Листание расписания ─────────────────────────────────────────────────────
 

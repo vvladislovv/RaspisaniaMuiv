@@ -58,16 +58,34 @@ async function call<T>(method: string, body: unknown, opts: CallOptions = {}): P
         signal: AbortSignal.timeout(TIMEOUT_MS),
       });
 
-      const json = (await res.json()) as { ok: boolean; result?: T; description?: string; error_code?: number };
+      const json = (await res.json()) as {
+        ok: boolean;
+        result?: T;
+        description?: string;
+        error_code?: number;
+        parameters?: { retry_after?: number };
+      };
 
       if (json.ok) return json.result as T;
 
-      // 4xx — повторять бессмысленно, кроме 429
+      const failure = new TelegramError(
+        method,
+        json.error_code ?? 0,
+        json.description ?? 'неизвестная ошибка',
+      );
+
+      // 429 — Telegram просит подождать и сам говорит сколько. Ошибку
+      // запоминаем: если попытки кончатся, в журнал должно попасть
+      // «Too Many Requests», а не безликое «сбой».
       if (json.error_code === 429) {
-        await new Promise((r) => setTimeout(r, 1000 * attempt));
+        lastError = failure;
+        if (attempt === retries) break;
+        const waitSeconds = json.parameters?.retry_after ?? attempt;
+        await new Promise((r) => setTimeout(r, Math.min(waitSeconds, 5) * 1000));
         continue;
       }
-      throw new TelegramError(method, json.error_code ?? 0, json.description ?? 'неизвестная ошибка');
+
+      throw failure;
     } catch (error) {
       lastError = error;
 
@@ -81,7 +99,9 @@ async function call<T>(method: string, body: unknown, opts: CallOptions = {}): P
     }
   }
 
-  throw lastError instanceof Error ? lastError : new Error(`Telegram ${method}: сбой`);
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(`Telegram ${method}: не удалось за ${retries} попыток`);
 }
 
 export interface SentMessage {

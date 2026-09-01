@@ -18,6 +18,7 @@ import {
   currentGroups,
   weekDates,
   fileForDate,
+  getWeekOfFile,
   requestAccess,
   decideAccess,
   isApproved,
@@ -381,11 +382,16 @@ export async function weekScreen(
   fromIso: string,
   groupIndex = 0,
 ): Promise<{ chunks: string[]; keyboard: InlineKeyboard }> {
-  const { groups } = await currentGroups(chatId, stored);
+  const { groups, missing } = await currentGroups(chatId, stored);
   const active = Math.min(Math.max(groupIndex, 0), Math.max(groups.length - 1, 0));
   const group = groups[active] ?? '';
 
-  const [{ days, file }, weeks] = await Promise.all([getWeek(group, fromIso), weekStarts()]);
+  // Неделя задаётся файлом, а не «ближайшим учебным днём группы»: иначе при
+  // переключении групп с разными днями менялась ещё и неделя.
+  const [file, weeks] = await Promise.all([fileForDate(fromIso), weekStarts()]);
+
+  const days = file && group ? await getWeekOfFile(group, file.id) : [];
+  const allDates = file ? await weekDates(file.id) : [];
 
   const chunks = formatWeek(days, {
     group,
@@ -393,15 +399,27 @@ export async function weekScreen(
     heading: file?.week_start ? `Неделя с ${humanDate(file.week_start)}` : 'Расписание на неделю',
   });
 
-  const anchor = days[0]?.date ?? fromIso;
+  // Кнопки дней — по всей неделе из файла, даже если у группы пар нет:
+  // иначе переключатель групп и навигация по неделям пропадали
+  const withLessons = new Map(days.map((d) => [d.date, d]));
+  const keyboardDays = allDates.map(
+    (date) => withLessons.get(date) ?? { date, name: dayNameOf(date), lessons: [] },
+  );
+
+  // Якорь — начало недели: он не зависит от того, какая группа выбрана,
+  // поэтому кнопки не «съезжают» при переключении
+  const anchor = file?.week_start ?? fromIso;
 
   return {
     chunks,
-    keyboard: scheduleKeyboard(days, null, file?.week_start ?? null, weeks, {
-      groups,
-      activeIndex: active,
-      dateIso: anchor,
-    }),
+    keyboard: scheduleKeyboard(
+      keyboardDays,
+      null,
+      file?.week_start ?? null,
+      weeks,
+      groups.length > 1 ? { groups, activeIndex: active, dateIso: anchor } : undefined,
+      missing,
+    ),
   };
 }
 
