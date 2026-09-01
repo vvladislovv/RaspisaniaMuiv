@@ -18,6 +18,7 @@ const PRIMARY_KEYS = {
   logs: ['id'],
   rate_limit: ['chat_id', 'window_start'],
   app_state: ['key'],
+  access: ['user_id'],
 };
 
 /** Значения по умолчанию из schema.sql — заглушка их не знает сама. */
@@ -26,11 +27,20 @@ const COLUMN_DEFAULTS = {
   files: { parsed_ok: false, parse_error: null, week_start: null, site_updated: null },
   logs: { chat_id: null, details: null, duration_ms: null },
   rate_limit: { count: 0 },
+  access: { status: 'pending', username: null, first_name: null, decided_at: null },
 };
 
 const tables = existsSync(snapshot)
   ? JSON.parse(readFileSync(snapshot, 'utf8'))
-  : { chats: [], files: [], schedules: [], logs: [], rate_limit: [], app_state: [] };
+  : {
+      chats: [],
+      files: [],
+      schedules: [],
+      logs: [],
+      rate_limit: [],
+      app_state: [],
+      access: [],
+    };
 
 const sequences = {};
 
@@ -208,6 +218,9 @@ function handleInsert(table, url, req, raw, res, single) {
     }
     if (table === 'logs' && record.ts === undefined) {
       record.ts = new Date().toISOString();
+    }
+    if (table === 'access' && record.requested_at === undefined) {
+      record.requested_at = new Date().toISOString();
     }
     if (table === 'files' && record.first_seen === undefined) {
       record.first_seen = new Date().toISOString();

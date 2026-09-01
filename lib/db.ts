@@ -41,11 +41,20 @@ export async function getChat(chatId: number): Promise<Chat | null> {
   return check(res, 'getChat') as Chat | null;
 }
 
-export async function upsertChat(chatId: number, title: string | null): Promise<void> {
-  const res = await db()
-    .from('chats')
-    .upsert({ chat_id: chatId, title, updated_at: new Date().toISOString() }, { onConflict: 'chat_id' })
-    .select('chat_id');
+export async function upsertChat(
+  chatId: number,
+  title: string | null,
+  addedBy?: number,
+): Promise<void> {
+  const row: Record<string, unknown> = {
+    chat_id: chatId,
+    title,
+    updated_at: new Date().toISOString(),
+  };
+  // Кто подключил чат — по нему потом видно, чьё это хозяйство
+  if (addedBy !== undefined) row.added_by = addedBy;
+
+  const res = await db().from('chats').upsert(row, { onConflict: 'chat_id' }).select('chat_id');
   check(res, 'upsertChat');
 }
 
@@ -605,4 +614,98 @@ export async function weekDates(fileId: number): Promise<string[]> {
   const res = await db().from('schedules').select('day_date').eq('file_id', fileId);
   const rows = (check(res, 'weekDates') ?? []) as { day_date: string }[];
   return [...new Set(rows.map((r) => r.day_date))].sort();
+}
+
+// ─── Доступ по заявкам ───────────────────────────────────────────────────────
+
+export type AccessStatus = 'pending' | 'approved' | 'denied';
+
+export interface AccessRow {
+  user_id: number;
+  username: string | null;
+  first_name: string | null;
+  status: AccessStatus;
+  requested_at: string;
+  decided_at: string | null;
+}
+
+export async function getAccess(userId: number): Promise<AccessRow | null> {
+  const res = await db().from('access').select('*').eq('user_id', userId).maybeSingle();
+  return check(res, 'getAccess') as AccessRow | null;
+}
+
+/**
+ * Заводит заявку, если её ещё не было. Возвращает актуальное состояние:
+ * повторное обращение не создаёт вторую заявку и не сбрасывает отказ.
+ */
+export async function requestAccess(
+  userId: number,
+  username: string | null,
+  firstName: string | null,
+): Promise<{ status: AccessStatus; isNew: boolean }> {
+  const existing = await getAccess(userId);
+  if (existing) return { status: existing.status, isNew: false };
+
+  const res = await db()
+    .from('access')
+    .insert({ user_id: userId, username, first_name: firstName, status: 'pending' })
+    .select('user_id');
+  check(res, 'requestAccess');
+
+  return { status: 'pending', isNew: true };
+}
+
+export async function decideAccess(userId: number, status: AccessStatus): Promise<void> {
+  const res = await db()
+    .from('access')
+    .upsert(
+      { user_id: userId, status, decided_at: new Date().toISOString() },
+      { onConflict: 'user_id' },
+    )
+    .select('user_id');
+  check(res, 'decideAccess');
+}
+
+/** Есть ли у человека право подключать чаты и пользоваться расписанием. */
+export async function isApproved(userId: number): Promise<boolean> {
+  if (userId === env.adminTelegramId) return true;
+  const row = await getAccess(userId);
+  return row?.status === 'approved';
+}
+
+export async function pendingRequests(limit = 20): Promise<AccessRow[]> {
+  const res = await db()
+    .from('access')
+    .select('*')
+    .eq('status', 'pending')
+    .order('requested_at', { ascending: true })
+    .limit(limit);
+  return (check(res, 'pendingRequests') ?? []) as AccessRow[];
+}
+
+export async function accessCounts(): Promise<Record<AccessStatus, number>> {
+  const res = await db().from('access').select('status');
+  const rows = (check(res, 'accessCounts') ?? []) as { status: AccessStatus }[];
+  return {
+    pending: rows.filter((r) => r.status === 'pending').length,
+    approved: rows.filter((r) => r.status === 'approved').length,
+    denied: rows.filter((r) => r.status === 'denied').length,
+  };
+}
+
+/** Полный сброс подключённых чатов и заявок: начинаем с чистого листа. */
+export async function resetChatsAndAccess(): Promise<{ chats: number; access: number }> {
+  const chats = await db().from('chats').delete().neq('chat_id', 0).select('chat_id');
+  check(chats, 'reset.chats');
+
+  const access = await db().from('access').delete().neq('user_id', 0).select('user_id');
+  check(access, 'reset.access');
+
+  const limits = await db().from('rate_limit').delete().gte('count', 0).select('chat_id');
+  check(limits, 'reset.rate_limit');
+
+  return {
+    chats: ((chats.data ?? []) as unknown[]).length,
+    access: ((access.data ?? []) as unknown[]).length,
+  };
 }

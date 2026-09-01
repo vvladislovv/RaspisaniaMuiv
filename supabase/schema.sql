@@ -78,6 +78,24 @@ create table if not exists rate_limit (
   primary key (chat_id, window_start)
 );
 
+-- Доступ к боту: заявка от человека и решение владельца.
+-- Бот публичный только на вход: писать может кто угодно, но добавить бота
+-- в группу и пользоваться расписанием — только после одобрения.
+create table if not exists access (
+  user_id      bigint primary key,
+  username     text,
+  first_name   text,
+  -- pending | approved | denied
+  status       text not null default 'pending',
+  requested_at timestamptz not null default now(),
+  decided_at   timestamptz
+);
+
+create index if not exists access_status_idx on access (status, requested_at desc);
+
+-- Кто добавил чат: по нему проверяется право на подключение
+alter table chats add column if not exists added_by bigint;
+
 -- Состояние приложения: одна строка, ключ-значение.
 create table if not exists app_state (
   key        text primary key,
@@ -86,6 +104,7 @@ create table if not exists app_state (
 );
 
 -- Доступ только через service_role с сервера. Публичных политик нет.
+alter table access     enable row level security;
 alter table chats      enable row level security;
 alter table files      enable row level security;
 alter table schedules  enable row level security;

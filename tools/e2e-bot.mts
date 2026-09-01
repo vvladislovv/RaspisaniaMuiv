@@ -97,7 +97,7 @@ function message(
   return {
     message: {
       message_id: Math.floor(Math.random() * 100000),
-      from: { id: from },
+      from: { id: from, username: `user${from}`, first_name: `Имя${from}` },
       chat:
         type === 'private'
           ? { id: chatId, type: 'private' }
@@ -141,6 +141,14 @@ function button(data: string, from = OWNER, chatId = CHAT): TgUpdate {
       },
     },
   };
+}
+
+/** Чистит заявки: доступ выдаётся заново в каждом прогоне. */
+async function resetAccess(): Promise<void> {
+  await fetch(`${process.env.SUPABASE_URL}/rest/v1/access?user_id=neq.0`, {
+    method: 'DELETE',
+    headers: { apikey: 'fake', Authorization: 'Bearer fake' },
+  });
 }
 
 /** Убирает следы прошлого прогона, чтобы тест можно было запускать повторно. */
@@ -222,6 +230,7 @@ head('Подготовка: загрузка расписания');
 await resetChat();
 await resetRateLimit();
 await resetAlerts();
+await resetAccess();
 const first = await tick(false);
 const siteReachable = first.check !== null && first.check.errors.length === 0;
 
@@ -237,41 +246,88 @@ ok(groups.length > 50, `в базе ${groups.length} групп`);
 
 // ─── Список разрешённых чатов ────────────────────────────────────────────────
 
-head('Публичный доступ');
+head('Доступ только по заявке');
 let m = mark();
-await handleUpdate(message('/start', STRANGER, -999));
-ok(sent(since(m)).length === 1, 'любой чат подключается сам');
-ok((await getChat(-999))?.enabled === true, 'новый чат сразу включён');
+await handleUpdate(message('/start', STRANGER, STRANGER, 'private'));
+let first_ = since(m);
+ok(
+  texts(first_).join('').includes('Заявка на доступ отправлена'),
+  'посторонний получает ответ про заявку',
+);
+ok(
+  keyboardOf(sent(first_).filter((c) => c.body.chat_id === STRANGER)).length === 0,
+  'никаких кнопок доступа ему не дают',
+);
+ok(
+  sent(first_).some((c) => c.body.chat_id === OWNER && String(c.body.text).includes('Заявка')),
+  'владельцу пришло уведомление о заявке',
+);
+ok(
+  keyboardOf(
+    sent(first_).filter((c) => c.body.chat_id === OWNER),
+  ).some((b) => b.callback_data?.startsWith('ok:')),
+  'в уведомлении есть кнопка разрешить',
+);
 
+// Повторное обращение не должно плодить уведомления
+await resetRateLimit();
 m = mark();
 await handleUpdate(message('/start', STRANGER, STRANGER, 'private'));
-const dm = since(m);
-ok(sent(dm).length === 1, 'в личке тоже отвечает');
 ok(
-  texts(dm).join('').includes('Как добавить в группу'),
-  'в личке есть инструкция по добавлению в группу',
+  !sent(since(m)).some((c) => c.body.chat_id === OWNER),
+  'повторная заявка владельца не дёргает',
 );
-ok(
-  texts(dm).join('').includes('Закрепление сообщений'),
-  'сказано, какое право нужно дать',
-);
-ok(
-  keyboardOf(dm).some((b) => String(b.url ?? '').includes('startgroup')),
-  'есть кнопка-ссылка «Добавить в группу»',
-);
-ok(!find(keyboardOf(dm), 'Сводка'), 'постороннему сводка не предлагается');
 
+head('Добавление в группу без доступа');
 m = mark();
-await handleUpdate(message('/start', OWNER, OWNER, 'private'));
-ok(!!find(keyboardOf(since(m)), 'Сводка'), 'владельцу предлагается сводка');
+await handleUpdate(membership('member', STRANGER, -991));
+const denied_ = since(m);
+ok(
+  texts(denied_).join('').includes('Доступ не открыт'),
+  'бот объясняет, почему не работает',
+);
+ok(denied_.some((c) => c.method === 'leaveChat'), 'и покидает чат');
+ok((await getChat(-991)) === null, 'чат в базе не создан');
+
+head('Владелец одобряет заявку');
+await resetRateLimit();
+m = mark();
+await handleUpdate(button(`ok:${STRANGER}`, OWNER, OWNER));
+const approved_ = since(m);
+ok(
+  sent(approved_).some(
+    (c) => c.body.chat_id === STRANGER && String(c.body.text).includes('Доступ открыт'),
+  ),
+  'человек узнаёт об одобрении сам',
+);
+ok(
+  keyboardOf(sent(approved_).filter((c) => c.body.chat_id === STRANGER)).some((b) =>
+    String(b.url ?? '').includes('startgroup'),
+  ),
+  'и сразу получает кнопку добавить в группу',
+);
+
+// Посторонний не может решать заявки
+m = mark();
+await handleUpdate(button(`ok:${GROUP_ADMIN}`, STRANGER, STRANGER));
+ok(
+  String(since(m).findLast((c) => c.method === 'answerCallbackQuery')?.body.text ?? '').includes(
+    'Недоступно',
+  ),
+  'решать заявки может только владелец',
+);
+
+head('Одобренный подключает группу');
+await resetRateLimit();
+m = mark();
+await handleUpdate(membership('member', STRANGER, -992));
+ok(sent(since(m)).length === 1, 'меню появляется само');
+ok(!since(m).some((c) => c.method === 'leaveChat'), 'из чата не уходит');
+ok((await getChat(-992))?.enabled === true, 'чат подключён');
 
 // ─── Добавление в группу ─────────────────────────────────────────────────────
 
 head('Бота добавили в группу');
-m = mark();
-await handleUpdate(membership('member', STRANGER, -998));
-ok(sent(since(m)).length === 1, 'бота может добавить любой — меню появляется');
-
 m = mark();
 await handleUpdate(membership('member', OWNER));
 let added = since(m);

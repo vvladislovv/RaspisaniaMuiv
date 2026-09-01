@@ -17,6 +17,12 @@ import {
   toggleChatGroup,
   currentGroups,
   weekDates,
+  requestAccess,
+  decideAccess,
+  isApproved,
+  getAccess,
+  pendingRequests,
+  accessCounts,
   MAX_GROUPS,
   upsertChat,
   getState,
@@ -27,6 +33,7 @@ import { log, logError } from './log';
 import {
   answerCallbackQuery,
   botUsername,
+  leaveChat,
   editMessageText,
   isChatAdmin,
   sendMessage,
@@ -43,6 +50,8 @@ import { LAST_CHECK_KEY } from './sync';
 
 interface TgUser {
   id: number;
+  username?: string;
+  first_name?: string;
 }
 
 interface TgChat {
@@ -136,18 +145,64 @@ function menuScreen(chat: Chat | null, ctx: Context): Screen {
   };
 }
 
+/**
+ * Экран для человека без доступа.
+ *
+ * Бот открыт на вход, но пользоваться им можно только после одобрения:
+ * иначе кто угодно добавил бы бота куда угодно и трогал чужие настройки.
+ */
+function accessScreen(status: 'pending' | 'denied'): Screen {
+  const lines = ['*Расписание колледжа МУИВ*', ''];
+
+  if (status === 'pending') {
+    lines.push(esc('Заявка на доступ отправлена. Дождись одобрения — я напишу сюда сам.'));
+  } else {
+    lines.push(esc('Доступ не открыт.'));
+  }
+
+  return { text: lines.join('\n'), keyboard: [] };
+}
+
+/** Уведомление владельцу о новой заявке. */
+function requestScreen(user: TgUser): Screen {
+  const who = [user.first_name, user.username ? `@${user.username}` : null]
+    .filter(Boolean)
+    .join(' ');
+
+  return {
+    text: [
+      '*Заявка на доступ*',
+      '',
+      `${esc(who || 'без имени')} · \`${user.id}\``,
+      '',
+      esc('Одобренный человек сможет добавлять бота в группы и выбирать группу.'),
+    ].join('\n'),
+    keyboard: [
+      [
+        { text: '✅ Разрешить', callback_data: `ok:${user.id}` },
+        { text: '⛔️ Отказать', callback_data: `no:${user.id}` },
+      ],
+    ],
+  };
+}
+
 /** Сводка для владельца бота: сколько чатов, какие группы, есть ли ошибки. */
 async function adminScreen(): Promise<Screen> {
-  const [stats, errors, check, file] = await Promise.all([
+  const [stats, errors, check, file, access, pending] = await Promise.all([
     chatStats(),
     errorCount(24),
     getState<{ at: string; filesOnSite: number; errors: string[] }>(LAST_CHECK_KEY),
     latestFile(),
+    accessCounts(),
+    pendingRequests(8),
   ]);
 
   const lines = ['*Сводка*', ''];
   lines.push(`Чатов: *${stats.total}*, включено ${stats.enabled}, с группой ${stats.withGroup}`);
   lines.push(`Ошибок за сутки: ${errors === 0 ? '*0*' : `*${errors}*`}`);
+  lines.push(
+    `Доступ: одобрено ${access.approved}, ждут *${access.pending}*, отказано ${access.denied}`,
+  );
 
   if (check) {
     lines.push(`Проверка сайта: ${esc(mskStamp(new Date(check.at)))}`);
@@ -163,13 +218,23 @@ async function adminScreen(): Promise<Screen> {
     }
   }
 
-  return {
-    text: lines.join('\n'),
-    keyboard: [
-      [{ text: '🔄 Обновить', callback_data: 'adm' }],
-      [{ text: '↩︎ Меню', callback_data: 'm' }],
-    ],
-  };
+  const rows: InlineKeyboard = [];
+
+  // Заявки решаются прямо из сводки: отдельного экрана для этого не нужно
+  for (const row of pending) {
+    const who = [row.first_name, row.username ? `@${row.username}` : null]
+      .filter(Boolean)
+      .join(' ');
+    rows.push([
+      { text: `✅ ${who || row.user_id}`, callback_data: `ok:${row.user_id}` },
+      { text: '⛔️', callback_data: `no:${row.user_id}` },
+    ]);
+  }
+
+  rows.push([{ text: '🔄 Обновить', callback_data: 'adm' }]);
+  rows.push([{ text: '↩︎ Меню', callback_data: 'm' }]);
+
+  return { text: lines.join('\n'), keyboard: rows };
 }
 
 /**
@@ -378,7 +443,7 @@ function isStart(text: string): boolean {
 
 async function handleMessage(message: TgMessage): Promise<void> {
   const chatId = message.chat.id;
-  const userId = message.from?.id;
+  const user = message.from;
 
   // Служебное сообщение о переезде приходит в старый чат — переносим настройки,
   // иначе бот замолчит в группе и перестанет слать расписание
@@ -399,20 +464,58 @@ async function handleMessage(message: TgMessage): Promise<void> {
     return;
   }
 
+  const isPrivate = message.chat.type === 'private';
+
+  // В личке /start — это заявка на доступ либо вход для уже одобренного
+  if (isPrivate && user) {
+    if (!(await isApproved(user.id))) {
+      const { status, isNew } = await requestAccess(
+        user.id,
+        user.username ?? null,
+        user.first_name ?? null,
+      );
+
+      const screen = accessScreen(status === 'denied' ? 'denied' : 'pending');
+      await sendMessage(chatId, screen.text, { silent: true });
+
+      await log('command', `Заявка на доступ: ${status}${isNew ? ' (новая)' : ''}`, {
+        chatId,
+        details: { userId: user.id, username: user.username },
+      });
+
+      // Владельцу сообщаем только о новой заявке, чтобы не дёргать повторами
+      if (isNew) {
+        const notice = requestScreen(user);
+        try {
+          await sendMessage(env.adminTelegramId, notice.text, {
+            silent: true,
+            keyboard: notice.keyboard,
+          });
+        } catch (error) {
+          await logError('Уведомление владельца о заявке', error);
+        }
+      }
+      return;
+    }
+
+    await upsertChat(chatId, null, user.id);
+    if (!(await getChat(chatId))?.enabled) await setChatEnabled(chatId, true);
+
+    const screen = menuScreen(await getChat(chatId), await contextOf(message.chat, user.id));
+    await sendMessage(chatId, screen.text, { silent: true, keyboard: screen.keyboard });
+    return;
+  }
+
+  // В группе /start работает, только если чат уже подключён одобренным человеком
   const chat = await getChat(chatId);
-  const isNew = !chat;
+  if (!chat) {
+    await log('skip', `/start в неподключённом чате ${chatId}`, { chatId });
+    return;
+  }
 
-  await upsertChat(chatId, message.chat.title ?? null);
-  // Бот публичный: любой чат подключается сам. Выключенный чат включаем
-  // обратно только по /start — то есть по явному действию человека.
-  if (!chat?.enabled) await setChatEnabled(chatId, true);
+  await log('command', '/start', { chatId, details: { userId: user?.id } });
 
-  await log('command', '/start', {
-    chatId,
-    details: { userId, isNew, type: message.chat.type, title: message.chat.title },
-  });
-
-  const screen = menuScreen(await getChat(chatId), await contextOf(message.chat, userId));
+  const screen = menuScreen(chat, await contextOf(message.chat, user?.id));
   await sendMessage(chatId, screen.text, { silent: true, keyboard: screen.keyboard });
 }
 
@@ -437,6 +540,14 @@ async function runCallback(
   const chatId = message.chat.id;
   const [chat, ctx] = await Promise.all([getChat(chatId), contextOf(message.chat, query.from.id)]);
 
+  // Кнопки работают только в подключённом чате. Исключение — решения по
+  // заявкам: они приходят владельцу в личку, где чата в базе может не быть.
+  const isDecision = data.startsWith('ok:') || data.startsWith('no:');
+  if (!chat && !isDecision) {
+    await answerCallbackQuery(query.id, 'Чат не подключён');
+    return;
+  }
+
   // В группе кнопки жмут все участники сразу, поэтому лимит выше, чем на команды
   if (!(await allowRequest(chatId, 60))) {
     ack('Слишком часто, подожди минуту');
@@ -460,6 +571,46 @@ async function runCallback(
   if (data === 'm') {
     ack();
     await edit(menuScreen(chat, ctx));
+    return;
+  }
+
+  // Решение по заявке — только владелец бота
+  if (data.startsWith('ok:') || data.startsWith('no:')) {
+    if (query.from.id !== env.adminTelegramId) {
+      ack('Недоступно');
+      return;
+    }
+
+    const targetId = Number(data.slice(3));
+    const approve = data.startsWith('ok:');
+    await decideAccess(targetId, approve ? 'approved' : 'denied');
+    ack(approve ? 'Доступ открыт' : 'Отказано');
+    await log('command', `Заявка ${approve ? 'одобрена' : 'отклонена'}: ${targetId}`);
+
+    // Человек должен узнать решение сам, не спрашивая
+    if (approve) {
+      try {
+        const username = await botUsername().catch(() => null);
+        await sendMessage(
+          targetId,
+          [
+            `*${esc('Доступ открыт')}*`,
+            '',
+            esc('Теперь можно добавить меня в группу — кнопка ниже, дальше всё подскажу.'),
+          ].join('\n'),
+          {
+            silent: false,
+            keyboard: username
+              ? [[{ text: '➕ Добавить в группу', url: `https://t.me/${username}?startgroup=true` }]]
+              : undefined,
+          },
+        );
+      } catch (error) {
+        await logError(`Уведомление об одобрении ${targetId}`, error);
+      }
+    }
+
+    await edit(await adminScreen());
     return;
   }
 
@@ -711,7 +862,28 @@ async function handleMembership(event: TgChatMemberUpdate): Promise<void> {
 
   const chat = await getChat(chatId);
 
-  await upsertChat(chatId, event.chat.title ?? null);
+  // Подключить чат может только одобренный человек. Иначе бот не остаётся
+  // в группе: молча висеть без дела — хуже, чем честно уйти.
+  if (!chat && !(await isApproved(event.from.id))) {
+    await log('skip', `Бота добавили без доступа в чат ${chatId}`, {
+      chatId,
+      details: { addedBy: event.from.id, title: event.chat.title },
+    });
+
+    try {
+      await sendMessage(
+        chatId,
+        esc('Доступ не открыт. Напиши мне в личку и дождись одобрения.'),
+        { silent: true },
+      );
+      await leaveChat(chatId);
+    } catch (error) {
+      await logError(`Выход из чата ${chatId} без доступа`, error);
+    }
+    return;
+  }
+
+  await upsertChat(chatId, event.chat.title ?? null, event.from.id);
 
   // Бота добавляют, чтобы он работал. Если чат был выключен — в том числе
   // потому, что бота до этого удалили, — включаем обратно, иначе расписание

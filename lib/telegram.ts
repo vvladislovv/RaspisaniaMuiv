@@ -278,3 +278,8 @@ export async function isChatAdmin(chatId: number, userId: number): Promise<boole
     return false;
   }
 }
+
+/** Покидает чат: бота добавили без разрешения — оставаться незачем. */
+export function leaveChat(chatId: number): Promise<unknown> {
+  return call('leaveChat', { chat_id: chatId }, { retries: 1 });
+}
