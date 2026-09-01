@@ -128,3 +128,14 @@ test('emojiTag собирает кастомный эмодзи и запасн�
   // Глиф со спецсимволом должен быть экранирован
   assert.equal(emojiTag('!', '123'), '![\\!](tg://emoji?id=123)');
 });
+
+test('подпись автора: белая птица из набора «ХакТайка», текст по-русски', async () => {
+  const { emojiTag, esc } = await import('../lib/format');
+
+  const line = `${emojiTag('🕊', '5399882430721071735')} ${esc('Сделано в')} [${esc('Хактайке')}](https://hacktaika.ru)`;
+
+  assert.match(line, /tg:\/\/emoji\?id=5399882430721071735/);
+  assert.match(line, /\[Хактайке\]/);
+  // Ссылка стоит на слове, а не на адресе
+  assert.doesNotMatch(line, /\[hacktaika/);
+});

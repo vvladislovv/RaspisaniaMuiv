@@ -496,14 +496,20 @@ export interface CreditEmoji {
   customId: string | null;
 }
 
-const DEFAULT_CREDIT_EMOJI = '🦅';
+/**
+ * Белая птица из набора «ХакТайка» — последний эмодзи набора.
+ * Запасной глиф выбран похожим: там, где кастомный эмодзи не отобразится
+ * (системные уведомления, пересылка без Premium), останется белая птица.
+ */
+const DEFAULT_CREDIT: CreditEmoji = { glyph: '🕊', customId: '5399882430721071735' };
 const CREDIT_EMOJI_KEY = 'credit_emoji';
 
 async function creditEmoji(): Promise<CreditEmoji> {
   const saved = await getState<CreditEmoji>(CREDIT_EMOJI_KEY);
+  if (!saved) return DEFAULT_CREDIT;
   return {
-    glyph: saved?.glyph || DEFAULT_CREDIT_EMOJI,
-    customId: saved?.customId ?? null,
+    glyph: saved.glyph || DEFAULT_CREDIT.glyph,
+    customId: saved.customId ?? null,
   };
 }
 
@@ -573,7 +579,8 @@ async function learnCreditEmoji(chatId: number, message: TgMessage): Promise<boo
   const text = message.text ?? '';
   // Глиф — то, что стоит на месте эмодзи: он же запасной вариант
   const glyph =
-    Array.from(text).slice(entity.offset, entity.offset + entity.length).join('') || '🦅';
+    Array.from(text).slice(entity.offset, entity.offset + entity.length).join('') ||
+    DEFAULT_CREDIT.glyph;
 
   const candidate: CreditEmoji = { glyph, customId: entity.custom_emoji_id };
 
