@@ -93,6 +93,75 @@ export interface DayMessageOptions {
   heading?: string;
 }
 
+/** Расписание одной группы на один день: `null`, если пар нет в файле. */
+export interface GroupDay {
+  group: string;
+  day: Day | null;
+}
+
+/** Пары одной группы в виде цитаты. */
+function dayQuote(day: Day | null): string {
+  if (!day || day.lessons.length === 0) return quote([`_${esc('Пар нет')}_`]);
+
+  const lines: string[] = [];
+  day.lessons.forEach((lesson, index) => {
+    if (index > 0) lines.push('');
+    lines.push(...lessonLines(lesson));
+  });
+  return quote(lines);
+}
+
+/**
+ * Сообщение на один день сразу по нескольким группам.
+ *
+ * Группы в файле МУИВ часто делят одну колонку, поэтому людям нужно расписание
+ * двух групп рядом. Название группы стоит над каждой цитатой — при двух блоках
+ * не спутаешь, что чьё.
+ */
+export function formatDayFor(
+  dateIso: string,
+  dayName: string,
+  blocks: GroupDay[],
+  opts: {
+    siteUpdated?: string | null;
+    heading?: string;
+    /** Группы, которых больше нет в файле: молчать об этом нельзя. */
+    missing?: string[];
+  } = {},
+): string {
+  const parts: string[] = [];
+
+  if (opts.heading) parts.push(`_${esc(opts.heading)}_`);
+  parts.push(`📅 *${esc(dayName)}, ${esc(humanDate(dateIso))}*`);
+
+  for (const block of blocks) {
+    parts.push('');
+    parts.push(`👥 *${esc(block.group)}*`);
+    parts.push(dayQuote(block.day));
+  }
+
+  if (blocks.length === 0 && (opts.missing?.length ?? 0) === 0) {
+    parts.push('');
+    parts.push(quote([`_${esc('Группа не выбрана')}_`]));
+  }
+
+  // Колледж иногда переименовывает группы или делит их на подгруппы.
+  // Молча показывать «пар нет» в таком случае — худшее из возможного.
+  for (const name of opts.missing ?? []) {
+    parts.push('');
+    parts.push(
+      `⚠️ ${esc(`Группы «${name}» больше нет в расписании — выбери её заново.`)}`,
+    );
+  }
+
+  if (opts.siteUpdated) {
+    parts.push('');
+    parts.push(`_${esc(`Файл обновлён: ${opts.siteUpdated}`)}_`);
+  }
+
+  return parts.join('\n');
+}
+
 /** Сообщение с расписанием на один день. */
 export function formatDay(day: Day, opts: DayMessageOptions): string {
   const parts: string[] = [];

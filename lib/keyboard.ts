@@ -18,7 +18,7 @@ export function chunk<T>(items: T[], size: number): T[][] {
 const TO_MENU = { text: '↩︎ Меню', callback_data: 'm' };
 
 export interface MenuOptions {
-  group: string | null;
+  groups: string[];
   /** В личке предлагаем добавить бота в группу; в самой группе это не нужно. */
   isPrivate: boolean;
   /** Владельцу бота показываем вход в сводку. */
@@ -31,13 +31,18 @@ export interface MenuOptions {
 export function menuKeyboard(opts: MenuOptions): InlineKeyboard {
   const rows: InlineKeyboard = [];
 
-  if (opts.group) {
+  if (opts.groups.length > 0) {
     rows.push([
       { text: '📅 Завтра', callback_data: 'day:1' },
       { text: '📅 Сегодня', callback_data: 'day:0' },
     ]);
     rows.push([{ text: '📖 Вся неделя', callback_data: 'week' }]);
-    rows.push([{ text: '👥 Сменить группу', callback_data: 'grp' }]);
+    rows.push([
+      {
+        text: opts.groups.length > 1 ? '👥 Изменить группы' : '👥 Группы',
+        callback_data: 'grp',
+      },
+    ]);
   } else {
     rows.push([{ text: '👥 Выбрать группу', callback_data: 'grp' }]);
   }
@@ -66,11 +71,19 @@ export function menuKeyboard(opts: MenuOptions): InlineKeyboard {
  * как колледж выложит новый файл. Активный день помечен точками, день без пар —
  * точкой после названия.
  */
+export interface GroupSwitch {
+  groups: string[];
+  activeIndex: number;
+  /** Дата, к которой относится показанная неделя. */
+  dateIso: string;
+}
+
 export function scheduleKeyboard(
   days: Day[],
   active: string | null,
   weekStart: string | null,
   allWeeks: string[],
+  groupSwitch?: GroupSwitch,
 ): InlineKeyboard {
   const rows: InlineKeyboard = chunk(
     days.map((day) => {
@@ -107,6 +120,17 @@ export function scheduleKeyboard(
     if (nav.length > 0) rows.push(nav);
   }
 
+  // В режиме недели показываем расписание одной группы: две недели рядом
+  // не читаются. Поэтому даём переключатель, если групп выбрано больше одной.
+  if (groupSwitch && groupSwitch.groups.length > 1) {
+    rows.push(
+      groupSwitch.groups.map((group, index) => ({
+        text: index === groupSwitch.activeIndex ? `· ${group} ·` : group,
+        callback_data: `wg:${index}:${groupSwitch.dateIso}`,
+      })),
+    );
+  }
+
   rows.push([TO_MENU]);
   return rows;
 }
@@ -127,12 +151,18 @@ export function groupKeyboard(
   groups: { group: string; index: number }[],
   sheetIndex: number,
   page: number,
+  selected: string[] = [],
 ): InlineKeyboard {
   const pages = chunk(groups, GROUPS_PER_PAGE);
   const current = pages[page] ?? [];
 
+  // Галочка показывает выбранные группы: нажатие снимает выбор, поэтому
+  // человек видит, что выбрал, не выходя из списка
   const rows: InlineKeyboard = chunk(
-    current.map((g) => ({ text: g.group, callback_data: `g:${g.index}` })),
+    current.map((g) => ({
+      text: selected.includes(g.group) ? `✓ ${g.group}` : g.group,
+      callback_data: `g:${g.index}`,
+    })),
     3,
   );
 
@@ -143,7 +173,11 @@ export function groupKeyboard(
     nav.push({ text: '▶︎', callback_data: `p:${sheetIndex}:${page + 1}` });
   }
   rows.push(nav);
-  rows.push([TO_MENU]);
+  rows.push([
+    selected.length > 0
+      ? { text: `✔︎ Готово (${selected.length})`, callback_data: 'm' }
+      : TO_MENU,
+  ]);
 
   return rows;
 }

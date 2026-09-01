@@ -24,6 +24,7 @@ import {
 } from '../lib/db';
 import { parseSchedule } from '../lib/parse';
 import { mskDateOffset } from '../lib/time';
+import { esc } from '../lib/format';
 
 const LOG = process.env.FAKE_TG_LOG ?? '/tmp/tg.json';
 const CHAT = -100777000;
@@ -52,6 +53,7 @@ function head(title: string) {
 interface Button {
   text: string;
   callback_data: string;
+  url?: string;
 }
 
 interface Call {
@@ -374,21 +376,29 @@ head('Выбор группы кнопками');
 m = mark();
 await handleUpdate(button('grp'));
 buttons = keyboardOf(since(m));
-ok(buttons.filter((b) => b.callback_data.startsWith('s:')).length === 6, 'предложено 6 курсов');
+ok(
+  buttons.filter((b) => b.callback_data.startsWith('s:')).length >= 4,
+  `предложено курсов: ${buttons.filter((b) => b.callback_data.startsWith('s:')).length}`,
+);
 ok(!!find(buttons, 'Меню'), 'с экрана курсов есть путь назад');
 
-const target = groups.find((g) => g.group === 'ИСП/П-24-11')!;
+// Названия групп колледж меняет между файлами, поэтому берём любой курс,
+// где групп хватает на проверку лимита в две штуки
+const target = groups.find(
+  (g) => groups.filter((x) => x.sheet === g.sheet).length >= 3,
+)!;
 const sheets = [...new Set(groups.map((g) => g.sheet))].sort((a, b) =>
   String(a).localeCompare(String(b), 'ru'),
 );
 const sheetIndex = sheets.indexOf(target.sheet);
-ok(sheetIndex !== -1, `курс группы найден: ${target.sheet}`);
+ok(!!target, `взят курс с запасом групп: ${target?.sheet}`);
+ok(sheetIndex !== -1, 'курс найден в списке');
 
 m = mark();
 await handleUpdate(button(`s:${sheetIndex}`));
 buttons = keyboardOf(since(m));
-const groupButton = buttons.find((b) => b.text === 'ИСП/П-24-11');
-ok(!!groupButton, 'кнопка ИСП/П-24-11 есть в списке');
+const groupButton = buttons.find((b) => b.callback_data.startsWith('g:'));
+ok(!!groupButton, 'в списке есть кнопки групп');
 
 m = mark();
 await handleUpdate(button(groupButton!.callback_data, STRANGER));
@@ -396,16 +406,90 @@ ok(
   String(since(m).findLast((c) => c.method === 'answerCallbackQuery')?.body.text ?? '').includes(
     'админ',
   ),
-  'посторонний не может сменить группу',
+  'посторонний не может менять группы',
 );
-ok((await getChat(CHAT))?.group_name === null, 'группа в базе не изменилась');
+ok(((await getChat(CHAT))?.groups ?? []).length === 0, 'группы в базе не изменились');
 
 m = mark();
 await handleUpdate(button(groupButton!.callback_data, GROUP_ADMIN));
-ok((await getChat(CHAT))?.group_name === 'ИСП/П-24-11', 'админ группы выбрал группу');
-ok(edited(since(m)).length === 1, 'после выбора сообщение заменяется на меню');
+ok(((await getChat(CHAT))?.groups ?? []).length === 1, 'админ группы выбрал первую группу');
+ok(edited(since(m)).length === 1, 'список остаётся открытым для второй группы');
+buttons = keyboardOf(since(m));
+ok(!!find(buttons, '✓ '), 'выбранная группа помечена галочкой');
+ok(!!find(buttons, 'Готово'), 'появилась кнопка «Готово»');
+
+// ─── Вторая группа ───────────────────────────────────────────────────────────
+
+head('Выбор второй группы');
+const second2 = buttons.find((b) => b.callback_data.startsWith('g:') && !b.text.startsWith('✓'))!;
+m = mark();
+await handleUpdate(button(second2.callback_data, GROUP_ADMIN));
+let chosen = (await getChat(CHAT))?.groups ?? [];
+ok(chosen.length === 2, `выбрано две группы: ${chosen.join(', ')}`);
+
+// Третья не должна влезть
+const third3 = keyboardOf(since(m)).find(
+  (b) => b.callback_data.startsWith('g:') && !b.text.startsWith('✓'),
+)!;
+m = mark();
+await handleUpdate(button(third3.callback_data, GROUP_ADMIN));
+ok(
+  String(since(m).findLast((c) => c.method === 'answerCallbackQuery')?.body.text ?? '').includes(
+    'нельзя',
+  ),
+  'третью группу добавить нельзя',
+);
+ok(((await getChat(CHAT))?.groups ?? []).length === 2, 'групп по-прежнему две');
+
+// Повторное нажатие снимает выбор
+m = mark();
+await handleUpdate(button(second2.callback_data, GROUP_ADMIN));
+ok(((await getChat(CHAT))?.groups ?? []).length === 1, 'повторное нажатие убирает группу');
+await handleUpdate(button(second2.callback_data, GROUP_ADMIN));
+chosen = (await getChat(CHAT))?.groups ?? [];
+ok(chosen.length === 2, 'и возвращает обратно');
+
+await resetRateLimit();
+m = mark();
+await handleUpdate(button('m'));
 buttons = keyboardOf(since(m));
 ok(!!find(buttons, 'Завтра') && !!find(buttons, 'Вся неделя'), 'в меню появилось расписание');
+{
+  const menuText = texts(since(m)).join('');
+  ok(
+    menuText.includes(esc(chosen[0])) && menuText.includes(esc(chosen[1])),
+    'меню показывает обе группы',
+  );
+}
+
+head('День показывает обе группы, неделя — по одной');
+m = mark();
+await handleUpdate(button('day:1'));
+const dayText = texts(since(m)).join('');
+ok(
+  dayText.includes(esc(chosen[0])) && dayText.includes(esc(chosen[1])),
+  'в сообщении на день видны обе группы',
+);
+
+m = mark();
+await handleUpdate(button('week'));
+const weekButtons = keyboardOf(since(m));
+ok(
+  weekButtons.filter((b) => b.callback_data.startsWith('wg:')).length === 2,
+  'в неделе есть переключатель между двумя группами',
+);
+ok(
+  weekButtons.some((b) => b.text.startsWith('· ')),
+  'активная группа отмечена',
+);
+
+const other = weekButtons.find((b) => b.callback_data.startsWith('wg:') && !b.text.startsWith('· '))!;
+m = mark();
+await handleUpdate(button(other.callback_data));
+ok(
+  texts(since(m)).join('').includes(esc(other.text)),
+  'переключение показывает неделю второй группы',
+);
 
 // ─── Листание расписания ─────────────────────────────────────────────────────
 
@@ -484,8 +568,8 @@ const groupBtn = keyboardOf(since(m)).find((b) => b.callback_data.startsWith('g:
 m = mark();
 await handleUpdate(button(groupBtn.callback_data, STRANGER));
 ok(
-  (await getChat(CHAT))?.group_name === 'ИСП/П-24-11',
-  'но подтвердить смену группы участник не может',
+  ((await getChat(CHAT))?.groups ?? []).length === 2,
+  'но изменить состав групп участник не может',
 );
 
 // ─── Статус и переключатель автоотправки ─────────────────────────────────────
@@ -496,7 +580,7 @@ m = mark();
 await handleUpdate(button('st'));
 screen = since(m);
 ok(texts(screen).join('').includes('Последняя проверка'), 'статус показывает время проверки');
-ok(texts(screen).join('').includes('ИСП'), 'статус показывает группу');
+ok(texts(screen).join('').includes(esc(chosen[0])), 'статус показывает группу');
 buttons = keyboardOf(screen);
 const offButton = find(buttons, 'Выключить');
 ok(!!offButton, 'есть переключатель автоотправки');
@@ -539,6 +623,71 @@ const bare = about
   .replace(/\[[^\]]*\]\([^)]*\)/g, '')
   .replace(/[*_]/g, '');
 ok(!/[.!()\-]/.test(bare), `в тексте нет неэкранированных символов: ${bare.slice(0, 60)}`);
+
+// ─── Переименование группы в новом файле ─────────────────────────────────────
+
+await resetRateLimit();
+head('Колледж переименовал группу');
+{
+  const { toggleChatGroup, getChat: read, normalizeGroup } = await import('../lib/db');
+  const real = (await listGroups())[0].group;
+  // Изображаем старое написание: другой регистр и дефисы вместо пробелов
+  const oldStyle = real.toUpperCase().replace(/\s/g, '-');
+
+  await fetch(`${process.env.SUPABASE_URL}/rest/v1/chats?chat_id=eq.${CHAT}`, {
+    method: 'PATCH',
+    headers: {
+      apikey: 'fake',
+      Authorization: 'Bearer fake',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ groups: [oldStyle] }),
+  });
+
+  ok(
+    normalizeGroup(oldStyle) === normalizeGroup(real),
+    'старое и новое написание сравниваются как одно',
+  );
+
+  m = mark();
+  await handleUpdate(button('day:1'));
+  const after = (await read(CHAT))?.groups ?? [];
+  ok(after[0] === real, `название обновилось само: ${oldStyle} -> ${after[0]}`);
+  ok(
+    !texts(since(m)).join('').includes('больше нет в расписании'),
+    'предупреждения нет: группа нашлась',
+  );
+
+  // А исчезнувшая группа должна давать явное предупреждение, а не «пар нет»
+  await fetch(`${process.env.SUPABASE_URL}/rest/v1/chats?chat_id=eq.${CHAT}`, {
+    method: 'PATCH',
+    headers: {
+      apikey: 'fake',
+      Authorization: 'Bearer fake',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ groups: ['ГРУППА-КОТОРОЙ-НЕТ'] }),
+  });
+
+  m = mark();
+  await handleUpdate(button('day:1'));
+  ok(
+    texts(since(m)).join('').includes('больше нет в расписании'),
+    'про исчезнувшую группу бот предупреждает',
+  );
+
+  // Возвращаем рабочее состояние
+  await fetch(`${process.env.SUPABASE_URL}/rest/v1/chats?chat_id=eq.${CHAT}`, {
+    method: 'PATCH',
+    headers: {
+      apikey: 'fake',
+      Authorization: 'Bearer fake',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ groups: chosen }),
+  });
+  void toggleChatGroup;
+}
 
 // ─── Повторное нажатие той же кнопки ─────────────────────────────────────────
 

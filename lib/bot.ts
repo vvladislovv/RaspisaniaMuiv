@@ -14,7 +14,9 @@ import {
   errorCount,
   migrateChat,
   setChatEnabled,
-  setChatGroup,
+  toggleChatGroup,
+  currentGroups,
+  MAX_GROUPS,
   upsertChat,
   getState,
   weekStarts,
@@ -29,9 +31,10 @@ import {
   sendMessage,
   type InlineKeyboard,
 } from './telegram';
-import { esc, formatDay, formatEmptyDay, formatWeek, humanDate } from './format';
+import { esc, formatDayFor, formatWeek, humanDate, type GroupDay } from './format';
 import { groupKeyboard, menuKeyboard, scheduleKeyboard, sheetKeyboard, statusKeyboard } from './keyboard';
 import { dayNameOf, mskDateOffset, mskStamp, mskToday } from './time';
+import type { Day } from './parse';
 import { env } from './env';
 import { LAST_CHECK_KEY } from './sync';
 
@@ -93,17 +96,23 @@ interface Context {
 function menuScreen(chat: Chat | null, ctx: Context): Screen {
   const lines = ['*Расписание колледжа МУИВ*', ''];
 
-  if (chat?.group_name) {
-    lines.push(`👥 Группа: *${esc(chat.group_name)}*`);
+  const groups = chat?.groups ?? [];
+
+  if (groups.length > 0) {
+    lines.push(
+      `👥 ${groups.length > 1 ? 'Группы' : 'Группа'}: ` +
+        groups.map((g) => `*${esc(g)}*`).join(', '),
+    );
     lines.push('');
     lines.push(esc('Проверяю сайт каждый час и обновляю закреплённое расписание.'));
     lines.push(
-      chat.enabled
+      chat?.enabled
         ? esc('Каждый день в 16:00 присылаю расписание на завтра и закрепляю его, кроме субботы.')
         : `_${esc('Автоотправка выключена. Включить — в разделе «Статус».')}_`,
     );
   } else {
     lines.push(esc('Группа ещё не выбрана. Нажми «Выбрать группу» — дальше всё кнопками.'));
+    lines.push(esc(`Можно выбрать до ${MAX_GROUPS} групп — расписание придёт по обеим.`));
   }
 
   if (ctx.isPrivate) {
@@ -118,7 +127,7 @@ function menuScreen(chat: Chat | null, ctx: Context): Screen {
   return {
     text: lines.join('\n'),
     keyboard: menuKeyboard({
-      group: chat?.group_name ?? null,
+      groups,
       isPrivate: ctx.isPrivate,
       isOwner: ctx.isOwner,
       username: ctx.username,
@@ -162,17 +171,46 @@ async function adminScreen(): Promise<Screen> {
   };
 }
 
-/** Экран одного дня. */
-async function dayScreen(group: string, dateIso: string, heading?: string): Promise<Screen> {
-  const [{ days, file }, weeks] = await Promise.all([getWeek(group, dateIso), weekStarts()]);
-  const day = days.find((d) => d.date === dateIso) ?? null;
+/**
+ * Экран одного дня сразу по всем выбранным группам: в один день пары обеих
+ * групп читаются рядом, и переключать ничего не нужно.
+ */
+async function dayScreen(
+  chatId: number,
+  stored: string[],
+  dateIso: string,
+  heading?: string,
+): Promise<Screen> {
+  const weeks = await weekStarts();
+  const { groups, missing } = await currentGroups(chatId, stored);
+  const perGroup = await Promise.all(groups.map((group) => getWeek(group, dateIso)));
 
-  const opts = { group, siteUpdated: file?.site_updated ?? null, heading };
-  const text = day ? formatDay(day, opts) : formatEmptyDay(dateIso, dayNameOf(dateIso), opts);
+  const blocks: GroupDay[] = groups.map((group, index) => ({
+    group,
+    day: perGroup[index].days.find((d) => d.date === dateIso) ?? null,
+  }));
+
+  const file = perGroup.find((w) => w.file)?.file ?? null;
+
+  // Для клавиатуры дни объединяем: точка «пар нет» гаснет, если пары есть
+  // хотя бы у одной группы
+  const byDate = new Map<string, Day>();
+  for (const { days } of perGroup) {
+    for (const day of days) {
+      const known = byDate.get(day.date);
+      if (!known || known.lessons.length === 0) byDate.set(day.date, day);
+    }
+  }
+  const merged = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+  const hasDay = blocks.some((b) => b.day);
 
   return {
-    text,
-    keyboard: scheduleKeyboard(days, day ? dateIso : null, file?.week_start ?? null, weeks),
+    text: formatDayFor(dateIso, dayNameOf(dateIso), blocks, {
+      siteUpdated: file?.site_updated ?? null,
+      heading,
+      missing,
+    }),
+    keyboard: scheduleKeyboard(merged, hasDay ? dateIso : null, file?.week_start ?? null, weeks),
   };
 }
 
@@ -181,9 +219,15 @@ async function dayScreen(group: string, dateIso: string, heading?: string): Prom
  * возвращается частями: первая идёт в правку, остальные — отдельными сообщениями.
  */
 async function weekScreen(
-  group: string,
+  chatId: number,
+  stored: string[],
   fromIso: string,
+  groupIndex = 0,
 ): Promise<{ chunks: string[]; keyboard: InlineKeyboard }> {
+  const { groups } = await currentGroups(chatId, stored);
+  const active = Math.min(Math.max(groupIndex, 0), Math.max(groups.length - 1, 0));
+  const group = groups[active] ?? '';
+
   const [{ days, file }, weeks] = await Promise.all([getWeek(group, fromIso), weekStarts()]);
 
   const chunks = formatWeek(days, {
@@ -192,7 +236,16 @@ async function weekScreen(
     heading: file?.week_start ? `Неделя с ${humanDate(file.week_start)}` : 'Расписание на неделю',
   });
 
-  return { chunks, keyboard: scheduleKeyboard(days, null, file?.week_start ?? null, weeks) };
+  const anchor = days[0]?.date ?? fromIso;
+
+  return {
+    chunks,
+    keyboard: scheduleKeyboard(days, null, file?.week_start ?? null, weeks, {
+      groups,
+      activeIndex: active,
+      dateIso: anchor,
+    }),
+  };
 }
 
 async function statusScreen(chat: Chat | null): Promise<Screen> {
@@ -204,7 +257,11 @@ async function statusScreen(chat: Chat | null): Promise<Screen> {
   ]);
 
   const lines = ['*Статус*', ''];
-  lines.push(`👥 Группа: ${chat?.group_name ? `*${esc(chat.group_name)}*` : '_не выбрана_'}`);
+  const groups = chat?.groups ?? [];
+  lines.push(
+    `👥 ${groups.length > 1 ? 'Группы' : 'Группа'}: ` +
+      (groups.length > 0 ? groups.map((g) => `*${esc(g)}*`).join(', ') : '_не выбрана_'),
+  );
   lines.push(`🔔 Автоотправка: ${chat?.enabled ? 'включена' : 'выключена'}`);
   lines.push('');
 
@@ -363,9 +420,10 @@ async function runCallback(
   const edit = (screen: Screen) =>
     editMessageText(chatId, message.message_id, screen.text, screen.keyboard);
 
-  /** Возвращает группу чата либо возвращает в меню с подсказкой. */
-  const requireGroup = async (): Promise<string | null> => {
-    if (chat?.group_name) return chat.group_name;
+  /** Возвращает группы чата либо возвращает в меню с подсказкой. */
+  const requireGroups = async (): Promise<string[] | null> => {
+    const groups = chat?.groups ?? [];
+    if (groups.length > 0) return groups;
     ack('Сначала выбери группу');
     await edit(menuScreen(chat, ctx));
     return null;
@@ -422,14 +480,15 @@ async function runCallback(
 
   // `day:0` — сегодня, `day:1` — завтра
   if (data.startsWith('day:')) {
-    const group = await requireGroup();
-    if (!group) return;
+    const groups = await requireGroups();
+    if (!groups) return;
 
     const offset = Number(data.slice(4));
     ack();
     await edit(
       await dayScreen(
-        group,
+        chatId,
+        groups,
         mskDateOffset(offset),
         offset === 1 ? 'Расписание на завтра' : 'Расписание на сегодня',
       ),
@@ -439,37 +498,37 @@ async function runCallback(
 
   // `d:<дата>` — конкретный день. `d:0`…`d:5` и `d:all` остались в старых сообщениях
   if (data.startsWith('d:')) {
-    const group = await requireGroup();
-    if (!group) return;
+    const groups = await requireGroups();
+    if (!groups) return;
 
     const key = data.slice(2);
     ack();
 
     if (key === 'all') {
-      const { chunks, keyboard } = await weekScreen(group, mskToday());
+      const { chunks, keyboard } = await weekScreen(chatId, groups, mskToday());
       await editMessageText(chatId, message.message_id, chunks[0], keyboard);
       return;
     }
 
     let dateIso = key;
     if (/^\d+$/.test(key)) {
-      const { days } = await getWeek(group, mskToday());
+      const { days } = await getWeek(groups[0], mskToday());
       dateIso = days[Number(key)]?.date ?? mskToday();
     }
 
-    await edit(await dayScreen(group, dateIso));
+    await edit(await dayScreen(chatId, groups, dateIso));
     return;
   }
 
   // `week` — текущая неделя, `w:<дата>` — неделя, содержащая эту дату
   if (data === 'week' || data.startsWith('w:')) {
-    const group = await requireGroup();
-    if (!group) return;
+    const groups = await requireGroups();
+    if (!groups) return;
 
     ack();
 
     const from = data === 'week' ? mskToday() : data.slice(2);
-    const { chunks, keyboard } = await weekScreen(group, from);
+    const { chunks, keyboard } = await weekScreen(chatId, groups, from);
     await editMessageText(chatId, message.message_id, chunks[0], keyboard);
 
     // Если неделя не влезла в одно сообщение — остальные части отправляем ниже
@@ -490,7 +549,7 @@ async function runCallback(
       await edit({
         text: esc('Расписание ещё не загружено. Попробуй через час.'),
         keyboard: menuKeyboard({
-          group: chat?.group_name ?? null,
+          groups: chat?.groups ?? [],
           isPrivate: ctx.isPrivate,
           isOwner: ctx.isOwner,
           username: ctx.username,
@@ -515,12 +574,20 @@ async function runCallback(
     }
 
     ack();
+    const chosen = chat?.groups ?? [];
     await edit({
-      text: `*${esc(sheet)}*\nВыбери группу:`,
+      text:
+        `*${esc(sheet)}*\n` +
+        esc(
+          chosen.length > 0
+            ? `Выбрано: ${chosen.join(', ')}. Нажми группу, чтобы добавить или убрать.`
+            : `Выбери группу. Можно до ${MAX_GROUPS} — расписание придёт по обеим.`,
+        ),
       keyboard: groupKeyboard(
         groups.filter((g) => g.sheet === sheet),
         sheetIndex,
         Number(pageRaw ?? 0) || 0,
+        chosen,
       ),
     });
     return;
@@ -528,23 +595,64 @@ async function runCallback(
 
   if (data.startsWith('g:')) {
     if (!(await isChatAdmin(chatId, query.from.id))) {
-      ack('Только админ чата может менять группу');
+      ack('Только админ чата может менять группы');
       return;
     }
 
-    const group = groups[Number(data.slice(2))];
-    if (!group) {
+    const picked = groups[Number(data.slice(2))];
+    if (!picked) {
       ack('Список устарел');
       await edit({ text: '*Выбери курс:*', keyboard: sheetKeyboard(sheets) });
       return;
     }
 
     await upsertChat(chatId, message.chat.title ?? null);
-    await setChatGroup(chatId, group.group);
-    ack(`Выбрано: ${group.group}`);
-    await log('command', `Группа чата установлена: ${group.group}`, { chatId });
+    const outcome = await toggleChatGroup(chatId, picked.group);
 
-    await edit(menuScreen(await getChat(chatId), ctx));
+    if (outcome === 'limit') {
+      ack(`Больше ${MAX_GROUPS} групп нельзя — сначала убери одну`);
+      return;
+    }
+
+    ack(outcome === 'added' ? `Добавлено: ${picked.group}` : `Убрано: ${picked.group}`);
+    await log('command', `Группы чата: ${outcome} ${picked.group}`, { chatId });
+
+    // Остаёмся в списке: вторую группу выбирают тут же, не возвращаясь в меню
+    const fresh = await getChat(chatId);
+    const sheetIndex = sheets.indexOf(picked.sheet);
+    await edit({
+      text:
+        `*${esc(picked.sheet)}*\n` +
+        esc(
+          (fresh?.groups ?? []).length > 0
+            ? `Выбрано: ${(fresh?.groups ?? []).join(', ')}. Нажми «Готово», когда закончишь.`
+            : `Выбери группу. Можно до ${MAX_GROUPS} — расписание придёт по обеим.`,
+        ),
+      keyboard: groupKeyboard(
+        groups.filter((g) => g.sheet === picked.sheet),
+        sheetIndex,
+        0,
+        fresh?.groups ?? [],
+      ),
+    });
+    return;
+  }
+
+  // Переключение группы в режиме недели: `wg:<индекс>:<дата>`
+  if (data.startsWith('wg:')) {
+    const chosen = await requireGroups();
+    if (!chosen) return;
+
+    const [, indexRaw, dateIso] = data.split(':');
+    ack();
+
+    const { chunks, keyboard } = await weekScreen(
+      chatId,
+      chosen,
+      dateIso || mskToday(),
+      Number(indexRaw) || 0,
+    );
+    await editMessageText(chatId, message.message_id, chunks[0], keyboard);
     return;
   }
 

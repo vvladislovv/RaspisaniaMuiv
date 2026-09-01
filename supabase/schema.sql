@@ -5,6 +5,9 @@ create table if not exists chats (
   chat_id       bigint primary key,
   title         text,
   group_name    text,
+  -- Групп может быть несколько: в файле МУИВ две группы часто делят одну
+  -- колонку, и людям нужно расписание обеих в одном сообщении
+  groups        text[] not null default '{}',
   enabled       boolean not null default true,
   pinned_msg_id bigint,
   -- какой день показывает закреплённое сообщение: нужно, чтобы при обновлении
@@ -15,6 +18,9 @@ create table if not exists chats (
 );
 
 alter table chats add column if not exists pinned_date date;
+alter table chats add column if not exists groups text[] not null default '{}';
+update chats set groups = array[group_name]
+  where group_name is not null and cardinality(groups) = 0;
 
 create table if not exists files (
   id           bigserial primary key,

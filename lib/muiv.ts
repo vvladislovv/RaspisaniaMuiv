@@ -231,11 +231,24 @@ export async function fetchSite(): Promise<SiteSnapshot> {
   return {
     files,
     async download(file: SiteFile): Promise<Buffer> {
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        const res = await session.fetch(
-          file.url,
-          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*',
-        );
+      const attempts = 4;
+      let lastNetworkError: string | null = null;
+
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        let res: Response;
+        try {
+          res = await session.fetch(
+            file.url,
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*',
+          );
+        } catch (error) {
+          // Обрыв соединения на полпути — обычное дело для чужого сервера.
+          // Повторяем с паузой, а не роняем всю проверку.
+          const cause = (error as { cause?: { code?: string } })?.cause?.code;
+          lastNetworkError = cause ?? (error instanceof Error ? error.message : String(error));
+          if (attempt < attempts) await sleep(700 * attempt);
+          continue;
+        }
 
         if (res.status >= 300 && res.status < 400) {
           const loc = res.headers.get('location');
@@ -266,7 +279,11 @@ export async function fetchSite(): Promise<SiteSnapshot> {
         }
         return buf;
       }
-      throw new Error(`Не удалось скачать ${file.title}`);
+
+      throw new Error(
+        `Не удалось скачать ${file.title}` +
+          (lastNetworkError ? `: сеть — ${lastNetworkError}` : ''),
+      );
     },
   };
 }

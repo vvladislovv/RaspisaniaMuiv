@@ -19,11 +19,13 @@ import {
   upsertFile,
   getWeek,
   weekStarts,
+  currentGroups,
   type Chat,
   type FileRow,
 } from './db';
 import { log, logError } from './log';
-import { formatDay, formatEmptyDay } from './format';
+import { formatDayFor, type GroupDay } from './format';
+import type { Day } from './parse';
 import {
   TelegramError,
   editMessageText,
@@ -178,28 +180,19 @@ export async function refreshPinned(): Promise<number> {
   let updated = 0;
 
   for (const chat of chats) {
-    if (!chat.group_name || !chat.pinned_msg_id || !chat.pinned_date) continue;
+    const date = chat.pinned_date;
+    if ((chat.groups ?? []).length === 0 || !chat.pinned_msg_id || !date) continue;
     // День уже прошёл — перерисовывать нечего
-    if (chat.pinned_date < today) continue;
+    if (date < today) continue;
 
     try {
-      const { days, file } = await getWeek(chat.group_name, chat.pinned_date);
-      const day = days.find((d) => d.date === chat.pinned_date) ?? null;
-
-      const opts = {
-        group: chat.group_name,
-        siteUpdated: file?.site_updated ?? null,
-        heading: chat.pinned_date === today ? 'Расписание на сегодня' : 'Расписание на завтра',
-      };
-      const text = day
-        ? formatDay(day, opts)
-        : formatEmptyDay(chat.pinned_date, dayNameOf(chat.pinned_date), opts);
+      const rendered = await renderDay(chat.chat_id, chat.groups, date, weeks, date === today);
 
       const ok = await editMessageText(
         chat.chat_id,
         chat.pinned_msg_id,
-        text,
-        scheduleKeyboard(days, day ? chat.pinned_date : null, file?.week_start ?? null, weeks),
+        rendered.text,
+        rendered.keyboard,
         { fallbackToSend: false },
       );
 
@@ -207,7 +200,7 @@ export async function refreshPinned(): Promise<number> {
         updated++;
         await log('send', 'Закреплённое расписание обновлено', {
           chatId: chat.chat_id,
-          details: { date: chat.pinned_date },
+          details: { date },
         });
       }
     } catch (error) {
@@ -216,6 +209,47 @@ export async function refreshPinned(): Promise<number> {
   }
 
   return updated;
+}
+
+/**
+ * Текст и кнопки расписания на день сразу по всем группам чата.
+ * Общий код для рассылки и для перерисовки закреплённого сообщения.
+ */
+async function renderDay(
+  chatId: number,
+  stored: string[],
+  dateIso: string,
+  weeks: string[],
+  isToday = false,
+): Promise<{ text: string; keyboard: ReturnType<typeof scheduleKeyboard> }> {
+  const { groups, missing } = await currentGroups(chatId, stored);
+  const perGroup = await Promise.all(groups.map((group) => getWeek(group, dateIso)));
+
+  const blocks: GroupDay[] = groups.map((group, index) => ({
+    group,
+    day: perGroup[index].days.find((d) => d.date === dateIso) ?? null,
+  }));
+
+  const file = perGroup.find((w) => w.file)?.file ?? null;
+
+  const byDate = new Map<string, Day>();
+  for (const { days } of perGroup) {
+    for (const day of days) {
+      const known = byDate.get(day.date);
+      if (!known || known.lessons.length === 0) byDate.set(day.date, day);
+    }
+  }
+  const merged = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+  const hasDay = blocks.some((b) => b.day);
+
+  return {
+    text: formatDayFor(dateIso, dayNameOf(dateIso), blocks, {
+      siteUpdated: file?.site_updated ?? null,
+      heading: isToday ? 'Расписание на сегодня' : 'Расписание на завтра',
+      missing,
+    }),
+    keyboard: scheduleKeyboard(merged, hasDay ? dateIso : null, file?.week_start ?? null, weeks),
+  };
 }
 
 /** Сколько чатов обслуживаем одновременно. Telegram допускает ~30 сообщений в секунду. */
@@ -231,27 +265,19 @@ const SEND_BUDGET_MS = 45_000;
 async function sendToChat(
   chat: Chat,
   dateIso: string,
-  dayName: string,
   weeks: string[],
 ): Promise<'sent' | 'failed' | 'disabled'> {
-  if (!chat.group_name) return 'failed';
+  const groups = chat.groups ?? [];
+  if (groups.length === 0) return 'failed';
 
   try {
-    // Берём неделю, содержащую завтрашний день: так подпись «файл обновлён»
-    // относится к тому файлу, из которого взято расписание.
-    const { days, file } = await getWeek(chat.group_name, dateIso);
-    const day = days.find((d) => d.date === dateIso) ?? null;
-
-    const opts = {
-      group: chat.group_name,
-      siteUpdated: file?.site_updated ?? null,
-      heading: 'Расписание на завтра',
-    };
-    const text = day ? formatDay(day, opts) : formatEmptyDay(dateIso, dayName, opts);
+    const rendered = await renderDay(chat.chat_id, groups, dateIso, weeks);
 
     // Кнопки и под закреплённым сообщением: можно листать дни, не набирая команды
-    const keyboard = scheduleKeyboard(days, day ? dateIso : null, file?.week_start ?? null, weeks);
-    const message = await sendMessage(chat.chat_id, text, { silent: false, keyboard });
+    const message = await sendMessage(chat.chat_id, rendered.text, {
+      silent: false,
+      keyboard: rendered.keyboard,
+    });
 
     // Дату помечаем сразу после отправки, до закрепления: она означает
     // «за этот день уже отправлено», и по ней рассылка продолжается с места
@@ -278,7 +304,7 @@ async function sendToChat(
 
     await log('send', `Расписание на ${dateIso} отправлено`, {
       chatId: chat.chat_id,
-      details: { group: chat.group_name, lessons: day?.lessons.length ?? 0 },
+      details: { groups },
     });
     return 'sent';
   } catch (error) {
@@ -316,12 +342,13 @@ export interface SendResult {
  */
 export async function sendTomorrow(): Promise<SendResult> {
   const dateIso = mskDateOffset(1);
-  const dayName = dayNameOf(dateIso);
   const weeks = await weekStarts();
   const deadline = Date.now() + SEND_BUDGET_MS;
 
   const all = await activeChats();
-  const queue = all.filter((chat) => chat.group_name && chat.pinned_date !== dateIso);
+  const queue = all.filter(
+    (chat) => (chat.groups ?? []).length > 0 && chat.pinned_date !== dateIso,
+  );
 
   const result: SendResult = { sent: 0, failed: 0, disabled: 0, pending: 0 };
   let next = 0;
@@ -332,7 +359,7 @@ export async function sendTomorrow(): Promise<SendResult> {
       const index = next++;
       if (index >= queue.length) return;
 
-      const outcome = await sendToChat(queue[index], dateIso, dayName, weeks);
+      const outcome = await sendToChat(queue[index], dateIso, weeks);
       if (outcome === 'sent') result.sent++;
       else if (outcome === 'disabled') result.disabled++;
       else result.failed++;

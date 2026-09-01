@@ -25,12 +25,16 @@ function check<T>(result: { data: T; error: { message: string } | null }, what: 
 export interface Chat {
   chat_id: number;
   title: string | null;
-  group_name: string | null;
+  /** Выбранные группы чата: одна или две. */
+  groups: string[];
   enabled: boolean;
   pinned_msg_id: number | null;
   /** Какой день показывает закреплённое сообщение. */
   pinned_date: string | null;
 }
+
+/** Сколько групп разрешено выбрать одному чату. */
+export const MAX_GROUPS = 2;
 
 export async function getChat(chatId: number): Promise<Chat | null> {
   const res = await db().from('chats').select('*').eq('chat_id', chatId).maybeSingle();
@@ -45,13 +49,42 @@ export async function upsertChat(chatId: number, title: string | null): Promise<
   check(res, 'upsertChat');
 }
 
-export async function setChatGroup(chatId: number, groupName: string): Promise<void> {
+export type ToggleResult = 'added' | 'removed' | 'limit';
+
+/**
+ * Добавляет или убирает группу чата. Групп может быть до двух: в файле МУИВ
+ * две группы часто делят одну колонку, и расписание нужно обеим сразу.
+ */
+export async function toggleChatGroup(chatId: number, group: string): Promise<ToggleResult> {
+  const chat = await getChat(chatId);
+  const current = chat?.groups ?? [];
+
+  let next: string[];
+  let outcome: ToggleResult;
+
+  if (current.includes(group)) {
+    next = current.filter((g) => g !== group);
+    outcome = 'removed';
+  } else if (current.length >= MAX_GROUPS) {
+    return 'limit';
+  } else {
+    next = [...current, group];
+    outcome = 'added';
+  }
+
   const res = await db()
     .from('chats')
-    .update({ group_name: groupName, updated_at: new Date().toISOString() })
+    .update({
+      groups: next,
+      // group_name оставлен для совместимости со старыми записями
+      group_name: next[0] ?? null,
+      updated_at: new Date().toISOString(),
+    })
     .eq('chat_id', chatId)
     .select('chat_id');
-  check(res, 'setChatGroup');
+  check(res, 'toggleChatGroup');
+
+  return outcome;
 }
 
 export async function setChatEnabled(chatId: number, enabled: boolean): Promise<void> {
@@ -76,14 +109,11 @@ export async function setPinnedMessage(
   check(res, 'setPinnedMessage');
 }
 
-/** Чаты, готовые к автоотправке: включены и с выбранной группой. */
+/** Чаты, готовые к автоотправке: включены и хотя бы с одной группой. */
 export async function activeChats(): Promise<Chat[]> {
-  const res = await db()
-    .from('chats')
-    .select('*')
-    .eq('enabled', true)
-    .not('group_name', 'is', null);
-  return (check(res, 'activeChats') ?? []) as Chat[];
+  const res = await db().from('chats').select('*').eq('enabled', true);
+  const rows = (check(res, 'activeChats') ?? []) as Chat[];
+  return rows.filter((chat) => (chat.groups ?? []).length > 0);
 }
 
 export async function allChats(): Promise<Chat[]> {
@@ -417,7 +447,8 @@ export async function migrateChat(oldId: number, newId: number): Promise<boolean
       {
         chat_id: newId,
         title: previous.title,
-        group_name: previous.group_name,
+        groups: previous.groups,
+        group_name: previous.groups?.[0] ?? null,
         enabled: previous.enabled,
         // id закреплённого сообщения при переезде не переносится
         pinned_msg_id: null,
@@ -444,18 +475,20 @@ export interface ChatStats {
 
 /** Сводка по подключённым чатам — для админского экрана. */
 export async function chatStats(): Promise<ChatStats> {
-  const res = await db().from('chats').select('group_name, enabled');
-  const rows = (check(res, 'chatStats') ?? []) as { group_name: string | null; enabled: boolean }[];
+  const res = await db().from('chats').select('groups, enabled');
+  const rows = (check(res, 'chatStats') ?? []) as { groups: string[] | null; enabled: boolean }[];
 
   const counts = new Map<string, number>();
   for (const row of rows) {
-    if (row.group_name) counts.set(row.group_name, (counts.get(row.group_name) ?? 0) + 1);
+    for (const group of row.groups ?? []) {
+      counts.set(group, (counts.get(group) ?? 0) + 1);
+    }
   }
 
   return {
     total: rows.length,
     enabled: rows.filter((r) => r.enabled).length,
-    withGroup: rows.filter((r) => r.group_name).length,
+    withGroup: rows.filter((r) => (r.groups ?? []).length > 0).length,
     topGroups: [...counts]
       .map(([group, chats]) => ({ group, chats }))
       .sort((a, b) => b.chats - a.chats || a.group.localeCompare(b.group, 'ru'))
@@ -472,4 +505,97 @@ export async function errorCount(hours = 24): Promise<number> {
     .eq('kind', 'error')
     .gte('ts', since);
   return ((check(res, 'errorCount') ?? []) as unknown[]).length;
+}
+
+/**
+ * Приведение названия группы к сравнимому виду.
+ *
+ * Колледж меняет написание между файлами: «ИСП/П-24-11» превращается в
+ * «ИСП/п 24-11». Регистр, пробелы и дефисы значения не имеют, а вот точка
+ * с цифрой — имеет: «23-09.1» и «23-09.2» это разные группы.
+ */
+export function normalizeGroup(name: string): string {
+  return name.toLowerCase().replace(/[\s-]+/g, '');
+}
+
+export interface GroupResolution {
+  /** Что сохранено в чате → как называется в актуальном файле. */
+  actual: Map<string, string>;
+  /** Группы, которых в актуальном файле не нашлось. */
+  missing: string[];
+  /** Названия, которые изменились и требуют обновления в базе. */
+  renamed: { from: string; to: string }[];
+}
+
+/**
+ * Сопоставляет сохранённые группы чата с актуальным файлом.
+ * Переименование подхватывается само; исчезнувшую группу надо выбрать заново.
+ */
+export async function resolveGroups(stored: string[]): Promise<GroupResolution> {
+  const available = await listGroups();
+  const byNormalized = new Map<string, string>();
+  for (const item of available) {
+    const key = normalizeGroup(item.group);
+    if (!byNormalized.has(key)) byNormalized.set(key, item.group);
+  }
+  const exact = new Set(available.map((g) => g.group));
+
+  const resolution: GroupResolution = { actual: new Map(), missing: [], renamed: [] };
+
+  for (const name of stored) {
+    if (exact.has(name)) {
+      resolution.actual.set(name, name);
+      continue;
+    }
+    const match = byNormalized.get(normalizeGroup(name));
+    if (match) {
+      resolution.actual.set(name, match);
+      resolution.renamed.push({ from: name, to: match });
+    } else {
+      resolution.missing.push(name);
+    }
+  }
+
+  return resolution;
+}
+
+/** Сохраняет новые названия групп после переименования в файле. */
+export async function renameChatGroups(
+  chatId: number,
+  renamed: { from: string; to: string }[],
+): Promise<void> {
+  if (renamed.length === 0) return;
+
+  const chat = await getChat(chatId);
+  if (!chat) return;
+
+  const map = new Map(renamed.map((r) => [r.from, r.to]));
+  const next = (chat.groups ?? []).map((g) => map.get(g) ?? g);
+
+  const res = await db()
+    .from('chats')
+    .update({ groups: next, group_name: next[0] ?? null, updated_at: new Date().toISOString() })
+    .eq('chat_id', chatId)
+    .select('chat_id');
+  check(res, 'renameChatGroups');
+}
+
+/**
+ * Актуальные названия групп чата: подхватывает переименования в файле и
+ * сообщает, какие группы исчезли — их надо выбрать заново.
+ */
+export async function currentGroups(
+  chatId: number,
+  stored: string[],
+): Promise<{ groups: string[]; missing: string[] }> {
+  const resolution = await resolveGroups(stored);
+
+  if (resolution.renamed.length > 0) {
+    await renameChatGroups(chatId, resolution.renamed);
+  }
+
+  return {
+    groups: stored.map((name) => resolution.actual.get(name)).filter((g): g is string => !!g),
+    missing: resolution.missing,
+  };
 }

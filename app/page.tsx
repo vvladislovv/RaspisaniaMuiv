@@ -115,7 +115,7 @@ export default async function StatusPage({
 
   const ribbon = buildRibbon(dayLogs);
   const sendHour = env.sendHourMsk;
-  const withGroup = chats.filter((c) => c.group_name && c.enabled).length;
+  const withGroup = chats.filter((c) => (c.groups ?? []).length > 0 && c.enabled).length;
 
   return (
     <div className="shell">
@@ -246,7 +246,13 @@ export default async function StatusPage({
                             />
                             {chat.title ?? <span className="mono">{chat.chat_id}</span>}
                           </td>
-                          <td>{chat.group_name ?? <span className="empty">не выбрана</span>}</td>
+                          <td>
+                            {(chat.groups ?? []).length > 0 ? (
+                              (chat.groups ?? []).join(', ')
+                            ) : (
+                              <span className="empty">не выбрана</span>
+                            )}
+                          </td>
                         </tr>
                       ))}
                     </tbody>
