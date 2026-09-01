@@ -112,3 +112,19 @@ test('describeUser не повторяет одно и то же имя дваж
   assert.equal(describeUser({ username: 'dislov' }), '@dislov');
   assert.equal(describeUser({ id: 42 }), 'ID 42');
 });
+
+test('emojiTag собирает кастомный эмодзи и запасной глиф', async () => {
+  const { emojiTag } = await import('../lib/format');
+
+  // Без id — обычный эмодзи как есть
+  assert.equal(emojiTag('🦅', null), '🦅');
+
+  // С id — разметка MarkdownV2, глиф внутри как запасной
+  assert.equal(
+    emojiTag('🦅', '5368324170671202286'),
+    '![🦅](tg://emoji?id=5368324170671202286)',
+  );
+
+  // Глиф со спецсимволом должен быть экранирован
+  assert.equal(emojiTag('!', '123'), '![\\!](tg://emoji?id=123)');
+});

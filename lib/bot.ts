@@ -28,6 +28,7 @@ import {
   MAX_GROUPS,
   upsertChat,
   getState,
+  setState,
   weekStarts,
   type Chat,
 } from './db';
@@ -41,7 +42,7 @@ import {
   sendMessage,
   type InlineKeyboard,
 } from './telegram';
-import { esc, formatDayFor, formatWeek, humanDate, type GroupDay } from './format';
+import { emojiTag, esc, formatDayFor, formatWeek, humanDate, type GroupDay } from './format';
 import { groupKeyboard, menuKeyboard, scheduleKeyboard, sheetKeyboard, statusKeyboard } from './keyboard';
 import { dayNameOf, mskDateOffset, mskStamp, mskToday } from './time';
 import type { Day } from './parse';
@@ -62,11 +63,19 @@ interface TgChat {
   title?: string;
 }
 
+interface TgMessageEntity {
+  type: string;
+  custom_emoji_id?: string;
+  offset: number;
+  length: number;
+}
+
 interface TgMessage {
   message_id: number;
   from?: TgUser;
   chat: TgChat;
   text?: string;
+  entities?: TgMessageEntity[];
   /** Группа превратилась в супергруппу: чат переехал на новый идентификатор. */
   migrate_to_chat_id?: number;
 }
@@ -479,7 +488,26 @@ async function statusScreen(chat: Chat | null): Promise<Screen> {
  * TypeScript `\.` превращается в обычную точку, экранирование теряется,
  * и Telegram отказывается разбирать разметку.
  */
-function aboutScreen(): Screen {
+/** Как подписывается автор. Кастомный эмодзи владелец задаёт сам, прислав его боту. */
+export interface CreditEmoji {
+  /** Обычный эмодзи: он же запасной, если кастомный не отобразится. */
+  glyph: string;
+  /** id кастомного эмодзи, если владелец его задал. */
+  customId: string | null;
+}
+
+const DEFAULT_CREDIT_EMOJI = '🦅';
+const CREDIT_EMOJI_KEY = 'credit_emoji';
+
+async function creditEmoji(): Promise<CreditEmoji> {
+  const saved = await getState<CreditEmoji>(CREDIT_EMOJI_KEY);
+  return {
+    glyph: saved?.glyph || DEFAULT_CREDIT_EMOJI,
+    customId: saved?.customId ?? null,
+  };
+}
+
+function aboutScreen(credit: CreditEmoji): Screen {
   const source = 'https://www.muiv.ru/studentu/spo/raspisanie/';
   const author = 'https://hacktaika.ru';
 
@@ -494,7 +522,7 @@ function aboutScreen(): Screen {
     '',
     esc('Каждый день в 16:00 присылаю расписание на завтра и закрепляю его, кроме субботы.'),
     '',
-    `⚡ ${esc('Сделано в')} [${esc('hacktaika.ru')}](${author})`,
+    `${emojiTag(credit.glyph, credit.customId)} ${esc('Сделано в')} [${esc('Хактайке')}](${author})`,
   ];
 
   return {
@@ -529,6 +557,62 @@ async function contextOf(chat: TgChat, userId?: number): Promise<Context> {
   };
 }
 
+/**
+ * Запоминает кастомный эмодзи из сообщения владельца.
+ *
+ * Telegram разрешает боту кастомные эмодзи, только если у владельца есть
+ * Premium, — поэтому сразу проверяем отправкой: сохраняем лишь то, что
+ * Telegram принял, иначе экран «О боте» сломался бы молча.
+ *
+ * Возвращает true, если сообщение было именно про эмодзи.
+ */
+async function learnCreditEmoji(chatId: number, message: TgMessage): Promise<boolean> {
+  const entity = message.entities?.find((e) => e.type === 'custom_emoji' && e.custom_emoji_id);
+  if (!entity?.custom_emoji_id) return false;
+
+  const text = message.text ?? '';
+  // Глиф — то, что стоит на месте эмодзи: он же запасной вариант
+  const glyph =
+    Array.from(text).slice(entity.offset, entity.offset + entity.length).join('') || '🦅';
+
+  const candidate: CreditEmoji = { glyph, customId: entity.custom_emoji_id };
+
+  try {
+    const preview = aboutScreen(candidate);
+    await sendMessage(chatId, preview.text, { silent: true });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    await sendMessage(
+      chatId,
+      [
+        `*${esc('Telegram не принял этот эмодзи')}*`,
+        '',
+        `\`${esc(reason.slice(0, 300))}\``,
+        '',
+        esc('Кастомные эмодзи бот может отправлять, только если у владельца есть Telegram Premium.'),
+      ].join('\n'),
+      { silent: true },
+    );
+    await log('skip', 'Кастомный эмодзи отклонён Telegram', {
+      chatId,
+      details: { customId: entity.custom_emoji_id, reason },
+    });
+    return true;
+  }
+
+  await setState(CREDIT_EMOJI_KEY, candidate);
+  await sendMessage(
+    chatId,
+    esc('Готово — этот эмодзи теперь стоит в подписи. Выше видно, как получилось.'),
+    { silent: true },
+  );
+  await log('command', 'Кастомный эмодзи задан', {
+    chatId,
+    details: { customId: entity.custom_emoji_id, glyph },
+  });
+  return true;
+}
+
 // ─── Команда /start ──────────────────────────────────────────────────────────
 
 function isStart(text: string): boolean {
@@ -548,6 +632,16 @@ async function handleMessage(message: TgMessage): Promise<void> {
         chatId: message.migrate_to_chat_id,
       });
     }
+    return;
+  }
+
+  // Владелец присылает кастомный эмодзи — бот запоминает его для подписи
+  // «Сделано в Хактайке». Просить у него id вручную было бы лишним трудом.
+  if (
+    user?.id === env.adminTelegramId &&
+    message.chat.type === 'private' &&
+    (await learnCreditEmoji(chatId, message))
+  ) {
     return;
   }
 
@@ -748,7 +842,7 @@ async function runCallback(
 
   if (data === 'about') {
     ack();
-    await edit(aboutScreen());
+    await edit(aboutScreen(await creditEmoji()));
     return;
   }
 

@@ -85,6 +85,18 @@ function quote(lines: string[], expandable = false): string {
   return '**' + body.join('\n') + '||';
 }
 
+/**
+ * Подпись эмодзи в MarkdownV2.
+ *
+ * Кастомный эмодзи задаётся как `![глиф](tg://emoji?id=...)`. Глиф в скобках —
+ * запасной: его показывают там, где кастомный отобразить нельзя (уведомления,
+ * пересылка не-Premium пользователем).
+ */
+export function emojiTag(glyph: string, customId: string | null): string {
+  if (!customId) return glyph;
+  return `![${esc(glyph)}](tg://emoji?id=${customId})`;
+}
+
 export interface DayMessageOptions {
   group: string;
   /** «Дата обновления» файла на сайте — показываем, чтобы было видно свежесть. */

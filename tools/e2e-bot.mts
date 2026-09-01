@@ -746,6 +746,54 @@ ok((await getChat(CHAT))?.enabled === true, 'админ включил обра�
 // ─── О боте ──────────────────────────────────────────────────────────────────
 
 await resetRateLimit();
+head('Кастомный эмодзи в подписи');
+await resetRateLimit();
+{
+  const withEmoji = (id: string): TgUpdate => ({
+    message: {
+      message_id: Math.floor(Math.random() * 100000),
+      from: { id: OWNER, username: 'owner', first_name: 'Владелец' },
+      chat: { id: OWNER, type: 'private' },
+      text: '🦅',
+      entities: [{ type: 'custom_emoji', custom_emoji_id: id, offset: 0, length: 1 }],
+    },
+  });
+
+  m = mark();
+  await handleUpdate(withEmoji('5368324170671202286'));
+  const learned = since(m);
+  ok(
+    texts(learned).join('').includes('tg://emoji?id=5368324170671202286'),
+    'бот показал предпросмотр с кастомным эмодзи',
+  );
+  ok(
+    texts(learned).join('').includes('этот эмодзи теперь стоит в подписи'),
+    'и подтвердил, что запомнил',
+  );
+
+  // Проверяем, что он попал в экран «О боте»
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(button('about'));
+  const about = texts(since(m)).join('');
+  ok(about.includes('tg://emoji?id=5368324170671202286'), 'подпись использует заданный эмодзи');
+  ok(about.includes('Хактайке'), 'автор подписан по-русски');
+  ok(!about.includes('hacktaika.ru]'), 'английского названия в тексте нет');
+
+  // Telegram отказал — сохранять нельзя
+  await failMethods(['sendMessage']);
+  m = mark();
+  await handleUpdate(withEmoji('000000000000000000'));
+  await failMethods([]);
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(button('about'));
+  ok(
+    texts(since(m)).join('').includes('5368324170671202286'),
+    'после отказа Telegram остаётся прежний эмодзи',
+  );
+}
+
 head('Экран «О боте»');
 m = mark();
 await handleUpdate(button('m'));
@@ -761,8 +809,10 @@ ok(about.includes('О боте'), 'есть заголовок');
 ok(!!find(keyboardOf(screen), 'Меню'), 'есть путь назад в меню');
 
 // Ни один спецсимвол не должен остаться неэкранированным, иначе Telegram
-// откажется разбирать разметку
+// откажется разбирать разметку. Снимаем то, что ставим сами: экранирование,
+// ссылки, кастомный эмодзи и жирный с курсивом.
 const bare = about
+  .replace(/!\[[^\]]*\]\(tg:\/\/emoji\?id=\d+\)/g, '')
   .replace(/\\./g, '')
   .replace(/\[[^\]]*\]\([^)]*\)/g, '')
   .replace(/[*_]/g, '');
