@@ -84,7 +84,18 @@ export function scheduleKeyboard(
   weekStart: string | null,
   allWeeks: string[],
   groupSwitch?: GroupSwitch,
+  /** Группы, которых нет в файле: нужна кнопка, чтобы выбрать заново. */
+  missingGroups: string[] = [],
 ): InlineKeyboard {
+  // Человеку сказали «выбери группу заново» — значит и кнопка должна быть тут,
+  // а не через меню
+  if (missingGroups.length > 0) {
+    return [
+      [{ text: '👥 Выбрать группу', callback_data: 'grp' }],
+      [TO_MENU],
+    ];
+  }
+
   const rows: InlineKeyboard = chunk(
     days.map((day) => {
       const label = shortDay(day.name) + (day.lessons.length === 0 ? ' ·' : '');

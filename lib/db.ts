@@ -599,3 +599,10 @@ export async function currentGroups(
     missing: resolution.missing,
   };
 }
+
+/** Все учебные даты недели по файлу — чтобы клавиатура показывала всю неделю. */
+export async function weekDates(fileId: number): Promise<string[]> {
+  const res = await db().from('schedules').select('day_date').eq('file_id', fileId);
+  const rows = (check(res, 'weekDates') ?? []) as { day_date: string }[];
+  return [...new Set(rows.map((r) => r.day_date))].sort();
+}

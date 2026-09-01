@@ -16,6 +16,7 @@ import {
   setChatEnabled,
   toggleChatGroup,
   currentGroups,
+  weekDates,
   MAX_GROUPS,
   upsertChat,
   getState,
@@ -172,10 +173,35 @@ async function adminScreen(): Promise<Screen> {
 }
 
 /**
+ * Дни недели для клавиатуры: берём все даты недели из файла, а не только те,
+ * где у группы есть пары. Иначе у группы с двумя учебными днями клавиатура
+ * состояла бы из двух кнопок, и в пустой день нельзя было бы заглянуть.
+ */
+async function keyboardDays(
+  perGroup: { days: Day[]; file: { id: number } | null }[],
+): Promise<Day[]> {
+  const withLessons = new Map<string, Day>();
+  for (const { days } of perGroup) {
+    for (const day of days) {
+      const known = withLessons.get(day.date);
+      if (!known || known.lessons.length === 0) withLessons.set(day.date, day);
+    }
+  }
+
+  const file = perGroup.find((w) => w.file)?.file ?? null;
+  const dates = file ? await weekDates(file.id) : [...withLessons.keys()];
+
+  return dates.sort().map(
+    (date) =>
+      withLessons.get(date) ?? { date, name: dayNameOf(date), lessons: [] },
+  );
+}
+
+/**
  * Экран одного дня сразу по всем выбранным группам: в один день пары обеих
  * групп читаются рядом, и переключать ничего не нужно.
  */
-async function dayScreen(
+export async function dayScreen(
   chatId: number,
   stored: string[],
   dateIso: string,
@@ -194,14 +220,7 @@ async function dayScreen(
 
   // Для клавиатуры дни объединяем: точка «пар нет» гаснет, если пары есть
   // хотя бы у одной группы
-  const byDate = new Map<string, Day>();
-  for (const { days } of perGroup) {
-    for (const day of days) {
-      const known = byDate.get(day.date);
-      if (!known || known.lessons.length === 0) byDate.set(day.date, day);
-    }
-  }
-  const merged = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+  const merged = await keyboardDays(perGroup);
   const hasDay = blocks.some((b) => b.day);
 
   return {
@@ -210,7 +229,14 @@ async function dayScreen(
       heading,
       missing,
     }),
-    keyboard: scheduleKeyboard(merged, hasDay ? dateIso : null, file?.week_start ?? null, weeks),
+    keyboard: scheduleKeyboard(
+      merged,
+      hasDay ? dateIso : null,
+      file?.week_start ?? null,
+      weeks,
+      undefined,
+      missing,
+    ),
   };
 }
 
@@ -218,7 +244,7 @@ async function dayScreen(
  * Экран недели. Неделя может не влезть в одно сообщение, поэтому текст
  * возвращается частями: первая идёт в правку, остальные — отдельными сообщениями.
  */
-async function weekScreen(
+export async function weekScreen(
   chatId: number,
   stored: string[],
   fromIso: string,

@@ -20,6 +20,7 @@ import {
   getWeek,
   weekStarts,
   currentGroups,
+  weekDates,
   type Chat,
   type FileRow,
 } from './db';
@@ -212,6 +213,31 @@ export async function refreshPinned(): Promise<number> {
 }
 
 /**
+ * Дни недели для клавиатуры: берём все даты недели из файла, а не только те,
+ * где у группы есть пары. Иначе у группы с двумя учебными днями клавиатура
+ * состояла бы из двух кнопок, и в пустой день нельзя было бы заглянуть.
+ */
+async function keyboardDays(
+  perGroup: { days: Day[]; file: { id: number } | null }[],
+): Promise<Day[]> {
+  const withLessons = new Map<string, Day>();
+  for (const { days } of perGroup) {
+    for (const day of days) {
+      const known = withLessons.get(day.date);
+      if (!known || known.lessons.length === 0) withLessons.set(day.date, day);
+    }
+  }
+
+  const file = perGroup.find((w) => w.file)?.file ?? null;
+  const dates = file ? await weekDates(file.id) : [...withLessons.keys()];
+
+  return dates.sort().map(
+    (date) =>
+      withLessons.get(date) ?? { date, name: dayNameOf(date), lessons: [] },
+  );
+}
+
+/**
  * Текст и кнопки расписания на день сразу по всем группам чата.
  * Общий код для рассылки и для перерисовки закреплённого сообщения.
  */
@@ -232,14 +258,7 @@ async function renderDay(
 
   const file = perGroup.find((w) => w.file)?.file ?? null;
 
-  const byDate = new Map<string, Day>();
-  for (const { days } of perGroup) {
-    for (const day of days) {
-      const known = byDate.get(day.date);
-      if (!known || known.lessons.length === 0) byDate.set(day.date, day);
-    }
-  }
-  const merged = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+  const merged = await keyboardDays(perGroup);
   const hasDay = blocks.some((b) => b.day);
 
   return {
@@ -248,7 +267,14 @@ async function renderDay(
       heading: isToday ? 'Расписание на сегодня' : 'Расписание на завтра',
       missing,
     }),
-    keyboard: scheduleKeyboard(merged, hasDay ? dateIso : null, file?.week_start ?? null, weeks),
+    keyboard: scheduleKeyboard(
+      merged,
+      hasDay ? dateIso : null,
+      file?.week_start ?? null,
+      weeks,
+      undefined,
+      missing,
+    ),
   };
 }
 

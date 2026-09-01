@@ -671,10 +671,30 @@ head('Колледж переименовал группу');
 
   m = mark();
   await handleUpdate(button('day:1'));
+  const lost = since(m);
   ok(
-    texts(since(m)).join('').includes('больше нет в расписании'),
+    texts(lost).join('').includes('больше нет в расписании'),
     'про исчезнувшую группу бот предупреждает',
   );
+  ok(
+    !!find(keyboardOf(lost), 'Выбрать группу'),
+    'и сразу даёт кнопку выбрать заново',
+  );
+
+  // Клавиатура должна показывать всю неделю, а не только дни с парами
+  await fetch(`${process.env.SUPABASE_URL}/rest/v1/chats?chat_id=eq.${CHAT}`, {
+    method: 'PATCH',
+    headers: {
+      apikey: 'fake',
+      Authorization: 'Bearer fake',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ groups: [real] }),
+  });
+  m = mark();
+  await handleUpdate(button('day:1'));
+  const dayBtns = keyboardOf(since(m)).filter((b) => /^d:\d{4}/.test(b.callback_data));
+  ok(dayBtns.length >= 5, `в клавиатуре вся неделя: ${dayBtns.length} дней`);
 
   // Возвращаем рабочее состояние
   await fetch(`${process.env.SUPABASE_URL}/rest/v1/chats?chat_id=eq.${CHAT}`, {

@@ -3,7 +3,9 @@
  * Нужен, чтобы оптимизировать по числам, а не по догадкам. Закрыт CRON_SECRET.
  */
 import { checkCronSecret } from '@/lib/auth';
-import { db, getChat, weekStarts, getWeek, listGroups } from '@/lib/db';
+import { db, getChat, weekStarts, getWeek, listGroups, allChats, currentGroups } from '@/lib/db';
+import { dayScreen, weekScreen } from '@/lib/bot';
+import { mskDateOffset } from '@/lib/time';
 import { env } from '@/lib/env';
 
 export const runtime = 'nodejs';
@@ -24,7 +26,38 @@ export async function GET(request: Request): Promise<Response> {
     return Response.json({ error: 'unauthorized' }, { status: 401 });
   }
 
-  const group = new URL(request.url).searchParams.get('group') ?? 'ИСП/П-24-11';
+  const url = new URL(request.url);
+
+  // Рендер экранов на живых данных: так видно, что делает боевой код,
+  // и при этом в Telegram ничего не уходит
+  if (url.searchParams.get('screens') === '1') {
+    const chats = await allChats();
+    const tomorrow = mskDateOffset(1);
+
+    const rendered = await Promise.all(
+      chats
+        .filter((chat) => (chat.groups ?? []).length > 0)
+        .map(async (chat) => {
+          const resolved = await currentGroups(chat.chat_id, chat.groups);
+          const day = await dayScreen(chat.chat_id, chat.groups, tomorrow, 'Расписание на завтра');
+          const week = await weekScreen(chat.chat_id, chat.groups, tomorrow);
+          return {
+            chat: chat.title ?? `личка ${chat.chat_id}`,
+            stored: chat.groups,
+            resolved: resolved.groups,
+            missing: resolved.missing,
+            dayText: day.text,
+            dayButtons: day.keyboard.flat().map((b) => b.text),
+            weekButtons: week.keyboard.flat().map((b) => b.text),
+            weekLength: week.chunks[0]?.length ?? 0,
+          };
+        }),
+    );
+
+    return Response.json({ tomorrow, chats: rendered });
+  }
+
+  const group = url.searchParams.get('group') ?? 'ИСП/п 24-11';
   const chatId = env.adminTelegramId;
 
   const sequential = Object.fromEntries(
