@@ -582,16 +582,37 @@ async function handleMessage(message: TgMessage): Promise<void> {
     return;
   }
 
-  // В группе /start работает, только если чат уже подключён одобренным человеком
+  // В группе /start подключает чат, если это делает одобренный человек.
+  // Без этого бот, уже сидящий в группе, подключить было нечем: события
+  // «бота добавили» больше не будет, а молчать — худший из вариантов.
   const chat = await getChat(chatId);
+
   if (!chat) {
-    await log('skip', `/start в неподключённом чате ${chatId}`, { chatId });
-    return;
+    if (!user || !(await isApproved(user.id))) {
+      await log('skip', `/start без доступа в чате ${chatId}`, {
+        chatId,
+        details: { userId: user?.id },
+      });
+      await sendMessage(
+        chatId,
+        esc('Доступ не открыт. Напиши мне в личку и дождись одобрения.'),
+        { silent: true },
+      );
+      return;
+    }
+
+    await upsertChat(chatId, message.chat.title ?? null, user.id);
+    await setChatEnabled(chatId, true);
+    await log('command', `Чат подключён через /start: ${chatId}`, {
+      chatId,
+      details: { userId: user.id, title: message.chat.title },
+    });
+  } else {
+    await log('command', '/start', { chatId, details: { userId: user?.id } });
   }
 
-  await log('command', '/start', { chatId, details: { userId: user?.id } });
-
-  const screen = menuScreen(chat, await contextOf(message.chat, user?.id));
+  const fresh = await getChat(chatId);
+  const screen = menuScreen(fresh, await contextOf(message.chat, user?.id));
   await sendMessage(chatId, screen.text, { silent: true, keyboard: screen.keyboard });
 }
 

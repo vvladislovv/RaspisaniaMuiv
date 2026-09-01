@@ -87,13 +87,14 @@ export function scheduleKeyboard(
   /** Группы, которых нет в файле: нужна кнопка, чтобы выбрать заново. */
   missingGroups: string[] = [],
 ): InlineKeyboard {
-  // Человеку сказали «выбери группу заново» — значит и кнопка должна быть тут,
-  // а не через меню
-  if (missingGroups.length > 0) {
-    return [
-      [{ text: '👥 Выбрать группу', callback_data: 'grp' }],
-      [TO_MENU],
-    ];
+  // Показывать нечего: ни дней, ни рабочих групп
+  if (days.length === 0) {
+    const rows: InlineKeyboard = [];
+    if (missingGroups.length > 0) {
+      rows.push([{ text: '👥 Выбрать группу', callback_data: 'grp' }]);
+    }
+    rows.push([TO_MENU]);
+    return rows;
   }
 
   const rows: InlineKeyboard = chunk(
@@ -140,6 +141,12 @@ export function scheduleKeyboard(
         callback_data: `wg:${index}:${groupSwitch.dateIso}`,
       })),
     );
+  }
+
+  // Одна группа потерялась, а другая работает: расписание показываем и дни
+  // листать даём, но кнопку «выбрать заново» ставим тут же, а не в меню
+  if (missingGroups.length > 0) {
+    rows.push([{ text: '👥 Выбрать группу', callback_data: 'grp' }]);
   }
 
   rows.push([TO_MENU]);

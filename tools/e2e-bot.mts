@@ -341,6 +341,29 @@ ok(
   'решать заявки может только владелец',
 );
 
+head('Бот уже в группе, а чата в базе нет');
+await resetRateLimit();
+{
+  const ORPHAN = -993;
+  // Посторонний должен получить объяснение, а не молчание
+  m = mark();
+  await handleUpdate(message('/start', GROUP_ADMIN, ORPHAN));
+  ok(
+    texts(since(m)).join('').includes('Доступ не открыт'),
+    'без доступа бот объясняет причину, а не молчит',
+  );
+  ok((await getChat(ORPHAN)) === null, 'чат при этом не подключается');
+
+  // Одобренный подключает чат командой, без повторного добавления бота
+  m = mark();
+  await handleUpdate(message('/start', OWNER, ORPHAN));
+  ok((await getChat(ORPHAN))?.enabled === true, 'одобренный подключает чат через /start');
+  ok(
+    texts(since(m)).join('').includes('Расписание колледжа МУИВ'),
+    'и сразу видит меню',
+  );
+}
+
 head('Одобренный подключает группу');
 await resetRateLimit();
 m = mark();
@@ -763,6 +786,32 @@ head('Колледж переименовал группу');
   ok(
     !!find(keyboardOf(lost), 'Выбрать группу'),
     'и сразу даёт кнопку выбрать заново',
+  );
+
+  // Одна группа потерялась, вторая рабочая: расписание и дни должны остаться
+  await fetch(`${process.env.SUPABASE_URL}/rest/v1/chats?chat_id=eq.${CHAT}`, {
+    method: 'PATCH',
+    headers: {
+      apikey: 'fake',
+      Authorization: 'Bearer fake',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ groups: ['ГРУППА-КОТОРОЙ-НЕТ', real] }),
+  });
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(button('day:1'));
+  const mixed = since(m);
+  const mixedButtons = keyboardOf(mixed);
+  ok(
+    mixedButtons.filter((b) => /^d:\d{4}/.test(b.callback_data)).length >= 5,
+    `дни листаются: ${mixedButtons.filter((b) => /^d:\d{4}/.test(b.callback_data)).length} кнопок`,
+  );
+  ok(!!find(mixedButtons, 'Выбрать группу'), 'и кнопка выбрать заново тоже есть');
+  ok(
+    texts(mixed).join('').includes(esc(real)) &&
+      texts(mixed).join('').includes('больше нет в расписании'),
+    'в сообщении и рабочая группа, и предупреждение',
   );
 
   // Клавиатура должна показывать всю неделю, а не только дни с парами
