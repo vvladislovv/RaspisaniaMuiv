@@ -259,7 +259,9 @@ ok(
   'никаких кнопок доступа ему не дают',
 );
 ok(
-  sent(first_).some((c) => c.body.chat_id === OWNER && String(c.body.text).includes('Заявка')),
+  sent(first_).some(
+    (c) => c.body.chat_id === OWNER && String(c.body.text).includes('Новая заявка'),
+  ),
   'владельцу пришло уведомление о заявке',
 );
 ok(
@@ -277,6 +279,28 @@ ok(
   !sent(since(m)).some((c) => c.body.chat_id === OWNER),
   'повторная заявка владельца не дёргает',
 );
+
+// Два одновременных /start не должны дать два уведомления
+await resetAccess();
+await resetRateLimit();
+m = mark();
+await Promise.all([
+  handleUpdate(message('/start', STRANGER, STRANGER, 'private')),
+  handleUpdate(message('/start', STRANGER, STRANGER, 'private')),
+]);
+ok(
+  sent(since(m)).filter((c) => c.body.chat_id === OWNER).length === 1,
+  `два одновременных обращения дали одно уведомление: ${sent(since(m)).filter((c) => c.body.chat_id === OWNER).length}`,
+);
+
+// Имя и юзернейм не должны повторяться в тексте заявки
+const notice = sent(since(m)).find((c) => c.body.chat_id === OWNER)!;
+const noticeText = String(notice.body.text);
+ok(
+  (noticeText.match(/user222/g) ?? []).length <= 1,
+  'в заявке нет повторяющегося имени',
+);
+ok(noticeText.includes(String(STRANGER)), 'в заявке есть id');
 
 head('Добавление в группу без доступа');
 m = mark();

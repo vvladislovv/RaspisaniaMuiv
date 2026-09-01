@@ -163,19 +163,40 @@ function accessScreen(status: 'pending' | 'denied'): Screen {
   return { text: lines.join('\n'), keyboard: [] };
 }
 
+/**
+ * Как назвать человека в заявке.
+ *
+ * Имя в Telegram часто совпадает с юзернеймом («Deviil_clown03» и
+ * «@Devil_clown03»), и печатать оба — значит показывать одно и то же дважды.
+ * Поэтому сравниваем без учёта регистра и подчёркиваний.
+ */
+export function describeUser(user: {
+  username?: string | null;
+  first_name?: string | null;
+  id?: number;
+}): string {
+  const name = user.first_name?.trim() || null;
+  const handle = user.username?.trim() || null;
+
+  const plain = (value: string) => value.toLowerCase().replace(/[_\s.]/g, '');
+  const same = name && handle && plain(name) === plain(handle);
+
+  if (handle && (same || !name)) return `@${handle}`;
+  if (name && handle) return `${name} (@${handle})`;
+  if (name) return name;
+  return user.id ? `ID ${user.id}` : 'без имени';
+}
+
 /** Уведомление владельцу о новой заявке. */
 function requestScreen(user: TgUser): Screen {
-  const who = [user.first_name, user.username ? `@${user.username}` : null]
-    .filter(Boolean)
-    .join(' ');
-
   return {
     text: [
-      '*Заявка на доступ*',
+      '*Новая заявка*',
       '',
-      `${esc(who || 'без имени')} · \`${user.id}\``,
+      esc(describeUser(user)),
+      `\`${user.id}\``,
       '',
-      esc('Одобренный человек сможет добавлять бота в группы и выбирать группу.'),
+      esc('Разрешить — сможет добавлять бота в группы и выбирать группу.'),
     ].join('\n'),
     keyboard: [
       [
@@ -210,6 +231,14 @@ async function adminScreen(): Promise<Screen> {
   }
   if (file) lines.push(`Файл: ${esc(file.title)}`);
 
+  if (pending.length > 0) {
+    lines.push('');
+    lines.push(`*${esc('Ждут решения')}*`);
+    for (const row of pending) {
+      lines.push(`${esc(describeUser({ ...row, id: row.user_id }))} · \`${row.user_id}\``);
+    }
+  }
+
   if (stats.topGroups.length > 0) {
     lines.push('');
     lines.push(`*${esc('Группы')}*`);
@@ -222,11 +251,11 @@ async function adminScreen(): Promise<Screen> {
 
   // Заявки решаются прямо из сводки: отдельного экрана для этого не нужно
   for (const row of pending) {
-    const who = [row.first_name, row.username ? `@${row.username}` : null]
-      .filter(Boolean)
-      .join(' ');
     rows.push([
-      { text: `✅ ${who || row.user_id}`, callback_data: `ok:${row.user_id}` },
+      {
+        text: `✅ ${describeUser({ ...row, id: row.user_id })}`,
+        callback_data: `ok:${row.user_id}`,
+      },
       { text: '⛔️', callback_data: `no:${row.user_id}` },
     ]);
   }

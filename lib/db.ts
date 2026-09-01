@@ -650,7 +650,15 @@ export async function requestAccess(
     .from('access')
     .insert({ user_id: userId, username, first_name: firstName, status: 'pending' })
     .select('user_id');
-  check(res, 'requestAccess');
+
+  // Два быстрых /start подряд могут вставляться одновременно. Проигравшая
+  // вставка упирается в первичный ключ — это не ошибка, а признак того,
+  // что заявка уже есть, и владельца второй раз дёргать не нужно.
+  if (res.error) {
+    const already = await getAccess(userId);
+    if (already) return { status: already.status, isNew: false };
+    check(res, 'requestAccess');
+  }
 
   return { status: 'pending', isNew: true };
 }

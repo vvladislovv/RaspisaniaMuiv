@@ -186,8 +186,16 @@ function handleInsert(table, url, req, raw, res, single) {
     // Значения по умолчанию применяются только при вставке: при слиянии
     // (upsert по существующей строке) обновляются лишь переданные колонки.
     const record = { ...row };
-    const existingIndex = conflict
-      ? tables[table].findIndex((r) => keyOf(table, r, conflict) === keyOf(table, record, conflict))
+
+    // Первичный ключ проверяем всегда, а не только при on_conflict: настоящий
+    // Postgres отвергает повторную вставку, и тест должен видеть то же самое
+    const keyColumns = conflict ?? PRIMARY_KEYS[table];
+    const hasKey =
+      keyColumns && keyColumns.every((c) => record[c] !== undefined && record[c] !== null);
+    const existingIndex = hasKey
+      ? tables[table].findIndex(
+          (r) => keyOf(table, r, keyColumns) === keyOf(table, record, keyColumns),
+        )
       : -1;
 
     if (existingIndex !== -1 && merge) {

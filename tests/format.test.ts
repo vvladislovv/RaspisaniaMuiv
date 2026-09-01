@@ -87,3 +87,16 @@ test('formatWeek режет длинную неделю на части в ли�
   assert.ok(chunks.length > 1, 'должно разрезаться на несколько сообщений');
   for (const chunk of chunks) assert.ok(chunk.length <= 4096, `часть длиной ${chunk.length}`);
 });
+
+test('describeUser не повторяет одно и то же имя дважды', async () => {
+  const { describeUser } = await import('../lib/bot');
+
+  // Имя и юзернейм различаются только регистром и лишней буквой в стиле
+  // «Deviil_clown03» / «@Devil_clown03» — но чаще совпадают полностью
+  assert.equal(describeUser({ first_name: 'Devil_clown03', username: 'Devil_clown03' }), '@Devil_clown03');
+  assert.equal(describeUser({ first_name: 'devil clown03', username: 'Devil_clown03' }), '@Devil_clown03');
+  assert.equal(describeUser({ first_name: 'Владислав', username: 'dislov' }), 'Владислав (@dislov)');
+  assert.equal(describeUser({ first_name: 'Владислав' }), 'Владислав');
+  assert.equal(describeUser({ username: 'dislov' }), '@dislov');
+  assert.equal(describeUser({ id: 42 }), 'ID 42');
+});
