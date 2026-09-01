@@ -17,6 +17,7 @@ import {
   toggleChatGroup,
   currentGroups,
   weekDates,
+  fileForDate,
   requestAccess,
   decideAccess,
   isApproved,
@@ -170,6 +171,45 @@ function accessScreen(status: 'pending' | 'denied'): Screen {
  * «@Devil_clown03»), и печатать оба — значит показывать одно и то же дважды.
  * Поэтому сравниваем без учёта регистра и подчёркиваний.
  */
+/** Расстояние редактирования: сколько правок отделяет одну строку от другой. */
+function editDistance(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length === 0 || b.length === 0) return Math.max(a.length, b.length);
+
+  let previous = Array.from({ length: b.length + 1 }, (_, i) => i);
+
+  for (let i = 1; i <= a.length; i++) {
+    const current = [i];
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      current[j] = Math.min(current[j - 1] + 1, previous[j] + 1, previous[j - 1] + cost);
+    }
+    previous = current;
+  }
+
+  return previous[b.length];
+}
+
+/**
+ * Имя и юзернейм — про одного и того же человека?
+ *
+ * Люди ставят имя почти как юзернейм и делают опечатки: «Deviil_clown03» при
+ * «@Devil_clown03». Точное сравнение такое не поймает, поэтому допускаем
+ * пару правок — но только на достаточно длинных строках, чтобы не склеить
+ * действительно разные короткие имена.
+ */
+function looksLikeSameHandle(name: string, handle: string): boolean {
+  const plain = (value: string) => value.toLowerCase().replace(/[_\s.\-]/g, '');
+  const a = plain(name);
+  const b = plain(handle);
+
+  if (a === b) return true;
+  if (Math.min(a.length, b.length) < 6) return false;
+  if (Math.abs(a.length - b.length) > 2) return false;
+
+  return editDistance(a, b) <= 2;
+}
+
 export function describeUser(user: {
   username?: string | null;
   first_name?: string | null;
@@ -178,10 +218,7 @@ export function describeUser(user: {
   const name = user.first_name?.trim() || null;
   const handle = user.username?.trim() || null;
 
-  const plain = (value: string) => value.toLowerCase().replace(/[_\s.]/g, '');
-  const same = name && handle && plain(name) === plain(handle);
-
-  if (handle && (same || !name)) return `@${handle}`;
+  if (handle && (!name || looksLikeSameHandle(name, handle))) return `@${handle}`;
   if (name && handle) return `${name} (@${handle})`;
   if (name) return name;
   return user.id ? `ID ${user.id}` : 'без имени';
@@ -213,7 +250,7 @@ async function adminScreen(): Promise<Screen> {
     chatStats(),
     errorCount(24),
     getState<{ at: string; filesOnSite: number; errors: string[] }>(LAST_CHECK_KEY),
-    latestFile(),
+    fileForDate(mskToday()),
     accessCounts(),
     pendingRequests(8),
   ]);
@@ -229,7 +266,7 @@ async function adminScreen(): Promise<Screen> {
     lines.push(`Проверка сайта: ${esc(mskStamp(new Date(check.at)))}`);
     if (check.errors.length > 0) lines.push(`⚠️ ${esc(check.errors.join('; ').slice(0, 200))}`);
   }
-  if (file) lines.push(`Файл: ${esc(file.title)}`);
+  if (file) lines.push(`Текущая неделя: ${esc(file.title)}`);
 
   if (pending.length > 0) {
     lines.push('');
@@ -369,7 +406,11 @@ export async function weekScreen(
 }
 
 async function statusScreen(chat: Chat | null): Promise<Screen> {
-  const [file, check] = await Promise.all([
+  const today = mskToday();
+  const [file, newest, check] = await Promise.all([
+    // Файл, по которому отвечаем сегодня, а не самый поздний на сайте:
+    // на странице лежат две недели сразу, и путать их нельзя
+    fileForDate(today),
     latestFile(),
     getState<{ at: string; filesOnSite: number; changed: string[]; errors: string[] }>(
       LAST_CHECK_KEY,
@@ -397,8 +438,14 @@ async function statusScreen(chat: Chat | null): Promise<Screen> {
 
   if (file) {
     lines.push('');
-    lines.push(`Файл: ${esc(file.title)}`);
+    lines.push(`Текущая неделя: ${esc(file.title)}`);
     if (file.site_updated) lines.push(`Обновлён на сайте: ${esc(file.site_updated)}`);
+
+    // Следующая неделя обычно появляется заранее — про неё стоит сказать
+    // отдельно, чтобы не выглядело, будто она уже действует
+    if (newest && newest.id !== file.id && newest.week_start) {
+      lines.push(`Уже выложена неделя с ${esc(humanDate(newest.week_start))}`);
+    }
   } else {
     lines.push('');
     lines.push('_Расписание ещё не загружено_');

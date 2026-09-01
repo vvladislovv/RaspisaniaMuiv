@@ -717,3 +717,36 @@ export async function resetChatsAndAccess(): Promise<{ chats: number; access: nu
     access: ((access.data ?? []) as unknown[]).length,
   };
 }
+
+/**
+ * Файл, из которого берётся расписание на указанную дату.
+ *
+ * На сайте одновременно лежат текущая и следующая недели, поэтому «самый
+ * свежий файл» и «файл, по которому мы отвечаем сегодня» — разные вещи.
+ * В статусе нужен именно второй, иначе строка про файл вводит в заблуждение.
+ */
+export async function fileForDate(dateIso: string): Promise<FileRow | null> {
+  const res = await db()
+    .from('files')
+    .select('*')
+    .eq('parsed_ok', true)
+    .lte('week_start', dateIso)
+    .order('week_start', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  const current = check(res, 'fileForDate') as FileRow | null;
+  if (current) return current;
+
+  // Дата раньше всех известных недель — показываем ближайшую будущую
+  const upcoming = await db()
+    .from('files')
+    .select('*')
+    .eq('parsed_ok', true)
+    .gt('week_start', dateIso)
+    .order('week_start', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  return check(upcoming, 'fileForDate.upcoming') as FileRow | null;
+}

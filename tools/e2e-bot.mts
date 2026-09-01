@@ -661,6 +661,10 @@ await handleUpdate(button('st'));
 screen = since(m);
 ok(texts(screen).join('').includes('Последняя проверка'), 'статус показывает время проверки');
 ok(texts(screen).join('').includes(esc(chosen[0])), 'статус показывает группу');
+ok(
+  texts(screen).join('').includes('Текущая неделя'),
+  'статус называет файл текущей недели, а не самый поздний',
+);
 buttons = keyboardOf(screen);
 const offButton = find(buttons, 'Выключить');
 ok(!!offButton, 'есть переключатель автоотправки');

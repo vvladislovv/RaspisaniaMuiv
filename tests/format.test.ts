@@ -91,10 +91,22 @@ test('formatWeek режет длинную неделю на части в ли�
 test('describeUser не повторяет одно и то же имя дважды', async () => {
   const { describeUser } = await import('../lib/bot');
 
-  // Имя и юзернейм различаются только регистром и лишней буквой в стиле
-  // «Deviil_clown03» / «@Devil_clown03» — но чаще совпадают полностью
+  // Точное совпадение и совпадение с точностью до регистра и подчёркиваний
   assert.equal(describeUser({ first_name: 'Devil_clown03', username: 'Devil_clown03' }), '@Devil_clown03');
   assert.equal(describeUser({ first_name: 'devil clown03', username: 'Devil_clown03' }), '@Devil_clown03');
+
+  // Настоящий случай: в имени лишняя буква
+  assert.equal(
+    describeUser({ first_name: 'Deviil_clown03', username: 'Devil_clown03' }),
+    '@Devil_clown03',
+  );
+
+  // Короткие и явно разные имена склеивать нельзя
+  assert.equal(describeUser({ first_name: 'Анна', username: 'anna1' }), 'Анна (@anna1)');
+  assert.equal(
+    describeUser({ first_name: 'Александр', username: 'vladislav' }),
+    'Александр (@vladislav)',
+  );
   assert.equal(describeUser({ first_name: 'Владислав', username: 'dislov' }), 'Владислав (@dislov)');
   assert.equal(describeUser({ first_name: 'Владислав' }), 'Владислав');
   assert.equal(describeUser({ username: 'dislov' }), '@dislov');
