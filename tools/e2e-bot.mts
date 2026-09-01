@@ -151,9 +151,12 @@ async function resetAccess(): Promise<void> {
   });
 }
 
-/** Убирает следы прошлого прогона, чтобы тест можно было запускать повторно. */
+/**
+ * Убирает следы прошлого прогона. Чистим все чаты, а не только основной:
+ * тест по ходу подключает несколько, и остатки ломали повторный запуск.
+ */
 async function resetChat(): Promise<void> {
-  await fetch(`${process.env.SUPABASE_URL}/rest/v1/chats?chat_id=eq.${CHAT}`, {
+  await fetch(`${process.env.SUPABASE_URL}/rest/v1/chats?chat_id=neq.0`, {
     method: 'DELETE',
     headers: { apikey: 'fake', Authorization: 'Bearer fake' },
   });
