@@ -12,6 +12,7 @@ import {
   getFileByName,
   latestFile,
   replaceSchedules,
+  dropSupersededWeeks,
   setPinnedMessage,
   setState,
   getState,
@@ -80,12 +81,19 @@ async function ingest(
       parseError: null,
     });
     const inserted = await replaceSchedules(row.id, workbook);
+
+    // Тот же файл мог уже лежать в базе под прежним именем — убираем дубль,
+    // иначе навигация покажет одну неделю дважды
+    const superseded = workbook.weekStart
+      ? await dropSupersededWeeks(row.id, workbook.weekStart)
+      : 0;
     await log('file_changed', `Файл «${file.title}» обновлён`, {
       details: {
         groups: workbook.groups.length,
         rows: inserted,
         weekStart: workbook.weekStart,
         siteUpdated: file.siteUpdated,
+        superseded,
       },
     });
     return { changed: true, row };

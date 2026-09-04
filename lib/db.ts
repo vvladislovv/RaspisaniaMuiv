@@ -2,6 +2,7 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { env } from './env';
 import type { Day, Lesson, Workbook } from './parse';
+import { mondayOf } from './time';
 
 let cached: SupabaseClient | null = null;
 
@@ -512,7 +513,17 @@ export async function weekStarts(): Promise<string[]> {
     .order('week_start', { ascending: true });
 
   const rows = (check(res, 'weekStarts') ?? []) as { week_start: string }[];
-  return [...new Set(rows.map((r) => r.week_start))];
+
+  // Одна запись на настоящую неделю: если в базе остались два файла одной
+  // недели, навигация не должна показывать её дважды
+  const byMonday = new Map<string, string>();
+  for (const row of rows) {
+    const monday = mondayOf(row.week_start);
+    const known = byMonday.get(monday);
+    if (!known || row.week_start > known) byMonday.set(monday, row.week_start);
+  }
+
+  return [...byMonday.values()].sort();
 }
 
 /**
@@ -849,4 +860,33 @@ export async function getWeekOfFile(groupName: string, fileId: number): Promise<
   }[];
 
   return rows.map((r) => ({ date: r.day_date, name: r.day_name, lessons: r.lessons }));
+}
+
+/**
+ * Убирает записи о файлах, описывающих ту же неделю, что и `keepId`.
+ *
+ * Колледж перезаливает файл недели под новым именем («31-5 августа-сентября»
+ * стало «1-5 сентября»), и в базе оказывались две записи на одну неделю:
+ * навигация показывала лишнюю неделю, а «Пред. неделя» вела на устаревшие
+ * данные. Неделя опознаётся по своему понедельнику.
+ */
+export async function dropSupersededWeeks(keepId: number, weekStart: string): Promise<number> {
+  const monday = mondayOf(weekStart);
+
+  const res = await db().from('files').select('id, week_start');
+  const rows = (check(res, 'dropSupersededWeeks.list') ?? []) as {
+    id: number;
+    week_start: string | null;
+  }[];
+
+  const doomed = rows
+    .filter((r) => r.id !== keepId && r.week_start && mondayOf(r.week_start) === monday)
+    .map((r) => r.id);
+
+  if (doomed.length === 0) return 0;
+
+  const del = await db().from('files').delete().in('id', doomed).select('id');
+  check(del, 'dropSupersededWeeks.delete');
+
+  return doomed.length;
 }

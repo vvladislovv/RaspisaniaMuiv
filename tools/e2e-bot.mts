@@ -956,6 +956,44 @@ ok(
   `на три нажатия ровно три обращения к API, а не повторы: ${edited(repeats).length}`,
 );
 
+// ─── Перезалив файла под другим именем ───────────────────────────────────────
+
+await resetRateLimit();
+head('Колледж перезалил неделю под новым именем');
+{
+  const { upsertFile: put, weekStarts: weeks, dropSupersededWeeks } = await import('../lib/db');
+  const before = await weeks();
+
+  // Та же неделя, но имя другое и начало сместилось на день — ровно так
+  // колледж заменил «31-5 августа-сентября» на «1-5 сентября»
+  const renamed = await put({
+    name: 'week1-renamed.xlsx',
+    url: 'https://www.muiv.ru/upload/fixture/week1-renamed.xlsx',
+    title: 'Расписание из фикстуры (перезалив)',
+    sha256: 'renamed',
+    size: 1,
+    siteUpdated: '04.09.2026',
+    weekStart: '2026-09-01',
+    parsedOk: true,
+    parseError: null,
+  });
+
+  const withDuplicate = await weeks();
+  ok(
+    withDuplicate.length === before.length,
+    `навигация не показывает лишнюю неделю: было ${before.length}, стало ${withDuplicate.length}`,
+  );
+
+  const removed = await dropSupersededWeeks(renamed.id, '2026-09-01');
+  ok(removed >= 1, `устаревшая запись о той же неделе удалена: ${removed}`);
+
+  const after = await weeks();
+  ok(after.length === before.length, 'недель по-прежнему столько же');
+
+  // Возвращаем расписание из фикстуры, чтобы дальше было на чём проверять
+  await seedFromFixture('after-rename');
+}
+
 // ─── Сбои базы ───────────────────────────────────────────────────────────────
 
 await resetRateLimit();

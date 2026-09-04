@@ -32,3 +32,17 @@ test('isSaturdayMsk определяет субботу по московско�
   // пятница 22:00 UTC = суббота 01:00 МСК
   assert.equal(isSaturdayMsk(new Date('2026-09-04T22:00:00Z')), true);
 });
+
+test('mondayOf опознаёт неделю по её понедельнику', async () => {
+  const { mondayOf } = await import('../lib/time');
+
+  // Колледж перезалил файл, и начало недели сместилось с 31.08 на 01.09 —
+  // понедельник обязан совпасть
+  assert.equal(mondayOf('2026-08-31'), '2026-08-31');
+  assert.equal(mondayOf('2026-09-01'), '2026-08-31');
+  assert.equal(mondayOf('2026-09-05'), '2026-08-31');
+  // Воскресенье относится к своей неделе, а не к следующей
+  assert.equal(mondayOf('2026-09-06'), '2026-08-31');
+  assert.equal(mondayOf('2026-09-07'), '2026-09-07');
+  assert.equal(mondayOf('2026-09-12'), '2026-09-07');
+});

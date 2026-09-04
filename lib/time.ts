@@ -60,3 +60,19 @@ export function mskStamp(date: Date): string {
     `${String(p.hour).padStart(2, '0')}:${String(p.minute).padStart(2, '0')} МСК`
   );
 }
+
+/**
+ * Понедельник недели, в которую попадает дата.
+ *
+ * Устойчивый признак недели. Колледж перезаливает файл то под другим путём,
+ * то под другим именем, и «начало недели» в новом файле может оказаться
+ * вторником (31.08 против 01.09) — но понедельник у них один и тот же.
+ */
+export function mondayOf(isoDate: string): string {
+  const [y, m, d] = isoDate.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  // getUTCDay(): 0 — воскресенье, поэтому его отматываем на шесть дней назад
+  const shift = (dt.getUTCDay() + 6) % 7;
+  dt.setUTCDate(dt.getUTCDate() - shift);
+  return dt.toISOString().slice(0, 10);
+}
