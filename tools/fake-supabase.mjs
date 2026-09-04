@@ -42,6 +42,12 @@ const tables = existsSync(snapshot)
       access: [],
     };
 
+/**
+ * Сколько следующих запросов отдать как сбой шлюза и по какому пути.
+ * Управляется запросом на /__flaky — так проверяются повторы к базе.
+ */
+let flaky = { left: 0, status: 504, match: '' };
+
 const sequences = {};
 
 function nextId(table) {
@@ -255,6 +261,24 @@ http
 
     req.on('end', () => {
       try {
+        if (url.pathname.endsWith('/__flaky')) {
+          const body = raw ? JSON.parse(raw) : {};
+          flaky = {
+            left: Number(body.count ?? 0),
+            status: Number(body.status ?? 504),
+            match: String(body.match ?? ''),
+          };
+          return respond(res, 200, { ok: true, flaky });
+        }
+
+        // Изображаем разовый сбой шлюза: клиент должен повторить сам
+        if (flaky.left > 0 && (!flaky.match || url.pathname.includes(flaky.match))) {
+          flaky.left -= 1;
+          res.writeHead(flaky.status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ message: 'Gateway Timeout' }));
+          return;
+        }
+
         if (segments.includes('rpc')) return handleRpc(segments, raw, res);
 
         const table = segments[segments.length - 1];

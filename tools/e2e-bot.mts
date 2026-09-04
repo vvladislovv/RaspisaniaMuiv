@@ -186,6 +186,15 @@ async function resetAlerts(): Promise<void> {
   });
 }
 
+/** Заставляет дублёр базы отдать несколько сбоев шлюза подряд. */
+async function flakyDb(count: number, match = ''): Promise<void> {
+  await fetch(`${process.env.SUPABASE_URL}/__flaky`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ count, match, status: 504 }),
+  });
+}
+
 /** Заставляет дублёр Telegram отклонять указанные методы. */
 async function failMethods(methods: string[]): Promise<void> {
   await fetch(`${process.env.TELEGRAM_API_BASE}/bot/__fail`, {
@@ -947,6 +956,31 @@ ok(
   `на три нажатия ровно три обращения к API, а не повторы: ${edited(repeats).length}`,
 );
 
+// ─── Сбои базы ───────────────────────────────────────────────────────────────
+
+await resetRateLimit();
+head('Разовый сбой базы не должен ничего ронять');
+{
+  // Один Gateway Timeout на чтении — экран всё равно должен открыться
+  await flakyDb(1);
+  m = mark();
+  await handleUpdate(button('m'));
+  ok(edited(since(m)).length === 1, 'нажатие пережило один 504 от базы');
+
+  // Косметическая отметка файла: её сбой не должен ронять проверку
+  await flakyDb(9, '/files');
+  let threw = false;
+  try {
+    const { touchFile } = await import('../lib/db');
+    await touchFile('week1.xlsx');
+  } catch {
+    threw = true;
+  }
+  ok(!threw, 'сбой отметки файла не бросает исключение');
+
+  await flakyDb(0);
+}
+
 // ─── Подавление повторных алертов ────────────────────────────────────────────
 
 head('Повторные алерты владельцу');
@@ -997,10 +1031,23 @@ ok(true, 'пустой апдейт не роняет обработчик');
 
 head('Ограничение частоты');
 await resetRateLimit();
+// Окно лимита — календарная минута. Если она сменится посреди прогона,
+// счётчик обнулится и пройдёт больше шестидесяти: это не поломка лимита,
+// поэтому проверяем строго только когда окно осталось тем же.
+const windowAt = () => Math.floor(Date.now() / 60_000);
+const windowBefore = windowAt();
 m = mark();
 for (let i = 0; i < 70; i++) await handleUpdate(button('m'));
 const answered = edited(since(m)).length;
-ok(answered === 60, `из 70 нажатий обработано ${answered} — лимит 60 в минуту`);
+
+if (windowAt() === windowBefore) {
+  ok(answered === 60, `из 70 нажатий обработано ${answered} — лимит 60 в минуту`);
+} else {
+  ok(
+    answered >= 60 && answered < 70,
+    `минута сменилась посреди прогона, обработано ${answered} — лимит всё равно сработал`,
+  );
+}
 
 // ─── Отказы Bot API ──────────────────────────────────────────────────────────
 

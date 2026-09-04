@@ -5,18 +5,83 @@ import type { Day, Lesson, Workbook } from './parse';
 
 let cached: SupabaseClient | null = null;
 
+/** Коды, при которых имеет смысл повторить: шлюз не ответил или попросил ждать. */
+const TRANSIENT_STATUS = new Set([429, 500, 502, 503, 504, 522, 524]);
+const DB_ATTEMPTS = 3;
+
+/**
+ * Можно ли безопасно повторить запрос.
+ *
+ * Чтение, изменение и удаление идемпотентны. Обычная вставка — нет: если
+ * первая попытка на самом деле прошла, а ответ потерялся, повтор добавил бы
+ * вторую строку. Исключение — upsert (`on_conflict` в адресе): он идемпотентен
+ * по своей природе.
+ */
+function isRetryable(url: string, method: string): boolean {
+  if (method === 'GET' || method === 'HEAD') return true;
+  if (method === 'PATCH' || method === 'DELETE') return true;
+  if (method === 'POST') return url.includes('on_conflict=');
+  return false;
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Fetch с повторами для Supabase.
+ *
+ * Разовый `Gateway Timeout` от базы ронял всю проверку расписания. Повтор
+ * задаётся здесь, одним местом на все запросы, а не в каждом вызове.
+ */
+async function retryingFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+  const method = (init?.method ?? 'GET').toUpperCase();
+  const retryable = isRetryable(url, method);
+
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= DB_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(input, init);
+
+      if (!retryable || !TRANSIENT_STATUS.has(res.status) || attempt === DB_ATTEMPTS) {
+        return res;
+      }
+
+      console.warn(`База ответила ${res.status}, попытка ${attempt} из ${DB_ATTEMPTS}`);
+    } catch (error) {
+      lastError = error;
+      if (!retryable || attempt === DB_ATTEMPTS) throw error;
+      console.warn(
+        `База недоступна (попытка ${attempt} из ${DB_ATTEMPTS}):`,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+
+    await sleep(250 * 2 ** (attempt - 1));
+  }
+
+  throw lastError instanceof Error ? lastError : new Error('База недоступна');
+}
+
 export function db(): SupabaseClient {
   if (!cached) {
     cached = createClient(env.supabaseUrl, env.supabaseServiceKey, {
       auth: { persistSession: false, autoRefreshToken: false },
+      global: { fetch: retryingFetch },
     });
   }
   return cached;
 }
 
 /** Бросает понятную ошибку вместо молчаливого проглатывания. */
-function check<T>(result: { data: T; error: { message: string } | null }, what: string): T {
-  if (result.error) throw new Error(`БД (${what}): ${result.error.message}`);
+function check<T>(
+  result: { data: T; error: { message: string; code?: string } | null },
+  what: string,
+): T {
+  if (result.error) {
+    const code = result.error.code ? ` [${result.error.code}]` : '';
+    throw new Error(`БД (${what})${code}: ${result.error.message}`);
+  }
   return result.data;
 }
 
@@ -164,13 +229,23 @@ export async function getFileByName(name: string): Promise<FileRow | null> {
   return check(res, 'getFileByName') as FileRow | null;
 }
 
+/**
+ * Отмечает, что файл всё ещё лежит на сайте.
+ *
+ * Это косметика: колонка `last_seen` ни на что не влияет. Поэтому ошибка тут
+ * не должна ронять проверку расписания — именно так разовый Gateway Timeout
+ * от базы обрушил весь тик и прислал владельцу алерт.
+ */
 export async function touchFile(name: string): Promise<void> {
   const res = await db()
     .from('files')
     .update({ last_seen: new Date().toISOString() })
     .eq('name', name)
     .select('id');
-  check(res, 'touchFile');
+
+  if (res.error) {
+    console.warn(`Не удалось отметить файл «${name}»:`, res.error.message);
+  }
 }
 
 export interface FileUpsert {
