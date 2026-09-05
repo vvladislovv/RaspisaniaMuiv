@@ -31,7 +31,12 @@ import {
   getState,
   setState,
   weekStarts,
+  clearState,
+  addFeedback,
+  feedbackFrom,
+  feedbackStats,
   type Chat,
+  type FeedbackKind,
 } from './db';
 import { log, logError } from './log';
 import {
@@ -44,8 +49,17 @@ import {
   TelegramError,
   type InlineKeyboard,
 } from './telegram';
-import { emojiTag, esc, formatDayFor, formatWeek, humanDate, type GroupDay } from './format';
-import { groupKeyboard, menuKeyboard, scheduleKeyboard, sheetKeyboard, statusKeyboard } from './keyboard';
+import { emojiTag, esc, formatDayFor, formatWeek, humanDate, quote, type GroupDay } from './format';
+import {
+  feedbackButton,
+  feedbackCancelKeyboard,
+  feedbackKindKeyboard,
+  groupKeyboard,
+  menuKeyboard,
+  scheduleKeyboard,
+  sheetKeyboard,
+  statusKeyboard,
+} from './keyboard';
 import { dayNameOf, mskDateOffset, mskStamp, mskToday, weekAnchor } from './time';
 import type { Day } from './parse';
 import { env } from './env';
@@ -224,7 +238,9 @@ function accessScreen(status: 'pending' | 'denied'): Screen {
     lines.push(esc('Доступ не открыт.'));
   }
 
-  return { text: lines.join('\n'), keyboard: [] };
+  // Кнопка «баг или идея» есть и здесь: сломанное чинить полезно,
+  // даже если сообщает человек, которого ещё не пустили к расписанию
+  return { text: lines.join('\n'), keyboard: [[feedbackButton(true, null)]] };
 }
 
 /**
@@ -287,6 +303,80 @@ export function describeUser(user: {
   return user.id ? `ID ${user.id}` : 'без имени';
 }
 
+// ─── Баги и предложения ──────────────────────────────────────────────────────
+
+/**
+ * Как называется тег. Владельцу важно с первого взгляда понимать, что
+ * пришло: сломанное чинят сразу, идею откладывают.
+ */
+const FEEDBACK_KINDS: Record<FeedbackKind, { title: string; emoji: string; tag: string }> = {
+  bug: { title: 'Баг', emoji: '🐞', tag: '#баг' },
+  idea: { title: 'Предложение', emoji: '💡', tag: '#предложение' },
+};
+
+/** Сколько сообщений от одного человека в час бот согласен передать. */
+const FEEDBACK_PER_HOUR = 5;
+
+/** Длиннее не примем: это заметка автору, а не переписка. */
+const FEEDBACK_MAX_LEN = 1000;
+
+/** Ключ ожидания: человек выбрал тег и сейчас пишет текст. */
+function feedbackKey(userId: number): string {
+  return `fb:${userId}`;
+}
+
+/** Ожидание протухает: выбранный вчера тег к сегодняшнему сообщению не относится. */
+const FEEDBACK_WAIT_MS = 30 * 60 * 1000;
+
+interface FeedbackWait {
+  kind: FeedbackKind;
+  at: string;
+}
+
+/** Экран выбора тега. */
+function feedbackScreen(): Screen {
+  return {
+    text: [
+      '*Баг или предложение*',
+      '',
+      esc('Нашёл ошибку или придумал, чего не хватает? Выбери, что это, и напиши одним сообщением — я передам автору.'),
+    ].join('\n'),
+    keyboard: feedbackKindKeyboard(),
+  };
+}
+
+/** Экран ожидания текста. */
+function feedbackComposeScreen(kind: FeedbackKind): Screen {
+  const info = FEEDBACK_KINDS[kind];
+  return {
+    text: [
+      `${info.emoji} *${esc(info.title)}*`,
+      '',
+      esc(
+        kind === 'bug'
+          ? 'Напиши следующим сообщением, что сломалось и как это повторить.'
+          : 'Напиши следующим сообщением, чего не хватает.',
+      ),
+      '',
+      `_${esc(`Одно сообщение, до ${FEEDBACK_MAX_LEN} символов.`)}_`,
+    ].join('\n'),
+    keyboard: feedbackCancelKeyboard(),
+  };
+}
+
+/** Уведомление владельцу: тег видно первой строкой. */
+function feedbackNotice(kind: FeedbackKind, user: TgUser, text: string): string {
+  const info = FEEDBACK_KINDS[kind];
+  return [
+    `${info.emoji} *${esc(info.title)}* ${esc(info.tag)}`,
+    '',
+    esc(describeUser(user)),
+    `\`${user.id}\``,
+    '',
+    quote(text.split('\n').map((line) => esc(line))),
+  ].join('\n');
+}
+
 /** Уведомление владельцу о новой заявке. */
 function requestScreen(user: TgUser): Screen {
   return {
@@ -309,13 +399,14 @@ function requestScreen(user: TgUser): Screen {
 
 /** Сводка для владельца бота: сколько чатов, какие группы, есть ли ошибки. */
 async function adminScreen(): Promise<Screen> {
-  const [stats, errors, check, file, access, pending] = await Promise.all([
+  const [stats, errors, check, file, access, pending, feedback] = await Promise.all([
     chatStats(),
     errorCount(24),
     getState<{ at: string; filesOnSite: number; errors: string[] }>(LAST_CHECK_KEY),
     fileForDate(weekAnchor()),
     accessCounts(),
     pendingRequests(8),
+    feedbackStats(24),
   ]);
 
   const lines = ['*Сводка*', ''];
@@ -324,6 +415,7 @@ async function adminScreen(): Promise<Screen> {
   lines.push(
     `Доступ: одобрено ${access.approved}, ждут *${access.pending}*, отказано ${access.denied}`,
   );
+  lines.push(`За сутки: 🐞 ${feedback.bugs}, 💡 ${feedback.ideas}`);
 
   if (check) {
     lines.push(`Проверка сайта: ${esc(mskStamp(new Date(check.at)))}`);
@@ -685,6 +777,98 @@ function isStart(text: string): boolean {
   return /^\/start(?:@[\w_]+)?\b/i.test(text.trim());
 }
 
+/**
+ * Что стоит за `/start` в ссылке вида `t.me/bot?start=fb`.
+ *
+ * Из группы обратную связь принять нельзя: у бота включён режим приватности,
+ * обычных сообщений он там не видит. Ссылка переводит человека в личку сразу
+ * на нужный экран, чтобы он не искал его руками.
+ */
+function startPayload(text: string): 'fb' | FeedbackKind | null {
+  const payload = text.trim().replace(/^\/start(?:@[\w_]+)?/i, '').trim().toLowerCase();
+  if (payload === 'fb' || payload === 'bug' || payload === 'idea') return payload;
+  return null;
+}
+
+/**
+ * Текст после выбора тега. Возвращает true, если сообщение было обратной
+ * связью и обработано, — тогда дальше его разбирать не нужно.
+ */
+async function handleFeedbackText(chatId: number, user: TgUser, raw: string): Promise<boolean> {
+  const key = feedbackKey(user.id);
+  const wait = await getState<FeedbackWait>(key);
+  if (!wait) return false;
+
+  // Тег выбрали полчаса назад: к этому сообщению он уже вряд ли относится
+  if (Date.now() - new Date(wait.at).getTime() > FEEDBACK_WAIT_MS) {
+    await clearState(key);
+    return false;
+  }
+
+  const text = raw.trim();
+  if (text.length === 0) return false;
+
+  if (text.length > FEEDBACK_MAX_LEN) {
+    await sendMessage(
+      chatId,
+      esc(`Слишком длинно: ${text.length} символов из ${FEEDBACK_MAX_LEN}. Сократи и пришли ещё раз.`),
+      { silent: true, keyboard: feedbackCancelKeyboard() },
+    );
+    return true;
+  }
+
+  // Потолок на человека в час: писать может кто угодно, и без потолка
+  // одному скучающему хватит минуты, чтобы завалить владельца
+  if ((await feedbackFrom(user.id, 1)) >= FEEDBACK_PER_HOUR) {
+    await clearState(key);
+    await sendMessage(
+      chatId,
+      esc('Пока хватит — больше пяти сообщений в час я не передаю. Возвращайся через час.'),
+      { silent: true },
+    );
+    await log('skip', `Обратная связь: лимит у ${user.id}`, { chatId, details: { userId: user.id } });
+    return true;
+  }
+
+  const info = FEEDBACK_KINDS[wait.kind];
+
+  await addFeedback({
+    chatId,
+    userId: user.id,
+    username: user.username ?? null,
+    firstName: user.first_name ?? null,
+    kind: wait.kind,
+    text,
+  });
+  await clearState(key);
+
+  // Уведомление владельцу — не критично для человека: он своё сообщение
+  // уже отдал, и «спасибо» он должен увидеть даже если Telegram подвёл
+  try {
+    await sendMessage(env.adminTelegramId, feedbackNotice(wait.kind, user, text), {
+      silent: false,
+    });
+  } catch (error) {
+    await logError('Уведомление владельца об обратной связи', error);
+  }
+
+  await sendMessage(
+    chatId,
+    [
+      `✅ *${esc('Передал автору')}* ${esc(info.tag)}`,
+      '',
+      esc('Спасибо — так бот становится лучше.'),
+    ].join('\n'),
+    { silent: true, keyboard: [[{ text: '↩︎ Меню', callback_data: 'm' }]] },
+  );
+
+  await log('command', `Обратная связь: ${wait.kind}`, {
+    chatId,
+    details: { userId: user.id, length: text.length },
+  });
+  return true;
+}
+
 async function handleMessage(message: TgMessage): Promise<void> {
   const chatId = message.chat.id;
   const user = message.from;
@@ -711,6 +895,12 @@ async function handleMessage(message: TgMessage): Promise<void> {
     return;
   }
 
+  // Человек выбрал тег и пишет текст. Ловим до всех прочих правил: команд
+  // у бота нет, и без этого сообщение молча пропало бы.
+  if (message.chat.type === 'private' && user && !isStart(message.text ?? '')) {
+    if (message.text && (await handleFeedbackText(chatId, user, message.text))) return;
+  }
+
   if (!isStart(message.text ?? '')) return;
 
   if (!(await allowRequest(chatId))) {
@@ -722,6 +912,23 @@ async function handleMessage(message: TgMessage): Promise<void> {
 
   // В личке /start — это заявка на доступ либо вход для уже одобренного
   if (isPrivate && user) {
+    // Пришли по ссылке «баг или идея» из группы — сразу нужный экран.
+    // Это до проверки доступа: сообщить о поломке может кто угодно.
+    const payload = startPayload(message.text ?? '');
+    if (payload) {
+      const kind = payload === 'fb' ? null : payload;
+      if (kind) {
+        await setState(feedbackKey(user.id), { kind, at: new Date().toISOString() });
+      }
+      const screen = kind ? feedbackComposeScreen(kind) : feedbackScreen();
+      await sendMessage(chatId, screen.text, { silent: true, keyboard: screen.keyboard });
+      await log('command', `Обратная связь: экран ${payload}`, {
+        chatId,
+        details: { userId: user.id },
+      });
+      return;
+    }
+
     if (!(await isApproved(user.id))) {
       const { status, isNew } = await requestAccess(
         user.id,
@@ -730,7 +937,7 @@ async function handleMessage(message: TgMessage): Promise<void> {
       );
 
       const screen = accessScreen(status === 'denied' ? 'denied' : 'pending');
-      await sendMessage(chatId, screen.text, { silent: true });
+      await sendMessage(chatId, screen.text, { silent: true, keyboard: screen.keyboard });
 
       await log('command', `Заявка на доступ: ${status}${isNew ? ' (новая)' : ''}`, {
         chatId,
@@ -832,7 +1039,10 @@ async function runCallback(
   // Кнопки работают только в подключённом чате. Исключение — решения по
   // заявкам: они приходят владельцу в личку, где чата в базе может не быть.
   const isDecision = data.startsWith('ok:') || data.startsWith('no:');
-  if (!chat && !isDecision) {
+  // Баги и предложения принимаем от кого угодно, в том числе из личек,
+  // которых нет в базе: у неодобренного человека записи о чате не будет
+  const isFeedback = data === 'fb' || data.startsWith('fb:');
+  if (!chat && !isDecision && !isFeedback && !(ctx.isPrivate && data === 'm')) {
     await answerCallbackQuery(query.id, 'Чат не подключён');
     return;
   }
@@ -859,7 +1069,39 @@ async function runCallback(
 
   if (data === 'm') {
     ack();
+    // Личка без записи в базе — это неодобренный человек: меню ему показывать
+    // нечего, зато видно, на какой стадии его заявка
+    if (!chat && ctx.isPrivate) {
+      const status = (await getAccess(query.from.id))?.status;
+      await edit(accessScreen(status === 'denied' ? 'denied' : 'pending'));
+      return;
+    }
     await edit(menuScreen(chat, ctx));
+    return;
+  }
+
+  // ─── Баги и предложения ────────────────────────────────────────────────────
+
+  if (data === 'fb') {
+    await clearState(feedbackKey(query.from.id));
+    ack();
+    await edit(feedbackScreen());
+    return;
+  }
+
+  if (data === 'fb:bug' || data === 'fb:idea') {
+    // Принять текст можно только в личке: в группе бот обычных сообщений
+    // не видит — у него включён режим приватности
+    if (!ctx.isPrivate) {
+      const username = await botUsername().catch(() => null);
+      ack(username ? 'Напиши мне в личку' : 'Это работает только в личке');
+      return;
+    }
+
+    const kind: FeedbackKind = data === 'fb:bug' ? 'bug' : 'idea';
+    await setState(feedbackKey(query.from.id), { kind, at: new Date().toISOString() });
+    ack();
+    await edit(feedbackComposeScreen(kind));
     return;
   }
 

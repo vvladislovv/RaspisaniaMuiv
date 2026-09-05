@@ -23,6 +23,7 @@ import {
   weekStarts,
   currentGroups,
   weekDates,
+  withReadCache,
   type Chat,
   type FileRow,
 } from './db';
@@ -186,6 +187,10 @@ export async function checkSite(): Promise<CheckResult> {
  * сообщений в чате не появляется. Если править нечего или не вышло — молчим.
  */
 export async function refreshPinned(): Promise<number> {
+  return withReadCache(runRefreshPinned);
+}
+
+async function runRefreshPinned(): Promise<number> {
   const chats = await activeChats();
   const today = mskDateOffset(0);
   const weeks = await weekStarts();
@@ -405,6 +410,12 @@ export interface SendResult {
  * чаты помечены датой, и следующий тик продолжит с места обрыва.
  */
 export async function sendTomorrow(): Promise<SendResult> {
+  // Расписание одно на всех: внутри кэша список групп и недели читаются
+  // из базы один раз, а не по разу на каждый чат
+  return withReadCache(runSendTomorrow);
+}
+
+async function runSendTomorrow(): Promise<SendResult> {
   const dateIso = mskDateOffset(1);
   const weeks = await weekStarts();
   const deadline = Date.now() + SEND_BUDGET_MS;

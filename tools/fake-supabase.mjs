@@ -19,6 +19,7 @@ const PRIMARY_KEYS = {
   rate_limit: ['chat_id', 'window_start'],
   app_state: ['key'],
   access: ['user_id'],
+  feedback: ['id'],
 };
 
 /** Значения по умолчанию из schema.sql — заглушка их не знает сама. */
@@ -35,6 +36,7 @@ const COLUMN_DEFAULTS = {
   logs: { chat_id: null, details: null, duration_ms: null },
   rate_limit: { count: 0 },
   access: { status: 'pending', username: null, first_name: null, decided_at: null },
+  feedback: { username: null, first_name: null },
 };
 
 const tables = existsSync(snapshot)
@@ -47,6 +49,7 @@ const tables = existsSync(snapshot)
       rate_limit: [],
       app_state: [],
       access: [],
+      feedback: [],
     };
 
 /**
@@ -54,6 +57,9 @@ const tables = existsSync(snapshot)
  * Управляется запросом на /__flaky — так проверяются повторы к базе.
  */
 let flaky = { left: 0, status: 504, match: '' };
+
+/** Счётчик обращений по таблицам: по нему тест видит нагрузку на базу. */
+let hits = {};
 
 const sequences = {};
 
@@ -231,7 +237,7 @@ function handleInsert(table, url, req, raw, res, single) {
       if (record[column] === undefined) record[column] = value;
     }
 
-    if (['files', 'schedules', 'logs'].includes(table) && record.id === undefined) {
+    if (['files', 'schedules', 'logs', 'feedback'].includes(table) && record.id === undefined) {
       record.id = nextId(table);
     }
     if (table === 'chats' && record.created_at === undefined) {
@@ -242,6 +248,9 @@ function handleInsert(table, url, req, raw, res, single) {
     }
     if (table === 'access' && record.requested_at === undefined) {
       record.requested_at = new Date().toISOString();
+    }
+    if (table === 'feedback' && record.created_at === undefined) {
+      record.created_at = new Date().toISOString();
     }
     if (table === 'files' && record.first_seen === undefined) {
       record.first_seen = new Date().toISOString();
@@ -268,6 +277,11 @@ http
 
     req.on('end', () => {
       try {
+        if (url.pathname.endsWith('/__stats')) {
+          if (req.method === 'POST') hits = {};
+          return respond(res, 200, hits);
+        }
+
         if (url.pathname.endsWith('/__flaky')) {
           const body = raw ? JSON.parse(raw) : {};
           flaky = {
@@ -289,6 +303,7 @@ http
         if (segments.includes('rpc')) return handleRpc(segments, raw, res);
 
         const table = segments[segments.length - 1];
+        hits[table] = (hits[table] ?? 0) + 1;
         if (!tables[table]) return respond(res, 404, { message: `нет таблицы ${table}` });
 
         const params = [...url.searchParams.entries()];

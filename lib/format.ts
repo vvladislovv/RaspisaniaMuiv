@@ -77,7 +77,7 @@ function lessonLines(lesson: Lesson): string[] {
  * `expandable` делает цитату раскрывающейся: в списке дней видно только
  * начало, остальное открывается тапом.
  */
-function quote(lines: string[], expandable = false): string {
+export function quote(lines: string[], expandable = false): string {
   const body = lines.map((line) => '>' + line);
   if (!expandable) return body.join('\n');
   // Пустая жирная разметка перед `>` отделяет цитату от предыдущей,

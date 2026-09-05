@@ -177,6 +177,13 @@ function button(data: string, from = OWNER, chatId = CHAT): TgUpdate {
   };
 }
 
+/** Нажатие в личке: там чата в базе может и не быть. */
+function privateButton(data: string, from: number): TgUpdate {
+  const base = button(data, from, from);
+  base.callback_query!.message!.chat = { id: from, type: 'private' };
+  return base;
+}
+
 /** Чистит заявки: доступ выдаётся заново в каждом прогоне. */
 async function resetAccess(): Promise<void> {
   await fetch(`${process.env.SUPABASE_URL}/rest/v1/access?user_id=neq.0`, {
@@ -194,6 +201,30 @@ async function resetChat(): Promise<void> {
     method: 'DELETE',
     headers: { apikey: 'fake', Authorization: 'Bearer fake' },
   });
+}
+
+/** Чистит баги и предложения между прогонами. */
+async function resetFeedback(): Promise<void> {
+  await fetch(`${process.env.SUPABASE_URL}/rest/v1/feedback?id=gte.0`, {
+    method: 'DELETE',
+    headers: { apikey: 'fake', Authorization: 'Bearer fake' },
+  });
+  await fetch(`${process.env.SUPABASE_URL}/rest/v1/app_state?key=like.fb:*`, {
+    method: 'DELETE',
+    headers: { apikey: 'fake', Authorization: 'Bearer fake' },
+  });
+}
+
+/** Обнуляет счётчик обращений к базе. */
+async function resetDbHits(): Promise<void> {
+  await fetch(`${process.env.SUPABASE_URL}/__stats`, { method: 'POST' });
+}
+
+/** Сколько раз за это время дёрнули таблицу. */
+async function dbHits(table: string): Promise<number> {
+  const res = await fetch(`${process.env.SUPABASE_URL}/__stats`);
+  const stats = (await res.json()) as Record<string, number>;
+  return stats[table] ?? 0;
 }
 
 /** Обнуляет счётчик частоты — иначе тест сам упирается в собственный лимит. */
@@ -318,9 +349,10 @@ ok(
   texts(first_).join('').includes('Заявка на доступ отправлена'),
   'посторонний получает ответ про заявку',
 );
+const accessButtons = keyboardOf(sent(first_).filter((c) => c.body.chat_id === STRANGER));
 ok(
-  keyboardOf(sent(first_).filter((c) => c.body.chat_id === STRANGER)).length === 0,
-  'никаких кнопок доступа ему не дают',
+  accessButtons.length === 1 && accessButtons[0].text.includes('Баг или идея'),
+  'кроме «баг или идея» кнопок ему не дают',
 );
 ok(
   sent(first_).some(
@@ -1280,6 +1312,191 @@ ok(
   ),
   `без force решение принято по времени: ${notForced.autoSend}`,
 );
+
+// ─── Привязка групп к чатам ──────────────────────────────────────────────────
+
+await resetRateLimit();
+head('У каждого чата — ровно его группы');
+{
+  const A = -100777200;
+  const B = -100777201;
+  const C = -100777202;
+
+  // Названия не должны быть началом друг друга: иначе проверка «в тексте нет
+  // чужой группы» соврала бы на «БАД 26-09» внутри «БАД 26-09.1»
+  const names = groups.map((g) => g.group);
+  const distinct = names.filter(
+    (name) => !names.some((other) => other !== name && other.startsWith(name)),
+  );
+  const [g1, g2, g3] = distinct;
+  ok(!!g1 && !!g2 && !!g3, `взяты непересекающиеся группы: ${g1}, ${g2}, ${g3}`);
+
+  const { toggleChatGroup } = await import('../lib/db');
+  await upsertChat(A, 'Чат А');
+  await toggleChatGroup(A, g1);
+  await upsertChat(B, 'Чат Б');
+  await toggleChatGroup(B, g2);
+  await toggleChatGroup(B, g3);
+  await upsertChat(C, 'Чат В');
+  await toggleChatGroup(C, g1);
+
+  ok((await getChat(A))?.groups.join('|') === g1, 'выбор чата А сохранён как есть');
+  ok((await getChat(B))?.groups.join('|') === `${g2}|${g3}`, 'у чата Б сохранены обе, по порядку');
+
+  for (const id of [A, B, C]) await setPinnedMessage(id, null, '2020-01-01');
+  m = mark();
+  await tick(true);
+  const out = since(m);
+
+  const textFor = (id: number) =>
+    sent(out)
+      .filter((c) => c.body.chat_id === id)
+      .map((c) => String(c.body.text))
+      .join('\n');
+
+  ok(
+    textFor(A).includes(esc(g1)) &&
+      !textFor(A).includes(esc(g2)) &&
+      !textFor(A).includes(esc(g3)),
+    'чат А получил только свою группу',
+  );
+  ok(
+    textFor(B).includes(esc(g2)) &&
+      textFor(B).includes(esc(g3)) &&
+      !textFor(B).includes(esc(g1)),
+    'чат Б получил обе свои и ни одной чужой',
+  );
+  ok(textFor(C).includes(esc(g1)), 'чат В со своей группой не остался без расписания');
+  ok(
+    (await getChat(A))?.groups.join('|') === g1,
+    'после рассылки выбор чата А не поменялся',
+  );
+}
+
+// ─── Нагрузка на базу ────────────────────────────────────────────────────────
+
+await resetRateLimit();
+head('Расписание читается один раз на всю рассылку');
+{
+  const many = [-100777210, -100777211, -100777212, -100777213, -100777214, -100777215];
+  const { toggleChatGroup } = await import('../lib/db');
+  const shared = groups[0].group;
+
+  for (const id of many) {
+    await upsertChat(id, `Массовый ${id}`);
+    await toggleChatGroup(id, shared);
+    await setPinnedMessage(id, null, '2020-01-01');
+  }
+
+  await resetDbHits();
+  const before = await tick(true);
+  const reads = await dbHits('schedules');
+
+  ok(before.sent! >= many.length, `разослано чатов: ${before.sent}`);
+  // Без общего кэша один только список групп читался бы по разу на чат.
+  // Порог с запасом: важно, что число не растёт вместе с числом чатов.
+  ok(reads <= 6, `таблица расписания прочитана ${reads} раз на ${before.sent} чатов`);
+}
+
+// ─── Баги и предложения ──────────────────────────────────────────────────────
+
+await resetRateLimit();
+await resetFeedback();
+head('Баги и предложения');
+{
+  // Человек без доступа: сообщать о поломках он всё равно должен уметь
+  const REPORTER = 4242;
+
+  m = mark();
+  await handleUpdate(message('/start', REPORTER, REPORTER, 'private'));
+  // Смотрим именно его сообщение: последним в пачке уходит уведомление владельцу
+  const toReporter = sent(since(m)).filter((c) => c.body.chat_id === REPORTER);
+  ok(!!find(keyboardOf(toReporter), 'Баг или идея'), 'кнопка есть даже без доступа');
+
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(privateButton('fb', REPORTER));
+  const kinds = keyboardOf(since(m));
+  ok(!!find(kinds, 'Баг') && !!find(kinds, 'Предложение'), 'предлагается выбрать тег');
+
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(privateButton('fb:bug', REPORTER));
+  ok(texts(since(m)).join('').includes('сломалось'), 'бот ждёт текст');
+
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(
+    message('Кнопка «Завтра» показывает вчерашний день', REPORTER, REPORTER, 'private'),
+  );
+  let out = since(m);
+  const notice = sent(out).find((c) => c.body.chat_id === OWNER);
+  ok(!!notice, 'владельцу пришло уведомление');
+  ok(String(notice?.body.text ?? '').includes('#баг'), 'в уведомлении виден тег');
+  ok(String(notice?.body.text ?? '').includes('Баг'), 'и его название');
+  ok(String(notice?.body.text ?? '').includes('Завтра'), 'и сам текст сообщения');
+  ok(
+    sent(out).some(
+      (c) => c.body.chat_id === REPORTER && String(c.body.text).includes('Передал'),
+    ),
+    'человеку сказали спасибо',
+  );
+
+  // Следующее сообщение — уже обычное: тег одноразовый
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(message('просто болтаю', REPORTER, REPORTER, 'private'));
+  ok(sent(since(m)).length === 0, 'без выбранного тега бот на текст не реагирует');
+
+  // Предложение приходит со своим тегом
+  await resetRateLimit();
+  await handleUpdate(privateButton('fb:idea', REPORTER));
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(message('Пусть показывает преподавателя', REPORTER, REPORTER, 'private'));
+  ok(
+    String(sent(since(m)).find((c) => c.body.chat_id === OWNER)?.body.text ?? '').includes(
+      '#предложение',
+    ),
+    'у предложения свой тег',
+  );
+
+  // Слишком длинное не проходит, ожидание не сбрасывается
+  await resetRateLimit();
+  await handleUpdate(privateButton('fb:bug', REPORTER));
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(message('я'.repeat(1500), REPORTER, REPORTER, 'private'));
+  out = since(m);
+  ok(texts(out).join('').includes('Слишком длинно'), 'слишком длинное отклонено');
+  ok(sent(out).every((c) => c.body.chat_id !== OWNER), 'и владельцу не ушло');
+
+  // Потолок: больше пяти в час бот не передаёт
+  await resetRateLimit();
+  for (let i = 0; i < 5; i++) {
+    await resetRateLimit();
+    await handleUpdate(privateButton('fb:bug', REPORTER));
+    await resetRateLimit();
+    await handleUpdate(message(`ещё баг ${i}`, REPORTER, REPORTER, 'private'));
+  }
+  await resetRateLimit();
+  await handleUpdate(privateButton('fb:bug', REPORTER));
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(message('шестой подряд', REPORTER, REPORTER, 'private'));
+  out = since(m);
+  ok(texts(out).join('').includes('Пока хватит'), 'потолок в час срабатывает');
+  ok(sent(out).every((c) => c.body.chat_id !== OWNER), 'сверх потолка владельца не дёргаем');
+
+  // В группе кнопка ведёт ссылкой в личку: обычных сообщений бот там не видит
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(message('/start', OWNER));
+  const inGroup = find(keyboardOf(since(m)), 'Баг или идея');
+  ok(!!inGroup?.url && inGroup.url.includes('start=fb'), 'из группы кнопка ведёт в личку');
+
+  await resetFeedback();
+}
 
 // ─── Группы с темами ─────────────────────────────────────────────────────────
 

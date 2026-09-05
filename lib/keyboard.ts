@@ -7,7 +7,7 @@
  */
 import type { Day } from './parse';
 import { shortDay } from './format';
-import type { InlineKeyboard } from './telegram';
+import type { InlineButton, InlineKeyboard } from './telegram';
 
 export function chunk<T>(items: T[], size: number): T[][] {
   const out: T[][] = [];
@@ -65,6 +65,11 @@ export function menuKeyboard(opts: MenuOptions): InlineKeyboard {
     { text: '⚙️ Статус', callback_data: 'st' },
     { text: 'ℹ️ О боте', callback_data: 'about' },
   ]);
+
+  // Писать баги и идеи можно только в личке: в группе у бота включён режим
+  // приватности, обычных сообщений он там не видит. Поэтому из группы —
+  // ссылкой в личку, а не кнопкой, которая ничего не смогла бы принять.
+  rows.push([feedbackButton(opts.isPrivate, opts.username)]);
 
   if (opts.isOwner) rows.push([{ text: '🛠 Сводка', callback_data: 'adm' }]);
 
@@ -158,6 +163,35 @@ export function scheduleKeyboard(
 
   rows.push([TO_MENU]);
   return rows;
+}
+
+/**
+ * Кнопка «Баг или идея».
+ *
+ * В личке это обычная кнопка. Из группы — ссылка `?start=fb`, которая
+ * открывает личку сразу на выборе тега; без имени бота ссылку не собрать,
+ * поэтому там остаётся кнопка с объяснением.
+ */
+export function feedbackButton(isPrivate: boolean, username: string | null): InlineButton {
+  const text = '🐞 Баг или идея';
+  if (isPrivate || !username) return { text, callback_data: 'fb' };
+  return { text, url: `https://t.me/${username}?start=fb` };
+}
+
+/** Выбор тега сообщения: без тега владельцу непонятно, что чинить первым. */
+export function feedbackKindKeyboard(): InlineKeyboard {
+  return [
+    [
+      { text: '🐞 Баг', callback_data: 'fb:bug' },
+      { text: '💡 Предложение', callback_data: 'fb:idea' },
+    ],
+    [TO_MENU],
+  ];
+}
+
+/** Экран ожидания текста: единственный выход — передумать. */
+export function feedbackCancelKeyboard(): InlineKeyboard {
+  return [[{ text: '✖️ Отмена', callback_data: 'fb' }], [TO_MENU]];
 }
 
 /** Выбор курса (листа файла). */

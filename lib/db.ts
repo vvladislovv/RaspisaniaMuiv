@@ -4,7 +4,7 @@ import { env } from './env';
 import type { Day, Lesson, Workbook } from './parse';
 import { mondayOf } from './time';
 
-let cached: SupabaseClient | null = null;
+let client: SupabaseClient | null = null;
 
 /** Коды, при которых имеет смысл повторить: шлюз не ответил или попросил ждать. */
 const TRANSIENT_STATUS = new Set([429, 500, 502, 503, 504, 522, 524]);
@@ -65,13 +65,13 @@ async function retryingFetch(input: RequestInfo | URL, init?: RequestInit): Prom
 }
 
 export function db(): SupabaseClient {
-  if (!cached) {
-    cached = createClient(env.supabaseUrl, env.supabaseServiceKey, {
+  if (!client) {
+    client = createClient(env.supabaseUrl, env.supabaseServiceKey, {
       auth: { persistSession: false, autoRefreshToken: false },
       global: { fetch: retryingFetch },
     });
   }
-  return cached;
+  return client;
 }
 
 /** Бросает понятную ошибку вместо молчаливого проглатывания. */
@@ -87,6 +87,41 @@ function check<T>(
 }
 
 // ─── Чаты ────────────────────────────────────────────────────────────────────
+
+/**
+ * Кэш чтений на время одной операции.
+ *
+ * Расписание одно на всех: при рассылке пятьсот чатов спрашивают у базы одно
+ * и то же — список групп, неделю группы, даты файла. Внутри `withReadCache`
+ * каждый такой запрос выполняется один раз, остальные получают готовый ответ
+ * из памяти. Кэш живёт только внутри вызова: между тиками файл мог поменяться,
+ * и держать его дольше было бы враньём.
+ */
+let readCache: Map<string, Promise<unknown>> | null = null;
+
+export async function withReadCache<T>(fn: () => Promise<T>): Promise<T> {
+  const previous = readCache;
+  readCache = new Map();
+  try {
+    return await fn();
+  } finally {
+    readCache = previous;
+  }
+}
+
+function cached<T>(key: string, load: () => Promise<T>): Promise<T> {
+  if (!readCache) return load();
+
+  const hit = readCache.get(key) as Promise<T> | undefined;
+  if (hit) return hit;
+
+  const fresh = load();
+  readCache.set(key, fresh);
+  // Разовый сбой не должен утащить за собой всю рассылку: неудачную попытку
+  // забываем, следующий желающий сходит в базу заново
+  fresh.catch(() => readCache?.delete(key));
+  return fresh;
+}
 
 export interface Chat {
   chat_id: number;
@@ -336,6 +371,10 @@ export async function replaceSchedules(fileId: number, workbook: Workbook): Prom
 
 /** Самый свежий успешно распарсенный файл. */
 export async function latestFile(): Promise<FileRow | null> {
+  return cached('latestFile', loadLatestFile);
+}
+
+async function loadLatestFile(): Promise<FileRow | null> {
   const res = await db()
     .from('files')
     .select('*')
@@ -358,6 +397,10 @@ export async function recentFiles(limit = 20): Promise<FileRow[]> {
 
 /** Список групп с указанием листа — для кнопок выбора. */
 export async function listGroups(): Promise<{ group: string; sheet: string | null }[]> {
+  return cached('listGroups', loadGroups);
+}
+
+async function loadGroups(): Promise<{ group: string; sheet: string | null }[]> {
   const file = await latestFile();
   if (!file) return [];
 
@@ -405,6 +448,13 @@ export async function getDay(groupName: string, dateIso: string): Promise<Day | 
  * В воскресенье это уже следующая неделя, в середине недели — текущая.
  */
 export async function getWeek(
+  groupName: string,
+  fromIso: string,
+): Promise<{ days: Day[]; file: FileRow | null }> {
+  return cached(`week:${groupName}:${fromIso}`, () => loadWeek(groupName, fromIso));
+}
+
+async function loadWeek(
   groupName: string,
   fromIso: string,
 ): Promise<{ days: Day[]; file: FileRow | null }> {
@@ -459,6 +509,12 @@ export async function setState(key: string, value: unknown): Promise<void> {
     .upsert({ key, value, updated_at: new Date().toISOString() }, { onConflict: 'key' })
     .select('key');
   check(res, 'setState');
+}
+
+/** Забывает значение: `value` в таблице not null, «пустого» состояния нет. */
+export async function clearState(key: string): Promise<void> {
+  const res = await db().from('app_state').delete().eq('key', key).select('key');
+  check(res, 'clearState');
 }
 
 // ─── Rate limit ──────────────────────────────────────────────────────────────
@@ -528,6 +584,10 @@ export async function logsSince(hours: number): Promise<LogRow[]> {
 
 /** Даты начала недель, для которых есть разобранное расписание. */
 export async function weekStarts(): Promise<string[]> {
+  return cached('weekStarts', loadWeekStarts);
+}
+
+async function loadWeekStarts(): Promise<string[]> {
   const res = await db()
     .from('files')
     .select('week_start')
@@ -582,6 +642,71 @@ export async function migrateChat(oldId: number, newId: number): Promise<boolean
   check(del, 'migrateChat.delete');
 
   return true;
+}
+
+// ─── Баги и предложения ──────────────────────────────────────────────────────
+
+export type FeedbackKind = 'bug' | 'idea';
+
+export interface FeedbackRow {
+  id: number;
+  chat_id: number;
+  user_id: number;
+  username: string | null;
+  first_name: string | null;
+  kind: FeedbackKind;
+  text: string;
+  created_at: string;
+}
+
+export async function addFeedback(entry: {
+  chatId: number;
+  userId: number;
+  username: string | null;
+  firstName: string | null;
+  kind: FeedbackKind;
+  text: string;
+}): Promise<FeedbackRow> {
+  const res = await db()
+    .from('feedback')
+    .insert({
+      chat_id: entry.chatId,
+      user_id: entry.userId,
+      username: entry.username,
+      first_name: entry.firstName,
+      kind: entry.kind,
+      text: entry.text,
+    })
+    .select('*')
+    .single();
+  return check(res, 'addFeedback') as FeedbackRow;
+}
+
+/**
+ * Сколько человек прислал за последние часы.
+ *
+ * Писать может кто угодно, поэтому нужен потолок: иначе одному скучающему
+ * хватит минуты, чтобы завалить владельца уведомлениями.
+ */
+export async function feedbackFrom(userId: number, hours = 1): Promise<number> {
+  const since = new Date(Date.now() - hours * 3_600_000).toISOString();
+  const res = await db()
+    .from('feedback')
+    .select('id')
+    .eq('user_id', userId)
+    .gte('created_at', since);
+  return ((check(res, 'feedbackFrom') ?? []) as { id: number }[]).length;
+}
+
+/** Сводка для владельца: сколько багов и идей пришло за сутки. */
+export async function feedbackStats(hours = 24): Promise<{ bugs: number; ideas: number }> {
+  const since = new Date(Date.now() - hours * 3_600_000).toISOString();
+  const res = await db().from('feedback').select('kind').gte('created_at', since);
+  const rows = (check(res, 'feedbackStats') ?? []) as { kind: string }[];
+  return {
+    bugs: rows.filter((r) => r.kind === 'bug').length,
+    ideas: rows.filter((r) => r.kind === 'idea').length,
+  };
 }
 
 export interface ChatStats {
@@ -720,6 +845,10 @@ export async function currentGroups(
 
 /** Все учебные даты недели по файлу — чтобы клавиатура показывала всю неделю. */
 export async function weekDates(fileId: number): Promise<string[]> {
+  return cached(`weekDates:${fileId}`, () => loadWeekDates(fileId));
+}
+
+async function loadWeekDates(fileId: number): Promise<string[]> {
   const res = await db().from('schedules').select('day_date').eq('file_id', fileId);
   const rows = (check(res, 'weekDates') ?? []) as { day_date: string }[];
   return [...new Set(rows.map((r) => r.day_date))].sort();
@@ -835,6 +964,10 @@ export async function resetChatsAndAccess(): Promise<{ chats: number; access: nu
  * В статусе нужен именно второй, иначе строка про файл вводит в заблуждение.
  */
 export async function fileForDate(dateIso: string): Promise<FileRow | null> {
+  return cached(`fileForDate:${dateIso}`, () => loadFileForDate(dateIso));
+}
+
+async function loadFileForDate(dateIso: string): Promise<FileRow | null> {
   const res = await db()
     .from('files')
     .select('*')

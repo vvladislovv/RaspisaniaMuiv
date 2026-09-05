@@ -107,6 +107,22 @@ create table if not exists app_state (
   updated_at timestamptz not null default now()
 );
 
+-- Баги и предложения. Писать может кто угодно, в том числе без доступа
+-- к расписанию: чинить чужие находки полезнее, чем беречь их от чужих глаз.
+create table if not exists feedback (
+  id         bigserial primary key,
+  chat_id    bigint not null,
+  user_id    bigint not null,
+  username   text,
+  first_name text,
+  -- 'bug' или 'idea': тег видно и в уведомлении владельцу, и в сводке
+  kind       text not null,
+  text       text not null,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists feedback_recent_idx on feedback (created_at desc);
+
 -- Доступ только через service_role с сервера. Публичных политик нет.
 alter table access     enable row level security;
 alter table chats      enable row level security;
@@ -115,6 +131,7 @@ alter table schedules  enable row level security;
 alter table logs       enable row level security;
 alter table rate_limit enable row level security;
 alter table app_state  enable row level security;
+alter table feedback   enable row level security;
 
 -- Чистка старых логов и счётчиков rate limit.
 create or replace function prune_old_rows() returns void language sql as $$
