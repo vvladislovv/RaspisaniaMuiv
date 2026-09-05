@@ -29,6 +29,14 @@ export class TelegramError extends Error {
     this.name = 'TelegramError';
   }
 
+  /** Темы больше нет: её удалили или закрыли, слать в неё бесполезно. */
+  get topicIsGone(): boolean {
+    return (
+      this.code === 400 &&
+      /message thread not found|TOPIC_DELETED|TOPIC_CLOSED/i.test(this.description)
+    );
+  }
+
   /** Чат недоступен безвозвратно: бота выгнали, заблокировали, чат удалён. */
   get chatIsGone(): boolean {
     if (this.code === 403) return true;
@@ -116,6 +124,8 @@ export function sendMessage(
     silent?: boolean;
     replyTo?: number;
     plain?: boolean;
+    /** Тема форума. Без неё сообщение уходит в «Общее». */
+    threadId?: number | null;
   } = {},
 ): Promise<SentMessage> {
   return call<SentMessage>('sendMessage', {
@@ -125,6 +135,7 @@ export function sendMessage(
     disable_notification: extra.silent ?? false,
     link_preview_options: { is_disabled: true },
     reply_to_message_id: extra.replyTo,
+    message_thread_id: extra.threadId ?? undefined,
     reply_markup: extra.keyboard ? { inline_keyboard: extra.keyboard } : undefined,
   });
 }

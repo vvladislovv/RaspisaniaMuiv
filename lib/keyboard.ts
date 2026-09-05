@@ -25,6 +25,8 @@ export interface MenuOptions {
   isOwner: boolean;
   /** Имя бота для ссылки «добавить в группу». */
   username: string | null;
+  /** Группа с темами, и человек сейчас не в той теме, куда идёт расписание. */
+  offerTopic?: boolean;
 }
 
 /** Главное меню. Без выбранной группы показывать расписание нечего. */
@@ -45,6 +47,11 @@ export function menuKeyboard(opts: MenuOptions): InlineKeyboard {
     ]);
   } else {
     rows.push([{ text: '👥 Выбрать группу', callback_data: 'grp' }]);
+  }
+
+  // Тема выбирается тем, где нажали: список тем Bot API не отдаёт
+  if (opts.offerTopic) {
+    rows.push([{ text: '🧵 Слать в эту тему', callback_data: 'topic' }]);
   }
 
   // Ссылка открывает выбор группы прямо в Telegram — руками добавлять не нужно

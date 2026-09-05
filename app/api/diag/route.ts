@@ -43,6 +43,7 @@ export async function GET(request: Request): Promise<Response> {
           const week = await weekScreen(chat.chat_id, chat.groups, tomorrow);
           return {
             chat: chat.title ?? `личка ${chat.chat_id}`,
+            topic: chat.topic_id ? (chat.topic_name ?? `#${chat.topic_id}`) : null,
             stored: chat.groups,
             resolved: resolved.groups,
             missing: resolved.missing,

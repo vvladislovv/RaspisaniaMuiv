@@ -14,6 +14,7 @@ import {
   errorCount,
   migrateChat,
   setChatEnabled,
+  setChatTopic,
   toggleChatGroup,
   currentGroups,
   weekDates,
@@ -62,6 +63,8 @@ interface TgChat {
   id: number;
   type: string;
   title?: string;
+  /** Супергруппа с темами: у сообщений появляется message_thread_id. */
+  is_forum?: boolean;
 }
 
 interface TgMessageEntity {
@@ -79,6 +82,12 @@ interface TgMessage {
   entities?: TgMessageEntity[];
   /** Группа превратилась в супергруппу: чат переехал на новый идентификатор. */
   migrate_to_chat_id?: number;
+  /** Тема форума. Появляется и у обычных ответов, поэтому одного её мало. */
+  message_thread_id?: number;
+  /** Сообщение действительно лежит в теме, а не просто отвечает кому-то. */
+  is_topic_message?: boolean;
+  /** У сообщения из темы сюда попадает служебное «тема создана» с названием. */
+  reply_to_message?: { forum_topic_created?: { name?: string } };
 }
 
 interface TgCallbackQuery {
@@ -113,6 +122,34 @@ interface Context {
   isPrivate: boolean;
   isOwner: boolean;
   username: string | null;
+  /** Супергруппа с темами: можно выбрать, в какую слать расписание. */
+  isForum: boolean;
+  /** Тема, в которой человек сейчас разговаривает с ботом. */
+  threadId: number | null;
+}
+
+/**
+ * Тема форума, в которой пришло сообщение.
+ *
+ * Проверяем is_topic_message, а не только message_thread_id: в обычной
+ * супергруппе он появляется и у простого ответа на чужое сообщение, и без
+ * этой проверки бот привязался бы к «теме», которой не существует.
+ */
+function threadOf(message: TgMessage | undefined): number | null {
+  if (!message?.is_topic_message) return null;
+  return message.message_thread_id ?? null;
+}
+
+/** Название темы, если Telegram приложил его к сообщению. */
+function topicNameOf(message: TgMessage | undefined): string | null {
+  const name = message?.reply_to_message?.forum_topic_created?.name;
+  return name ? name.slice(0, 100) : null;
+}
+
+/** Как называть тему в тексте: «Общее» — это форум без выбранной темы. */
+function topicLabel(chat: Chat | null): string {
+  if (!chat?.topic_id) return 'Общее';
+  return chat.topic_name ?? `тема №${chat.topic_id}`;
 }
 
 function menuScreen(chat: Chat | null, ctx: Context): Screen {
@@ -137,6 +174,18 @@ function menuScreen(chat: Chat | null, ctx: Context): Screen {
     lines.push(esc(`Можно выбрать до ${MAX_GROUPS} групп — расписание придёт по обеим.`));
   }
 
+  // Форум: расписание без указания темы падает в «Общее» и теряется,
+  // поэтому в меню всегда видно, куда оно уходит, и как это поменять
+  if (ctx.isForum) {
+    lines.push('');
+    lines.push(`🧵 Тема для расписания: *${esc(topicLabel(chat))}*`);
+    if (ctx.threadId !== (chat?.topic_id ?? null)) {
+      lines.push(
+        `_${esc('Чтобы расписание приходило сюда, нажми «Слать в эту тему».')}_`,
+      );
+    }
+  }
+
   if (ctx.isPrivate) {
     lines.push('');
     lines.push(`*${esc('Как добавить в группу')}*`);
@@ -153,6 +202,9 @@ function menuScreen(chat: Chat | null, ctx: Context): Screen {
       isPrivate: ctx.isPrivate,
       isOwner: ctx.isOwner,
       username: ctx.username,
+      // Кнопка нужна только там, где тема отличается от выбранной: в самой
+      // выбранной теме менять нечего
+      offerTopic: ctx.isForum && ctx.threadId !== (chat?.topic_id ?? null),
     }),
   };
 }
@@ -550,7 +602,11 @@ async function groupIndex(): Promise<{
 }
 
 /** Что показывать в меню: личка это или группа, и кто нажал. */
-async function contextOf(chat: TgChat, userId?: number): Promise<Context> {
+async function contextOf(
+  chat: TgChat,
+  userId?: number,
+  message?: TgMessage,
+): Promise<Context> {
   let username: string | null = null;
   try {
     username = await botUsername();
@@ -561,6 +617,8 @@ async function contextOf(chat: TgChat, userId?: number): Promise<Context> {
     isPrivate: chat.type === 'private',
     isOwner: userId === env.adminTelegramId,
     username,
+    isForum: chat.is_forum === true,
+    threadId: threadOf(message),
   };
 }
 
@@ -706,6 +764,8 @@ async function handleMessage(message: TgMessage): Promise<void> {
   // Без этого бот, уже сидящий в группе, подключить было нечем: события
   // «бота добавили» больше не будет, а молчать — худший из вариантов.
   const chat = await getChat(chatId);
+  // Отвечать нужно в ту же тему, где спросили: иначе ответ улетит в «Общее»
+  const threadId = threadOf(message);
 
   if (!chat) {
     if (!user || !(await isApproved(user.id))) {
@@ -716,24 +776,33 @@ async function handleMessage(message: TgMessage): Promise<void> {
       await sendMessage(
         chatId,
         esc('Доступ не открыт. Напиши мне в личку и дождись одобрения.'),
-        { silent: true },
+        { silent: true, threadId },
       );
       return;
     }
 
     await upsertChat(chatId, message.chat.title ?? null, user.id);
     await setChatEnabled(chatId, true);
+
+    // Подключили из темы — значит расписание ждут именно там. Просить
+    // отдельно нажать кнопку было бы лишним шагом на пустом месте.
+    if (threadId !== null) await setChatTopic(chatId, threadId, topicNameOf(message));
+
     await log('command', `Чат подключён через /start: ${chatId}`, {
       chatId,
-      details: { userId: user.id, title: message.chat.title },
+      details: { userId: user.id, title: message.chat.title, topicId: threadId },
     });
   } else {
     await log('command', '/start', { chatId, details: { userId: user?.id } });
   }
 
   const fresh = await getChat(chatId);
-  const screen = menuScreen(fresh, await contextOf(message.chat, user?.id));
-  await sendMessage(chatId, screen.text, { silent: true, keyboard: screen.keyboard });
+  const screen = menuScreen(fresh, await contextOf(message.chat, user?.id, message));
+  await sendMessage(chatId, screen.text, {
+    silent: true,
+    keyboard: screen.keyboard,
+    threadId,
+  });
 }
 
 // ─── Кнопки ──────────────────────────────────────────────────────────────────
@@ -755,7 +824,10 @@ async function runCallback(
   }
 
   const chatId = message.chat.id;
-  const [chat, ctx] = await Promise.all([getChat(chatId), contextOf(message.chat, query.from.id)]);
+  const [chat, ctx] = await Promise.all([
+    getChat(chatId),
+    contextOf(message.chat, query.from.id, message),
+  ]);
 
   // Кнопки работают только в подключённом чате. Исключение — решения по
   // заявкам: они приходят владельцу в личку, где чата в базе может не быть.
@@ -870,6 +942,26 @@ async function runCallback(
     return;
   }
 
+  // Куда слать расписание в форуме. Списка тем Bot API не даёт, поэтому
+  // тема задаётся местом нажатия: где нажали — туда и слать.
+  if (data === 'topic') {
+    if (!(await isChatAdmin(chatId, query.from.id))) {
+      ack('Только админ чата может это менять');
+      return;
+    }
+
+    const threadId = ctx.threadId;
+    await setChatTopic(chatId, threadId, topicNameOf(message));
+    ack(threadId === null ? 'Буду слать в «Общее»' : 'Буду слать в эту тему');
+    await log('command', `Тема для расписания: ${threadId ?? 'общее'}`, {
+      chatId,
+      details: { topicId: threadId, topicName: topicNameOf(message) },
+    });
+
+    await edit(menuScreen(await getChat(chatId), ctx));
+    return;
+  }
+
   // ─── Расписание ────────────────────────────────────────────────────────────
 
   // `day:0` — сегодня, `day:1` — завтра
@@ -927,7 +1019,7 @@ async function runCallback(
 
     // Если неделя не влезла в одно сообщение — остальные части отправляем ниже
     for (const text of chunks.slice(1)) {
-      await sendMessage(chatId, text, { silent: true });
+      await sendMessage(chatId, text, { silent: true, threadId: ctx.threadId });
     }
     return;
   }
@@ -1116,10 +1208,16 @@ async function handleMembership(event: TgChatMemberUpdate): Promise<void> {
 
   // В группе напоминаем про право закреплять — без него ежедневное
   // расписание отправится, но не закрепится
-  const hint =
-    event.chat.type === 'private'
-      ? ''
-      : `\n\n_${esc('Чтобы я мог закреплять расписание, дай мне право «Закрепление сообщений».')}_`;
+  const hints: string[] = [];
+  if (event.chat.type !== 'private') {
+    hints.push(esc('Чтобы я мог закреплять расписание, дай мне право «Закрепление сообщений».'));
+  }
+  // Добавили в форум: событие приходит без темы, и расписание пошло бы
+  // в «Общее». Сказать про это надо сразу, а не когда оно туда упадёт.
+  if (event.chat.is_forum) {
+    hints.push(esc('В группе есть темы: открой нужную, напиши /start — и расписание пойдёт туда.'));
+  }
+  const hint = hints.length > 0 ? `\n\n_${hints.join(' ')}_` : '';
 
   await sendMessage(chatId, screen.text + hint, { silent: true, keyboard: screen.keyboard });
 }

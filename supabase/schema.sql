@@ -18,6 +18,10 @@ create table if not exists chats (
 );
 
 alter table chats add column if not exists pinned_date date;
+-- Супергруппа с темами: расписание должно приходить в выбранную тему,
+-- иначе оно падает в «Общее» и теряется среди чужих сообщений
+alter table chats add column if not exists topic_id bigint;
+alter table chats add column if not exists topic_name text;
 alter table chats add column if not exists groups text[] not null default '{}';
 update chats set groups = array[group_name]
   where group_name is not null and cardinality(groups) = 0;

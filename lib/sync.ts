@@ -8,6 +8,7 @@ import { parseSchedule } from './parse';
 import {
   activeChats,
   setChatEnabled,
+  setChatTopic,
   fileNameOf,
   getFileByName,
   latestFile,
@@ -34,6 +35,8 @@ import {
   pinChatMessage,
   sendMessage,
   unpinChatMessage,
+  type InlineKeyboard,
+  type SentMessage,
 } from './telegram';
 import { scheduleKeyboard } from './keyboard';
 import { dayNameOf, isSaturdayMsk, mskDateOffset, mskParts } from './time';
@@ -295,6 +298,36 @@ const SEND_CONCURRENCY = 8;
  */
 const SEND_BUDGET_MS = 45_000;
 
+/**
+ * Отправка с оглядкой на тему форума.
+ *
+ * Тему могли удалить или закрыть уже после того, как её выбрали. Ронять из-за
+ * этого рассылку нельзя: слать нечем — значит слать в «Общее», а настройку
+ * забыть, чтобы в следующий раз не биться в ту же стену.
+ */
+async function sendToTopic(
+  chat: Chat,
+  text: string,
+  keyboard: InlineKeyboard,
+): Promise<SentMessage> {
+  try {
+    return await sendMessage(chat.chat_id, text, {
+      silent: false,
+      keyboard,
+      threadId: chat.topic_id,
+    });
+  } catch (error) {
+    if (!(chat.topic_id && error instanceof TelegramError && error.topicIsGone)) throw error;
+
+    await setChatTopic(chat.chat_id, null);
+    await log('skip', `Тема ${chat.topic_id} в чате ${chat.chat_id} недоступна`, {
+      chatId: chat.chat_id,
+      details: { reason: error.description },
+    });
+    return sendMessage(chat.chat_id, text, { silent: false, keyboard });
+  }
+}
+
 /** Отправляет расписание одному чату. Возвращает, удалось ли. */
 async function sendToChat(
   chat: Chat,
@@ -308,10 +341,7 @@ async function sendToChat(
     const rendered = await renderDay(chat.chat_id, groups, dateIso, weeks);
 
     // Кнопки и под закреплённым сообщением: можно листать дни, не набирая команды
-    const message = await sendMessage(chat.chat_id, rendered.text, {
-      silent: false,
-      keyboard: rendered.keyboard,
-    });
+    const message = await sendToTopic(chat, rendered.text, rendered.keyboard);
 
     // Дату помечаем сразу после отправки, до закрепления: она означает
     // «за этот день уже отправлено», и по ней рассылка продолжается с места

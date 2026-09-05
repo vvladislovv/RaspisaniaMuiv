@@ -107,6 +107,40 @@ function message(
   };
 }
 
+/** Сообщение внутри темы форума. */
+function forumMessage(
+  text: string,
+  from: number,
+  chatId: number,
+  threadId: number | null,
+  topicName?: string,
+): TgUpdate {
+  const base = message(text, from, chatId);
+  base.message!.chat.is_forum = true;
+  if (threadId !== null) {
+    base.message!.message_thread_id = threadId;
+    base.message!.is_topic_message = true;
+    if (topicName) base.message!.reply_to_message = { forum_topic_created: { name: topicName } };
+  }
+  return base;
+}
+
+/** Нажатие кнопки под сообщением, которое лежит в теме форума. */
+function forumButton(
+  data: string,
+  from: number,
+  chatId: number,
+  threadId: number | null,
+): TgUpdate {
+  const base = button(data, from, chatId);
+  base.callback_query!.message!.chat.is_forum = true;
+  if (threadId !== null) {
+    base.callback_query!.message!.message_thread_id = threadId;
+    base.callback_query!.message!.is_topic_message = true;
+  }
+  return base;
+}
+
 /** Событие «бота добавили в чат» или «убрали из чата». */
 function membership(status: string, from = OWNER, chatId = CHAT, type = 'supergroup'): TgUpdate {
   return {
@@ -210,6 +244,15 @@ async function goneChats(chats: number[]): Promise<void> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ chats }),
+  });
+}
+
+/** Помечает темы как удалённые: отправка в них получает 400. */
+async function goneTopics(topics: number[]): Promise<void> {
+  await fetch(`${process.env.TELEGRAM_API_BASE}/bot/__gone`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ topics }),
   });
 }
 
@@ -1237,6 +1280,96 @@ ok(
   ),
   `без force решение принято по времени: ${notForced.autoSend}`,
 );
+
+// ─── Группы с темами ─────────────────────────────────────────────────────────
+
+await resetRateLimit();
+head('Форум: расписание уходит в выбранную тему');
+{
+  const FORUM = -100777100;
+  const TOPIC = 42;
+  const OTHER = 77;
+  const { toggleChatGroup } = await import('../lib/db');
+
+  // Подключение прямо из темы: где написали /start — туда и слать
+  m = mark();
+  await handleUpdate(forumMessage('/start', OWNER, FORUM, TOPIC, 'Расписание'));
+  let out = since(m);
+  let forum = await getChat(FORUM);
+  ok(forum?.topic_id === TOPIC, 'тема запомнена при подключении');
+  ok(forum?.topic_name === 'Расписание', 'название темы сохранено');
+  ok(
+    sent(out).some((c) => c.body.chat_id === FORUM && c.body.message_thread_id === TOPIC),
+    'ответ пришёл в ту же тему, а не в «Общее»',
+  );
+  ok(texts(out).join('').includes('Тема для расписания'), 'в меню видно, куда идёт расписание');
+  ok(!find(keyboardOf(out), 'эту тему'), 'в самой выбранной теме менять нечего');
+
+  // Меню, открытое в другой теме, предлагает переключиться
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(forumMessage('/start', OWNER, FORUM, OTHER, 'Флудилка'));
+  ok(!!find(keyboardOf(since(m)), 'эту тему'), 'из другой темы предлагается переключить');
+
+  // Обычный участник настройку не меняет
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(forumButton('topic', STRANGER, FORUM, OTHER));
+  ok(
+    String(since(m).findLast((c) => c.method === 'answerCallbackQuery')?.body.text ?? '').includes(
+      'админ',
+    ),
+    'менять тему может только админ чата',
+  );
+  ok((await getChat(FORUM))?.topic_id === TOPIC, 'тема осталась прежней');
+
+  // Админ переключает нажатием внутри нужной темы
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(forumButton('topic', OWNER, FORUM, OTHER));
+  ok((await getChat(FORUM))?.topic_id === OTHER, 'админ переключил тему нажатием в ней');
+
+  // Автоотправка уважает выбор
+  await toggleChatGroup(FORUM, groups[0].group);
+  await setPinnedMessage(FORUM, null, '2020-01-01');
+  await resetRateLimit();
+  m = mark();
+  await tick(true);
+  out = since(m).filter((c) => c.body.chat_id === FORUM);
+  ok(
+    sent(out).some((c) => !c.failed && c.body.message_thread_id === OTHER),
+    'расписание пришло в выбранную тему',
+  );
+
+  // Тему удалили: расписание всё равно должно дойти, а настройку забываем
+  await goneTopics([OTHER]);
+  await setPinnedMessage(FORUM, null, '2020-01-01');
+  await resetRateLimit();
+  m = mark();
+  await tick(true);
+  out = since(m).filter((c) => c.body.chat_id === FORUM);
+  ok(
+    out.some((c) => c.body.message_thread_id === OTHER && c.failed),
+    'в удалённую тему Telegram не пускает',
+  );
+  ok(
+    sent(out).some((c) => !c.failed && c.body.message_thread_id === undefined),
+    'расписание всё равно ушло — в «Общее»',
+  );
+  ok((await getChat(FORUM))?.topic_id === null, 'мёртвая тема забыта');
+  await goneTopics([]);
+
+  // В обычной группе ничего этого быть не должно
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(message('/start', OWNER));
+  out = since(m);
+  ok(!texts(out).join('').includes('Тема для расписания'), 'в группе без тем про темы молчим');
+  ok(
+    sent(out).every((c) => c.body.message_thread_id === undefined),
+    'и тему в отправку не подставляем',
+  );
+}
 
 console.log(failures ? `\nПРОВАЛЕНО ПРОВЕРОК: ${failures}\n` : '\nВсе проверки прошли\n');
 process.exitCode = failures ? 1 : 0;

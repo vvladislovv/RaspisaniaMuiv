@@ -23,7 +23,14 @@ const PRIMARY_KEYS = {
 
 /** Значения по умолчанию из schema.sql — заглушка их не знает сама. */
 const COLUMN_DEFAULTS = {
-  chats: { enabled: true, group_name: null, pinned_msg_id: null, title: null },
+  chats: {
+    enabled: true,
+    group_name: null,
+    pinned_msg_id: null,
+    title: null,
+    topic_id: null,
+    topic_name: null,
+  },
   files: { parsed_ok: false, parse_error: null, week_start: null, site_updated: null },
   logs: { chat_id: null, details: null, duration_ms: null },
   rate_limit: { count: 0 },

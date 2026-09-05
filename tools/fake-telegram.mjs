@@ -27,6 +27,9 @@ let failing = new Set();
  */
 let gone = new Set();
 
+/** Темы, которых «больше нет»: отправка в них получает 400. */
+let goneTopics = new Set();
+
 /** Последний текст правки на чат — чтобы изображать «message is not modified». */
 const lastEdit = new Map();
 
@@ -73,9 +76,11 @@ http
       }
 
       if (method === '__gone') {
-        gone = new Set((raw ? JSON.parse(raw).chats : []).map(String));
+        const payload = raw ? JSON.parse(raw) : {};
+        gone = new Set((payload.chats ?? []).map(String));
+        goneTopics = new Set((payload.topics ?? []).map(String));
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, gone: [...gone] }));
+        res.end(JSON.stringify({ ok: true, gone: [...gone], goneTopics: [...goneTopics] }));
         return;
       }
 
@@ -90,6 +95,23 @@ http
             ok: false,
             error_code: 403,
             description: 'Forbidden: bot is not a member of the supergroup chat',
+          }),
+        );
+        return;
+      }
+
+      if (
+        body.message_thread_id !== undefined &&
+        goneTopics.has(String(body.message_thread_id))
+      ) {
+        calls.push({ method, body, failed: true });
+        writeFileSync(logPath, JSON.stringify(calls, null, 2));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            ok: false,
+            error_code: 400,
+            description: 'Bad Request: message thread not found',
           }),
         );
         return;

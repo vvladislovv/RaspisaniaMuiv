@@ -97,6 +97,10 @@ export interface Chat {
   pinned_msg_id: number | null;
   /** Какой день показывает закреплённое сообщение. */
   pinned_date: string | null;
+  /** Тема форума, в которую слать расписание. null — обычный чат или «Общее». */
+  topic_id: number | null;
+  /** Название темы, если Telegram его показал: в меню оно понятнее номера. */
+  topic_name: string | null;
 }
 
 /** Сколько групп разрешено выбрать одному чату. */
@@ -169,6 +173,25 @@ export async function setChatEnabled(chatId: number, enabled: boolean): Promise<
     .eq('chat_id', chatId)
     .select('chat_id');
   check(res, 'setChatEnabled');
+}
+
+/**
+ * Запоминает тему форума для расписания.
+ *
+ * Список тем Bot API не отдаёт, поэтому тема задаётся тем, что человек
+ * нажимает кнопку внутри неё: куда нажал — туда и слать.
+ */
+export async function setChatTopic(
+  chatId: number,
+  topicId: number | null,
+  topicName: string | null = null,
+): Promise<void> {
+  const res = await db()
+    .from('chats')
+    .update({ topic_id: topicId, topic_name: topicName, updated_at: new Date().toISOString() })
+    .eq('chat_id', chatId)
+    .select('chat_id');
+  check(res, 'setChatTopic');
 }
 
 export async function setPinnedMessage(
