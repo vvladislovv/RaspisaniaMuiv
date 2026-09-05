@@ -76,3 +76,14 @@ export function mondayOf(isoDate: string): string {
   dt.setUTCDate(dt.getUTCDate() - shift);
   return dt.toISOString().slice(0, 10);
 }
+
+/**
+ * Дата, по которой выбирается «текущая» неделя.
+ *
+ * В субботу пары ещё есть и файл недели ещё бывает обновляют — неделю не
+ * трогаем. А в воскресенье она уже прожита: людям нужна следующая, поэтому
+ * отсчёт ведём от понедельника.
+ */
+export function weekAnchor(now: Date = new Date()): string {
+  return mskParts(now).weekday === 0 ? mskDateOffset(1, now) : mskToday(now);
+}

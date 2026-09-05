@@ -40,11 +40,12 @@ import {
   editMessageText,
   isChatAdmin,
   sendMessage,
+  TelegramError,
   type InlineKeyboard,
 } from './telegram';
 import { emojiTag, esc, formatDayFor, formatWeek, humanDate, type GroupDay } from './format';
 import { groupKeyboard, menuKeyboard, scheduleKeyboard, sheetKeyboard, statusKeyboard } from './keyboard';
-import { dayNameOf, mskDateOffset, mskStamp, mskToday } from './time';
+import { dayNameOf, mskDateOffset, mskStamp, mskToday, weekAnchor } from './time';
 import type { Day } from './parse';
 import { env } from './env';
 import { LAST_CHECK_KEY } from './sync';
@@ -260,7 +261,7 @@ async function adminScreen(): Promise<Screen> {
     chatStats(),
     errorCount(24),
     getState<{ at: string; filesOnSite: number; errors: string[] }>(LAST_CHECK_KEY),
-    fileForDate(mskToday()),
+    fileForDate(weekAnchor()),
     accessCounts(),
     pendingRequests(8),
   ]);
@@ -433,7 +434,7 @@ export async function weekScreen(
 }
 
 async function statusScreen(chat: Chat | null): Promise<Screen> {
-  const today = mskToday();
+  const today = weekAnchor();
   const [file, newest, check] = await Promise.all([
     // Файл, по которому отвечаем сегодня, а не самый поздний на сайте:
     // на странице лежат две недели сразу, и путать их нельзя
@@ -898,14 +899,14 @@ async function runCallback(
     ack();
 
     if (key === 'all') {
-      const { chunks, keyboard } = await weekScreen(chatId, groups, mskToday());
+      const { chunks, keyboard } = await weekScreen(chatId, groups, weekAnchor());
       await editMessageText(chatId, message.message_id, chunks[0], keyboard);
       return;
     }
 
     let dateIso = key;
     if (/^\d+$/.test(key)) {
-      const { days } = await getWeek(groups[0], mskToday());
+      const { days } = await getWeek(groups[0], weekAnchor());
       dateIso = days[Number(key)]?.date ?? mskToday();
     }
 
@@ -920,7 +921,7 @@ async function runCallback(
 
     ack();
 
-    const from = data === 'week' ? mskToday() : data.slice(2);
+    const from = data === 'week' ? weekAnchor() : data.slice(2);
     const { chunks, keyboard } = await weekScreen(chatId, groups, from);
     await editMessageText(chatId, message.message_id, chunks[0], keyboard);
 
@@ -1042,7 +1043,7 @@ async function runCallback(
     const { chunks, keyboard } = await weekScreen(
       chatId,
       chosen,
-      dateIso || mskToday(),
+      dateIso || weekAnchor(),
       Number(indexRaw) || 0,
     );
     await editMessageText(chatId, message.message_id, chunks[0], keyboard);
@@ -1138,6 +1139,16 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
   }
 }
 
+/** Чат апдейта — нужен только для журнала, поэтому без разбора всех видов. */
+function chatIdOf(update: TgUpdate): number | null {
+  return (
+    update.message?.chat.id ??
+    update.callback_query?.message?.chat.id ??
+    update.my_chat_member?.chat.id ??
+    null
+  );
+}
+
 /** Точка входа для вебхука. Никогда не бросает — Telegram не должен ретраить. */
 export async function handleUpdate(update: TgUpdate): Promise<void> {
   const started = Date.now();
@@ -1152,6 +1163,19 @@ export async function handleUpdate(update: TgUpdate): Promise<void> {
       });
     } else if (update.my_chat_member) await handleMembership(update.my_chat_member);
   } catch (error) {
+    // Чата уже нет: бота выгнали или он сам ушёл, пока апдейт лежал в очереди.
+    // Так бывает при добавлении по ссылке «➕ Добавить в группу»: Telegram
+    // присылает и «бота добавили», и /start, а необладатель доступа получает
+    // отказ и выход из чата — второй апдейт неизбежно упирается в 403.
+    // Это не поломка, будить владельца незачем — хватит записи в журнале.
+    if (error instanceof TelegramError && error.chatIsGone) {
+      await log('skip', `Апдейт из недоступного чата: ${error.description}`, {
+        chatId: chatIdOf(update),
+        details: { update: JSON.stringify(update).slice(0, 1000) },
+      });
+      return;
+    }
+
     await logError('Обработка апдейта Telegram', error, {
       update: JSON.stringify(update).slice(0, 1000),
     });

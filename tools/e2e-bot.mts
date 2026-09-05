@@ -204,6 +204,15 @@ async function failMethods(methods: string[]): Promise<void> {
   });
 }
 
+/** Помечает чаты как недоступные: дублёр отвечает по ним 403. */
+async function goneChats(chats: number[]): Promise<void> {
+  await fetch(`${process.env.TELEGRAM_API_BASE}/bot/__gone`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chats }),
+  });
+}
+
 /**
  * Наполняет базу из локального файла-фикстуры. Нужен, когда сайт МУИВ
  * недоступен: проверки поведения бота не должны зависеть от чужого сервера.
@@ -324,6 +333,29 @@ ok(
 );
 ok(denied_.some((c) => c.method === 'leaveChat'), 'и покидает чат');
 ok((await getChat(-991)) === null, 'чат в базе не создан');
+
+head('Апдейт из чата, откуда бота уже выгнали');
+await resetAlerts();
+await resetRateLimit();
+{
+  const GONE = -992;
+  await goneChats([GONE]);
+  m = mark();
+  // Так выглядит добавление по ссылке «➕ Добавить в группу»: Telegram шлёт
+  // сразу два апдейта — «бота добавили» и /start. Первый выгоняет бота из
+  // чужого чата, второй неизбежно упирается в 403. Это не поломка.
+  await handleUpdate(message('/start@fake_bot true', STRANGER, GONE));
+  const raced = since(m);
+  ok(
+    raced.some((c) => c.method === 'sendMessage' && c.body.chat_id === GONE && c.failed),
+    'ответ в недоступный чат ожидаемо отклонён',
+  );
+  ok(
+    sent(raced).every((c) => c.body.chat_id !== OWNER),
+    'но владельцу алерт об этом не уходит',
+  );
+  await goneChats([]);
+}
 
 head('Владелец одобряет заявку');
 await resetRateLimit();

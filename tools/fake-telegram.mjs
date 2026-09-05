@@ -20,6 +20,13 @@ let messageId = 1000;
  */
 let failing = new Set();
 
+/**
+ * Чаты, из которых бота «выгнали»: любой вызов к ним получает 403.
+ * Управляется запросом на /__gone — так проверяется, что бот не будит
+ * владельца из-за апдейта из недоступного чата.
+ */
+let gone = new Set();
+
 /** Последний текст правки на чат — чтобы изображать «message is not modified». */
 const lastEdit = new Map();
 
@@ -65,7 +72,28 @@ http
         return;
       }
 
+      if (method === '__gone') {
+        gone = new Set((raw ? JSON.parse(raw).chats : []).map(String));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, gone: [...gone] }));
+        return;
+      }
+
       const body = raw ? JSON.parse(raw) : {};
+
+      if (body.chat_id !== undefined && gone.has(String(body.chat_id))) {
+        calls.push({ method, body, failed: true });
+        writeFileSync(logPath, JSON.stringify(calls, null, 2));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            ok: false,
+            error_code: 403,
+            description: 'Forbidden: bot is not a member of the supergroup chat',
+          }),
+        );
+        return;
+      }
 
       if (failing.has(method)) {
         calls.push({ method, body, failed: true });
