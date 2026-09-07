@@ -145,7 +145,18 @@ async function tryOpenSession(): Promise<{ session: Session; html: string } | st
 
     if (!res.ok) return `сайт ответил ${res.status} (${trace.join(',')})`;
 
-    const html = await res.text();
+    // Чтение тела — та же сеть, что и запрос: обрыв на середине страницы
+    // выглядел бы как исключение мимо всех повторов, и одна оборванная
+    // загрузка означала бы потерянную проверку. Возвращаем причину строкой,
+    // чтобы openSession начал заново с чистой сессией.
+    let html: string;
+    try {
+      html = await res.text();
+    } catch (error) {
+      const cause = (error as { cause?: { code?: string } })?.cause?.code;
+      return `страница не дочиталась: ${cause ?? (error instanceof Error ? error.message : String(error))}`;
+    }
+
     trace.push(`${res.status}/${html.length}`);
 
     if (!isChallenge(html)) return { session, html };

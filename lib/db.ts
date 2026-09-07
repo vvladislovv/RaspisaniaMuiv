@@ -1,4 +1,5 @@
 /** Доступ к Supabase. Только серверный ключ, только с сервера. */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { env } from './env';
 import type { Day, Lesson, Workbook } from './parse';
@@ -97,29 +98,33 @@ function check<T>(
  * из памяти. Кэш живёт только внутри вызова: между тиками файл мог поменяться,
  * и держать его дольше было бы враньём.
  */
-let readCache: Map<string, Promise<unknown>> | null = null;
+/**
+ * Кэш живёт в контексте вызова, а не в переменной модуля.
+ *
+ * Vercel может выполнять два вызова функции в одном процессе одновременно —
+ * например, часовой тик задержался и наложился на следующий. С общей
+ * переменной они перетирали бы кэш друг другу, а в худшем случае один
+ * оставлял бы свой кэш висеть навсегда, и все дальнейшие запросы получали бы
+ * устаревшее расписание. AsyncLocalStorage даёт каждому вызову своё хранилище.
+ */
+const cacheStore = new AsyncLocalStorage<Map<string, Promise<unknown>>>();
 
-export async function withReadCache<T>(fn: () => Promise<T>): Promise<T> {
-  const previous = readCache;
-  readCache = new Map();
-  try {
-    return await fn();
-  } finally {
-    readCache = previous;
-  }
+export function withReadCache<T>(fn: () => Promise<T>): Promise<T> {
+  return cacheStore.run(new Map(), fn);
 }
 
 function cached<T>(key: string, load: () => Promise<T>): Promise<T> {
-  if (!readCache) return load();
+  const store = cacheStore.getStore();
+  if (!store) return load();
 
-  const hit = readCache.get(key) as Promise<T> | undefined;
+  const hit = store.get(key) as Promise<T> | undefined;
   if (hit) return hit;
 
   const fresh = load();
-  readCache.set(key, fresh);
+  store.set(key, fresh);
   // Разовый сбой не должен утащить за собой всю рассылку: неудачную попытку
   // забываем, следующий желающий сходит в базу заново
-  fresh.catch(() => readCache?.delete(key));
+  fresh.catch(() => store.delete(key));
   return fresh;
 }
 

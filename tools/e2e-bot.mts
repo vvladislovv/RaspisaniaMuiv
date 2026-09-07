@@ -71,6 +71,7 @@ function calls(): Call[] {
   }
 }
 
+const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const mark = (): number => calls().length;
 const since = (from: number): Call[] => calls().slice(from);
 const sent = (list: Call[]) => list.filter((c) => c.method === 'sendMessage');
@@ -1436,6 +1437,64 @@ head('Расписание читается один раз на всю расс
   // Без общего кэша один только список групп читался бы по разу на чат.
   // Порог с запасом: важно, что число не растёт вместе с числом чатов.
   ok(reads <= 6, `таблица расписания прочитана ${reads} раз на ${before.sent} чатов`);
+}
+
+// ─── Кэш чтений ──────────────────────────────────────────────────────────────
+
+head('Кэш не протекает между одновременными вызовами');
+{
+  const { withReadCache, listGroups: read } = await import('../lib/db');
+
+  // Внутри одного вызова список групп читается один раз
+  await resetDbHits();
+  await withReadCache(async () => {
+    await read();
+    await read();
+    await read();
+  });
+  ok((await dbHits('schedules')) === 1, 'внутри одного вызова — одно чтение');
+
+  // Два наложившихся вызова: важно, что начатый раньше кончается раньше —
+  // именно так общая переменная модуля оставляла свой кэш висеть навсегда,
+  // и все дальнейшие запросы получали бы устаревшее расписание
+  await resetDbHits();
+  let letAFinish: () => void = () => {};
+  let letBFinish: () => void = () => {};
+  const aGate = new Promise<void>((r) => {
+    letAFinish = r;
+  });
+  const bGate = new Promise<void>((r) => {
+    letBFinish = r;
+  });
+
+  const a = withReadCache(async () => {
+    await read();
+    await aGate;
+  });
+  await pause(80); // дать A прочитать и встать на ожидание
+
+  const b = withReadCache(async () => {
+    await read();
+    await bGate;
+    await read(); // должно взяться из собственного кэша B
+  });
+  await pause(80);
+
+  letAFinish();
+  await a; // A закончился, пока B ещё работает
+
+  letBFinish();
+  await b;
+
+  const overlapped = await dbHits('schedules');
+  ok(overlapped === 2, `у каждого вызова свой кэш: чтений ${overlapped}`);
+
+  // Ничего не осталось висеть: вне вызова чтение снова идёт в базу
+  await resetDbHits();
+  await read();
+  await read();
+  const outside = await dbHits('schedules');
+  ok(outside === 2, `вне вызова кэш не действует: чтений ${outside}`);
 }
 
 // ─── Баги и предложения ──────────────────────────────────────────────────────
