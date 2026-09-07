@@ -1313,6 +1313,46 @@ ok(
   `без force решение принято по времени: ${notForced.autoSend}`,
 );
 
+// ─── Сбои сайта МУИВ ─────────────────────────────────────────────────────────
+
+await resetRateLimit();
+await resetAlerts();
+head('Один промах сайта не будит владельца');
+{
+  const { noteFileFailure, noteFileOk } = await import('../lib/sync');
+  const title = 'Проверочный файл';
+  await fetch(`${process.env.SUPABASE_URL}/rest/v1/app_state?key=like.siteFail:*`, {
+    method: 'DELETE',
+    headers: { apikey: 'fake', Authorization: 'Bearer fake' },
+  });
+
+  m = mark();
+  await noteFileFailure(title, new Error('The operation was aborted due to timeout'));
+  ok(
+    sent(since(m)).every((c) => c.body.chat_id !== OWNER),
+    'первый промах владельцу не уходит',
+  );
+
+  m = mark();
+  await noteFileFailure(title, new Error('The operation was aborted due to timeout'));
+  ok(
+    sent(since(m)).some(
+      (c) => c.body.chat_id === OWNER && String(c.body.text).includes('Скачивание файла'),
+    ),
+    'второй промах подряд — уже алерт',
+  );
+
+  // Удачное скачивание обнуляет серию: следующий одиночный промах снова молчит
+  await resetAlerts();
+  await noteFileOk(title);
+  m = mark();
+  await noteFileFailure(title, new Error('The operation was aborted due to timeout'));
+  ok(
+    sent(since(m)).every((c) => c.body.chat_id !== OWNER),
+    'после успешной проверки серия обнулилась',
+  );
+}
+
 // ─── Привязка групп к чатам ──────────────────────────────────────────────────
 
 await resetRateLimit();

@@ -17,6 +17,7 @@ import {
   setPinnedMessage,
   setState,
   getState,
+  clearState,
   touchFile,
   upsertFile,
   getWeek,
@@ -120,6 +121,42 @@ async function ingest(
 }
 
 /** Проверяет сайт и обновляет БД. Возвращает список изменившихся файлов. */
+/**
+ * Будить ли владельца на N-м подряд сбое одного файла.
+ *
+ * Чужой сервер иногда отвечает медленно, и следующая проверка через час
+ * обычно проходит — расписание в базе от одного промаха не устаревает.
+ * Поэтому первый промах молчит, со второго (файл недоступен больше часа)
+ * приходит алерт, а дальше напоминание раз в двенадцать часов, чтобы
+ * многодневная авария сайта не превратилась в поток сообщений.
+ */
+export function shouldAlertOnStreak(streak: number): boolean {
+  return streak === 2 || (streak > 2 && streak % 12 === 0);
+}
+
+const failKey = (title: string): string => `siteFail:${title}`.slice(0, 200);
+
+/** Записывает сбой скачивания и решает, беспокоить ли владельца. */
+export async function noteFileFailure(title: string, error: unknown): Promise<void> {
+  const key = failKey(title);
+  const streak = ((await getState<number>(key)) ?? 0) + 1;
+  await setState(key, streak);
+
+  if (shouldAlertOnStreak(streak)) {
+    await logError(`Скачивание файла «${title}»`, error, { streak });
+    return;
+  }
+
+  await log('skip', `Файл «${title}» не скачался, попробуем через час`, {
+    details: { streak, reason: error instanceof Error ? error.message : String(error) },
+  });
+}
+
+/** Файл снова читается — серия сбоев кончилась. */
+export async function noteFileOk(title: string): Promise<void> {
+  if ((await getState<number>(failKey(title))) !== null) await clearState(failKey(title));
+}
+
 export async function checkSite(): Promise<CheckResult> {
   const started = Date.now();
   const result: CheckResult = { filesOnSite: 0, changed: [], errors: [] };
@@ -161,10 +198,11 @@ export async function checkSite(): Promise<CheckResult> {
       const outcome = await ingest(file, site.download);
       if (outcome.changed) result.changed.push(file.title);
       if (outcome.error) result.errors.push(`${file.title}: ${outcome.error}`);
+      await noteFileOk(file.title);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       result.errors.push(`${file.title}: ${message}`);
-      await logError(`Скачивание файла «${file.title}»`, error);
+      await noteFileFailure(file.title, error);
     }
   }
 

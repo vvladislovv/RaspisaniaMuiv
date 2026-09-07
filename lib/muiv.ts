@@ -15,6 +15,17 @@ const ALLOWED_HOST = 'www.muiv.ru';
 
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 15_000;
+
+/**
+ * Срок одной попытки скачивания и общий срок на файл.
+ *
+ * Обычно оба файла целиком проверяются за две-четыре секунды, так что десяти
+ * секунд на попытку хватает с десятикратным запасом. Общий срок нужен, чтобы
+ * повторы не съели минуту, отведённую функции: после него честнее вернуться
+ * с ошибкой и повторить всё через час.
+ */
+const DOWNLOAD_TIMEOUT_MS = 10_000;
+const DOWNLOAD_BUDGET_MS = 20_000;
 const MAX_ATTEMPTS = 6;
 
 /** Тот же расчёт, что в `get_jhash` на странице-заглушке. */
@@ -77,11 +88,13 @@ class Session {
     this.jar.set('__jua_', encodeUa(UA));
   }
 
-  async fetch(url: string, accept: string): Promise<Response> {
+  async fetch(url: string, accept: string, timeoutMs = REQUEST_TIMEOUT_MS): Promise<Response> {
     const u = assertAllowed(url);
     const res = await fetch(u, {
       redirect: 'manual', // сайт после решения защиты редиректит на себя же
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      // Таймаут покрывает и заголовки, и чтение тела: страница приходит быстро,
+      // а файл — как повезёт, поэтому у скачивания срок свой
+      signal: AbortSignal.timeout(timeoutMs),
       headers: {
         'User-Agent': UA,
         Accept: accept,
@@ -232,24 +245,32 @@ export async function fetchSite(): Promise<SiteSnapshot> {
     files,
     async download(file: SiteFile): Promise<Buffer> {
       const attempts = 4;
+      const deadline = Date.now() + DOWNLOAD_BUDGET_MS;
       let lastNetworkError: string | null = null;
 
+      /** Сетевой сбой — повод попробовать ещё раз, а не уронить проверку. */
+      const networkFailed = async (error: unknown, attempt: number): Promise<void> => {
+        const cause = (error as { cause?: { code?: string } })?.cause?.code;
+        lastNetworkError = cause ?? (error instanceof Error ? error.message : String(error));
+        if (attempt < attempts && Date.now() < deadline) await sleep(700 * attempt);
+      };
+
       for (let attempt = 1; attempt <= attempts; attempt++) {
+        if (Date.now() > deadline) break;
+
         let res: Response;
         try {
           res = await session.fetch(
             file.url,
             'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*',
+            DOWNLOAD_TIMEOUT_MS,
           );
         } catch (error) {
-          // Обрыв соединения на полпути — обычное дело для чужого сервера.
-          // Повторяем с паузой, а не роняем всю проверку.
-          const cause = (error as { cause?: { code?: string } })?.cause?.code;
-          lastNetworkError = cause ?? (error instanceof Error ? error.message : String(error));
-          if (attempt < attempts) await sleep(700 * attempt);
+          await networkFailed(error, attempt);
           continue;
         }
 
+        // Разбор ответа: тут ошибки настоящие, повторять их бессмысленно
         if (res.status >= 300 && res.status < 400) {
           const loc = res.headers.get('location');
           if (!loc) throw new Error('Редирект без Location');
@@ -270,7 +291,17 @@ export async function fetchSite(): Promise<SiteSnapshot> {
           throw new Error(`Файл ${file.title} слишком большой: ${declared} байт`);
         }
 
-        const buf = Buffer.from(await res.arrayBuffer());
+        // Чтение тела — тоже сеть, и тоже под сроком запроса. Раньше оно шло
+        // без повторов: один медленный ответ сайта означал потерянную проверку
+        // и разбуженного владельца, хотя следующая попытка обычно проходит.
+        let buf: Buffer;
+        try {
+          buf = Buffer.from(await res.arrayBuffer());
+        } catch (error) {
+          await networkFailed(error, attempt);
+          continue;
+        }
+
         if (buf.byteLength > MAX_FILE_BYTES) {
           throw new Error(`Файл ${file.title} слишком большой: ${buf.byteLength} байт`);
         }

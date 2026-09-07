@@ -10,10 +10,15 @@
  *   npx tsx tools/e2e-local.mts
  */
 import { checkSite } from '../lib/sync';
-import { getDay, getWeek, latestFile, listGroups, recentLogs, upsertChat, setChatGroup, getChat } from '../lib/db';
+import { getDay, getWeek, latestFile, listGroups, recentLogs, upsertChat, toggleChatGroup, getChat } from '../lib/db';
 import { formatDay } from '../lib/format';
 
-const GROUP = process.env.E2E_GROUP ?? 'ИСП/П-24-11';
+/**
+ * Группу берём из файла, а не из константы: колледж их переименовывает
+ * (было «ИСП/П-24-11», стало «ИСП/п 23-09.1»), и захардкоженное имя гарантированно
+ * рассыпется. Конкретную можно задать через E2E_GROUP.
+ */
+const WANTED = process.env.E2E_GROUP ?? null;
 const CHAT_ID = Number(process.env.E2E_CHAT_ID ?? '-1');
 
 function head(title: string) {
@@ -53,7 +58,11 @@ const sheets = [...new Set(groups.map((g) => g.sheet))];
 console.log(`  групп: ${groups.length}, курсов (листов): ${sheets.length}`);
 console.log(`  курсы: ${sheets.join(' | ')}`);
 ok(groups.length > 50, 'групп больше пятидесяти');
-ok(groups.some((g) => g.group === GROUP), `группа ${GROUP} есть в списке`);
+const GROUP = WANTED ?? groups[0]?.group ?? '';
+ok(!!GROUP, `взята группа из файла: ${GROUP}`);
+if (WANTED) {
+  ok(groups.some((g) => g.group === WANTED), `заданная группа ${WANTED} есть в списке`);
+}
 
 head(`Неделя группы ${GROUP} из базы`);
 const week = await getWeek(GROUP, '2026-08-31');
@@ -89,10 +98,11 @@ if (target) {
 head('Привязка чата к группе');
 if (CHAT_ID !== -1) {
   await upsertChat(CHAT_ID, 'Проверочный чат');
-  await setChatGroup(CHAT_ID, GROUP);
+  // Групп у чата может быть две, поэтому выбор — переключателем
+  await toggleChatGroup(CHAT_ID, GROUP);
   const chat = await getChat(CHAT_ID);
-  console.log(`  чат ${CHAT_ID} -> ${chat?.group_name}`);
-  ok(chat?.group_name === GROUP, 'группа сохранилась в базе');
+  console.log(`  чат ${CHAT_ID} -> ${(chat?.groups ?? []).join(', ')}`);
+  ok((chat?.groups ?? []).includes(GROUP), 'группа сохранилась в базе');
   ok(chat?.enabled === true, 'чат включён');
 } else {
   console.log('  пропущено: не задан E2E_CHAT_ID');
