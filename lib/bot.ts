@@ -600,7 +600,7 @@ async function statusScreen(chat: Chat | null): Promise<Screen> {
 
   if (check) {
     lines.push(`Последняя проверка сайта: ${esc(mskStamp(new Date(check.at)))}`);
-    lines.push(`Файлов на странице: ${check.filesOnSite}`);
+    lines.push(`Групп проверено: ${check.filesOnSite}`);
     if (check.errors.length > 0) {
       lines.push(`⚠️ ${esc(check.errors.join('; ').slice(0, 300))}`);
     }

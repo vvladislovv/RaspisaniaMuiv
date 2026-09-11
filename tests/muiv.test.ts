@@ -1,34 +1,35 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { jhash, parseFileList } from '../lib/muiv';
+import { parseGroupTable } from '../lib/muiv';
 
-test('jhash совпадает со значениями из браузера', () => {
-  // Пары (код из куки __js_p_, хеш, который поставил браузер) — снято с живого сайта
-  assert.equal(jhash(311), 115);
-  assert.equal(jhash(430), 724);
+// Фрагмент `ttable`, снятый вживую с ajax.php (el=groupnames) для реальной группы
+const TTABLE = `<h2>08.09.2026 (вторник)</h2><div class="tableScroll"><TABLE><TBODY><tr class="th-1"><td><b>Время занятия</b></td><td><b>Группа</b></td><td><b>Дисциплина</b></td><td><b>Аудитория</b></td><td><b>Вид занятия</b></td><td><b>Преподаватель</b></td></tr><tr><td>12:05-13:35</td><td style="white-space: nowrap;">к/о/к БАД-26-09</td><td>Математика</td><td>ауд.206 (колледж)</td><td>Семинары ИПЗ</td><td>Кириллаева Мария Александровна</td></tr><tr><td>13:45-15:15</td><td style="white-space: nowrap;">к/о/к БАД-26-09</td><td>Математика</td><td>ауд.206 (колледж)</td><td>Семинары ИПЗ</td><td>Кириллаева Мария Александровна</td></tr></TBODY></TABLE></div><h2>09.09.2026 (среда)</h2><div class="tableScroll"><TABLE><TBODY><tr class="th-1"><td><b>Время занятия</b></td><td><b>Группа</b></td><td><b>Дисциплина</b></td><td><b>Аудитория</b></td><td><b>Вид занятия</b></td><td><b>Преподаватель</b></td></tr><tr><td>12:05-13:35</td><td style="white-space: nowrap;">к/о/к БАД-26-09</td><td>Химия</td><td>503</td><td>Семинары ИПЗ</td><td>Зюзюкин Михаил Юрьевич</td></tr></TBODY></TABLE></div>`;
+
+test('parseGroupTable разбирает дни и пары', () => {
+  const days = parseGroupTable(TTABLE);
+
+  assert.equal(days.length, 2);
+  assert.equal(days[0].date, '2026-09-08');
+  assert.equal(days[0].name, 'Вторник');
+  assert.equal(days[0].lessons.length, 2);
+  assert.equal(days[0].lessons[0].pair, 1);
+  assert.equal(days[0].lessons[0].time, '12:05-13:35');
+  assert.equal(days[0].lessons[0].subject, 'Математика · Семинары ИПЗ');
+  assert.equal(days[0].lessons[0].teacher, 'Кириллаева Мария Александровна');
+  assert.equal(days[0].lessons[0].room, 'ауд.206 (колледж)');
+
+  assert.equal(days[1].date, '2026-09-09');
+  assert.equal(days[1].name, 'Среда');
+  assert.equal(days[1].lessons.length, 1);
+  assert.equal(days[1].lessons[0].subject, 'Химия · Семинары ИПЗ');
 });
 
-test('parseFileList находит файл, название и дату обновления', () => {
-  const html = `
-    <div class="doc">
-      <a href="/upload/iblock/7fd/abc/Raspisanie-kolledzh.xlsx">
-        <span>Расписание колледж 31-5 августа-сентября (1 неделя)</span>
-      </a>
-      <div class="doc__meta">59,09 кБ <span>Дата обновления: 25.08.2026</span></div>
-    </div>`;
-
-  const files = parseFileList(html);
-  assert.equal(files.length, 1);
-  assert.equal(files[0].url, 'https://www.muiv.ru/upload/iblock/7fd/abc/Raspisanie-kolledzh.xlsx');
-  assert.equal(files[0].title, 'Расписание колледж 31-5 августа-сентября (1 неделя)');
-  assert.equal(files[0].siteUpdated, '25.08.2026');
-  assert.equal(files[0].siteSize, '59,09 кБ');
+test('parseGroupTable отдаёт пустой список для пустого ttable', () => {
+  assert.deepEqual(parseGroupTable('<p>Выберите группу</p>'), []);
 });
 
-test('parseFileList не дублирует одинаковые ссылки', () => {
-  const html = `
-    <a href="/upload/a/x.xlsx">Раз</a>
-    <a href="/upload/a/x.xlsx">Раз ещё</a>
-    <a href="/upload/documents/privacy-policy.pdf">Политика</a>`;
-  assert.equal(parseFileList(html).length, 1);
+test('parseGroupTable сортирует дни по дате', () => {
+  const days = parseGroupTable(TTABLE);
+  const sorted = [...days].sort((a, b) => a.date.localeCompare(b.date));
+  assert.deepEqual(days.map((d) => d.date), sorted.map((d) => d.date));
 });

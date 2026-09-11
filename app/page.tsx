@@ -137,7 +137,7 @@ export default async function StatusPage({
               <>
                 <p className="stamp">{mskStamp(checkedAt)}</p>
                 <p className="subline">
-                  {minutesAgo === 0 ? 'только что' : `${minutesAgo} мин назад`} · на странице файлов:{' '}
+                  {minutesAgo === 0 ? 'только что' : `${minutesAgo} мин назад`} · групп проверено:{' '}
                   {lastCheck?.filesOnSite ?? 0}
                   {lastCheck?.durationMs
                     ? ` · за ${(lastCheck.durationMs / 1000).toFixed(1).replace('.', ',')} с`

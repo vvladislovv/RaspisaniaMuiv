@@ -1,9 +1,10 @@
 /**
  * Сквозная проверка без настоящей базы и без отправки в Telegram.
  *
- * Ходит на настоящий сайт МУИВ, скачивает файл, разбирает, пишет в подставную
- * базу (tools/fake-supabase.mjs) и проверяет, что чтение из базы даёт то же
- * расписание, что и парсер.
+ * Ходит на настоящий сайт МУИВ через headless Chromium, обновляет каталог
+ * групп, подписывает тестовый чат на группу и тянет её расписание — пишет
+ * в подставную базу (tools/fake-supabase.mjs) и проверяет, что чтение из базы
+ * даёт то же расписание, что и парсер.
  *
  * Запуск:
  *   node tools/fake-supabase.mjs 54321 /tmp/e2e.json &
@@ -34,35 +35,49 @@ function ok(condition: unknown, message: string) {
   process.exitCode = 1;
 }
 
-head('Проверка сайта и запись в базу');
+// Первый checkSite() поднимает браузер и обновляет только каталог групп —
+// без подписанного чата тянуть расписание пока нечего (см. lib/sync.ts).
+head('Первая проверка сайта — обновление каталога групп');
+const catalogStarted = Date.now();
+const catalogResult = await checkSite();
+console.log(`  заняло: ${((Date.now() - catalogStarted) / 1000).toFixed(1)} с`);
+ok(catalogResult.errors.length === 0, 'ошибок нет');
+
+head('Список групп для кнопок');
+const groups = await listGroups();
+const sheets = [...new Set(groups.map((g) => g.sheet))];
+console.log(`  групп: ${groups.length}, курсов: ${sheets.length}`);
+console.log(`  курсы: ${sheets.join(' | ')}`);
+ok(groups.length > 50, 'групп больше пятидесяти');
+const GROUP = WANTED ?? groups[0]?.group ?? '';
+ok(!!GROUP, `взята группа из каталога: ${GROUP}`);
+if (WANTED) {
+  ok(groups.some((g) => g.group === WANTED), `заданная группа ${WANTED} есть в списке`);
+}
+
+head('Привязка тестового чата к группе');
+const chatIdForFetch = CHAT_ID !== -1 ? CHAT_ID : -999;
+await upsertChat(chatIdForFetch, 'Проверочный чат (временный)');
+await toggleChatGroup(chatIdForFetch, GROUP);
+ok((await getChat(chatIdForFetch))?.groups.includes(GROUP) ?? false, 'группа сохранилась в базе');
+
+head('Вторая проверка сайта — расписание подписанной группы');
 const started = Date.now();
 const result = await checkSite();
-console.log(`  файлов на сайте: ${result.filesOnSite}`);
+console.log(`  групп проверено: ${result.filesOnSite}`);
 console.log(`  изменилось: ${result.changed.length ? result.changed.join(', ') : 'нет'}`);
 console.log(`  ошибок: ${result.errors.length ? result.errors.join('; ') : 'нет'}`);
 console.log(`  заняло: ${((Date.now() - started) / 1000).toFixed(1)} с`);
-ok(result.filesOnSite > 0, 'файлы на странице найдены');
+ok(result.filesOnSite > 0, 'хотя бы одна группа проверена');
 ok(result.errors.length === 0, 'ошибок нет');
 
 head('Актуальный файл в базе');
 const file = await latestFile();
 console.log(`  ${file?.title}`);
-console.log(`  обновлён на сайте: ${file?.site_updated} · неделя с ${file?.week_start}`);
+console.log(`  неделя с ${file?.week_start}`);
 console.log(`  размер: ${file?.size} байт · sha256: ${file?.sha256.slice(0, 16)}…`);
 ok(file?.parsed_ok === true, 'файл разобран без ошибок');
 ok(!!file?.week_start, 'начало недели определено');
-
-head('Список групп для кнопок');
-const groups = await listGroups();
-const sheets = [...new Set(groups.map((g) => g.sheet))];
-console.log(`  групп: ${groups.length}, курсов (листов): ${sheets.length}`);
-console.log(`  курсы: ${sheets.join(' | ')}`);
-ok(groups.length > 50, 'групп больше пятидесяти');
-const GROUP = WANTED ?? groups[0]?.group ?? '';
-ok(!!GROUP, `взята группа из файла: ${GROUP}`);
-if (WANTED) {
-  ok(groups.some((g) => g.group === WANTED), `заданная группа ${WANTED} есть в списке`);
-}
 
 head(`Неделя группы ${GROUP} из базы`);
 const week = await getWeek(GROUP, '2026-08-31');
@@ -95,17 +110,14 @@ if (target) {
   ok(false, 'не нашлось дня с парами');
 }
 
-head('Привязка чата к группе');
 if (CHAT_ID !== -1) {
+  head('Реальный чат из E2E_CHAT_ID тоже подписан на группу');
   await upsertChat(CHAT_ID, 'Проверочный чат');
-  // Групп у чата может быть две, поэтому выбор — переключателем
   await toggleChatGroup(CHAT_ID, GROUP);
   const chat = await getChat(CHAT_ID);
   console.log(`  чат ${CHAT_ID} -> ${(chat?.groups ?? []).join(', ')}`);
   ok((chat?.groups ?? []).includes(GROUP), 'группа сохранилась в базе');
   ok(chat?.enabled === true, 'чат включён');
-} else {
-  console.log('  пропущено: не задан E2E_CHAT_ID');
 }
 
 head('Выбор недели, когда на сайте лежит несколько файлов');
