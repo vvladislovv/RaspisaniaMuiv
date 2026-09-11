@@ -3,17 +3,16 @@
  * Вызывается из /api/tick раз в час.
  */
 import { createHash } from 'node:crypto';
-import { fetchSite, type SiteFile } from './muiv';
-import { parseSchedule } from './parse';
+import { withBrowserSession, type BrowserSession } from './browser';
+import { SCHEDULE_URL, fetchCatalog, fetchGroupSchedule } from './muiv';
+import type { Day, Workbook } from './parse';
 import {
   activeChats,
   setChatEnabled,
   setChatTopic,
-  fileNameOf,
   getFileByName,
   latestFile,
   replaceSchedules,
-  dropSupersededWeeks,
   setPinnedMessage,
   setState,
   getState,
@@ -25,12 +24,13 @@ import {
   currentGroups,
   weekDates,
   withReadCache,
+  catalogEntry,
+  replaceGroupsCatalog,
   type Chat,
   type FileRow,
 } from './db';
 import { log, logError } from './log';
 import { formatDayFor, type GroupDay } from './format';
-import type { Day } from './parse';
 import {
   TelegramError,
   editMessageText,
@@ -53,71 +53,93 @@ export interface CheckResult {
   errors: string[];
 }
 
-function sha256(buf: Buffer): string {
-  return createHash('sha256').update(buf).digest('hex');
+function sha256(s: string): string {
+  return createHash('sha256').update(s).digest('hex');
 }
 
-/** Скачивает и разбирает один файл, пишет результат в БД. */
-async function ingest(
-  file: SiteFile,
-  download: (f: SiteFile) => Promise<Buffer>,
+/**
+ * Разбор дней для одной группы — то, что раньше было «файлом» на сайте
+ * (`.xlsx`), теперь получено по AJAX и не имеет ни адреса, ни своего веса в
+ * байтах. Имя всё равно нужно стабильное: по нему ищется существующая
+ * запись, а адрес и размер в новой модели чисто описательные.
+ */
+async function ingestGroup(
+  groupName: string,
+  days: Day[],
 ): Promise<{ changed: boolean; row: FileRow | null; error?: string }> {
-  const name = fileNameOf(file.url);
+  const name = `ajax:${groupName}`;
   const existing = await getFileByName(name);
-  const buf = await download(file);
-  const hash = sha256(buf);
+  const hash = sha256(JSON.stringify(days));
 
   if (existing && existing.sha256 === hash && existing.parsed_ok) {
     await touchFile(name);
     return { changed: false, row: existing };
   }
 
+  const weekStart = days[0]?.date ?? null;
+  const workbook: Workbook = { weekStart, groups: [{ group: groupName, sheet: '', days }] };
+
   try {
-    const workbook = parseSchedule(buf);
+    if (days.length === 0) throw new Error('Нет ни одного дня в расписании группы');
+
     const row = await upsertFile({
       name,
-      url: file.url,
-      title: file.title,
+      url: SCHEDULE_URL,
+      title: groupName,
       sha256: hash,
-      size: buf.byteLength,
-      siteUpdated: file.siteUpdated,
+      size: JSON.stringify(days).length,
+      siteUpdated: null,
       weekStart: workbook.weekStart,
       parsedOk: true,
       parseError: null,
     });
     const inserted = await replaceSchedules(row.id, workbook);
 
-    // Тот же файл мог уже лежать в базе под прежним именем — убираем дубль,
-    // иначе навигация покажет одну неделю дважды
-    const superseded = workbook.weekStart
-      ? await dropSupersededWeeks(row.id, workbook.weekStart)
-      : 0;
-    await log('file_changed', `Файл «${file.title}» обновлён`, {
-      details: {
-        groups: workbook.groups.length,
-        rows: inserted,
-        weekStart: workbook.weekStart,
-        siteUpdated: file.siteUpdated,
-        superseded,
-      },
+    // Дублей недели тут не бывает: имя файла — стабильный ключ группы
+    // (`ajax:<group>`), upsertFile обновляет тот же ряд, а не создаёт новый.
+    // dropSupersededWeeks здесь не нужен и опасен: он чистит весь `files` без
+    // привязки к группе, а теперь на каждую группу свой ряд с той же неделей.
+    await log('file_changed', `Расписание «${groupName}» обновлено`, {
+      details: { days: days.length, rows: inserted, weekStart: workbook.weekStart },
     });
     return { changed: true, row };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await upsertFile({
       name,
-      url: file.url,
-      title: file.title,
+      url: SCHEDULE_URL,
+      title: groupName,
       sha256: hash,
-      size: buf.byteLength,
-      siteUpdated: file.siteUpdated,
+      size: JSON.stringify(days).length,
+      siteUpdated: null,
       weekStart: null,
       parsedOk: false,
       parseError: message,
     });
-    await logError(`Разбор файла «${file.title}»`, error);
+    await logError(`Разбор расписания «${groupName}»`, error);
     return { changed: false, row: null, error: message };
   }
+}
+
+const CATALOG_REFRESH_KEY = 'catalog_refreshed_date';
+
+/**
+ * Раз в сутки обходит весь каталог университета (курс × форма обучения) и
+ * обновляет `groups_catalog` — список для кнопок выбора группы в /start.
+ * Часовой тик каталог не трогает: он тянет расписание только уже подписанных
+ * групп, а полный обход дороже и нужен реже.
+ */
+async function maybeRefreshCatalog(session: BrowserSession): Promise<void> {
+  const today = mskDateOffset(0);
+  const lastRefresh = await getState<string>(CATALOG_REFRESH_KEY);
+  if (lastRefresh === today) return;
+
+  const catalog = await fetchCatalog(session.page);
+  await replaceGroupsCatalog(catalog);
+  await setState(CATALOG_REFRESH_KEY, today);
+  await log('check', `Каталог групп обновлён: ${catalog.length}`, {
+    details: { groups: catalog.length },
+  });
 }
 
 /** Проверяет сайт и обновляет БД. Возвращает список изменившихся файлов. */
@@ -157,6 +179,15 @@ export async function noteFileOk(title: string): Promise<void> {
   if ((await getState<number>(failKey(title))) !== null) await clearState(failKey(title));
 }
 
+/**
+ * Проверяет сайт и обновляет БД.
+ *
+ * Тянет расписание только для групп, на которые сейчас подписан хотя бы один
+ * включённый чат — не весь каталог университета: один прогон поднимает
+ * настоящий Chromium, и укладываться нужно в 60-секундный лимит функции.
+ * Каталог всех групп (для кнопок выбора) обновляется отдельно, раз в сутки —
+ * см. `maybeRefreshCatalog`.
+ */
 export async function checkSite(): Promise<CheckResult> {
   const started = Date.now();
   const result: CheckResult = { filesOnSite: 0, changed: [], errors: [] };
@@ -173,9 +204,32 @@ export async function checkSite(): Promise<CheckResult> {
     });
   };
 
-  let site: Awaited<ReturnType<typeof fetchSite>>;
+  const chats = await activeChats();
+  const groupNames = [...new Set(chats.flatMap((c) => c.groups ?? []))];
+
+  // Браузер поднимается в любом случае, даже без подписанных групп: раз в
+  // сутки нужно обновить каталог для кнопок выбора группы (иначе на пустой
+  // базе /start никогда не покажет ни одной группы)
+  let scheduleByGroup: Map<string, Day[] | Error>;
   try {
-    site = await fetchSite();
+    scheduleByGroup = await withBrowserSession(SCHEDULE_URL, async (session) => {
+      await maybeRefreshCatalog(session);
+
+      const out = new Map<string, Day[] | Error>();
+      for (const groupName of groupNames) {
+        try {
+          const entry = await catalogEntry(groupName);
+          if (!entry) {
+            out.set(groupName, new Error('Группы нет в каталоге сайта — возможно, переименована'));
+            continue;
+          }
+          out.set(groupName, await fetchGroupSchedule(session.page, entry));
+        } catch (error) {
+          out.set(groupName, error instanceof Error ? error : new Error(String(error)));
+        }
+      }
+      return out;
+    });
   } catch (error) {
     result.errors.push(error instanceof Error ? error.message : String(error));
     await record();
@@ -186,29 +240,26 @@ export async function checkSite(): Promise<CheckResult> {
     throw error;
   }
 
-  result.filesOnSite = site.files.length;
+  result.filesOnSite = groupNames.length;
 
-  if (site.files.length === 0) {
-    result.errors.push('На странице нет файлов расписания');
-    await logError('Проверка сайта', new Error('На странице нет ни одного .xls/.xlsx'));
-  }
-
-  for (const file of site.files) {
+  for (const groupName of groupNames) {
+    const outcome = scheduleByGroup.get(groupName);
     try {
-      const outcome = await ingest(file, site.download);
-      if (outcome.changed) result.changed.push(file.title);
-      if (outcome.error) result.errors.push(`${file.title}: ${outcome.error}`);
-      await noteFileOk(file.title);
+      if (outcome instanceof Error) throw outcome;
+      const ingested = await ingestGroup(groupName, outcome ?? []);
+      if (ingested.changed) result.changed.push(groupName);
+      if (ingested.error) result.errors.push(`${groupName}: ${ingested.error}`);
+      await noteFileOk(groupName);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      result.errors.push(`${file.title}: ${message}`);
-      await noteFileFailure(file.title, error);
+      result.errors.push(`${groupName}: ${message}`);
+      await noteFileFailure(groupName, error);
     }
   }
 
   await record();
 
-  await log('check', `Проверка сайта: файлов ${result.filesOnSite}, изменилось ${result.changed.length}`, {
+  await log('check', `Проверка сайта: групп ${result.filesOnSite}, изменилось ${result.changed.length}`, {
     durationMs: Date.now() - started,
     details: { changed: result.changed, errors: result.errors },
   });

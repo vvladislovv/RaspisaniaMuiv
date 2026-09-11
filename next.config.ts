@@ -2,6 +2,8 @@ import type { NextConfig } from 'next';
 
 const config: NextConfig = {
   poweredByHeader: false,
+  // Бинарник Chromium не бандлится через webpack — грузится с диска в рантайме
+  serverExternalPackages: ['playwright-core', '@sparticuz/chromium'],
   async headers() {
     return [
       {

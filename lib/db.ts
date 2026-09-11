@@ -400,27 +400,77 @@ export async function recentFiles(limit = 20): Promise<FileRow[]> {
   return (check(res, 'recentFiles') ?? []) as FileRow[];
 }
 
-/** Список групп с указанием листа — для кнопок выбора. */
+/**
+ * Список групп с указанием курса — для кнопок выбора.
+ *
+ * Берётся из `groups_catalog`, а не из уже подключённых групп в `schedules`:
+ * по часовому тику расписание тянется только для групп, на которые уже
+ * подписан хотя бы один чат, а каталог всех групп университета обновляется
+ * отдельно и реже (см. `upsertGroupsCatalog`).
+ */
 export async function listGroups(): Promise<{ group: string; sheet: string | null }[]> {
   return cached('listGroups', loadGroups);
 }
 
 async function loadGroups(): Promise<{ group: string; sheet: string | null }[]> {
-  const file = await latestFile();
-  if (!file) return [];
-
   const res = await db()
-    .from('schedules')
-    .select('group_name, sheet_name')
-    .eq('file_id', file.id);
+    .from('groups_catalog')
+    .select('group_name, year')
+    .order('group_name', { ascending: true });
 
-  const rows = (check(res, 'listGroups') ?? []) as { group_name: string; sheet_name: string | null }[];
-  const seen = new Map<string, string | null>();
-  for (const r of rows) if (!seen.has(r.group_name)) seen.set(r.group_name, r.sheet_name);
-
-  return [...seen]
-    .map(([group, sheet]) => ({ group, sheet }))
+  const rows = (check(res, 'listGroups') ?? []) as { group_name: string; year: string }[];
+  return rows
+    .map((r) => ({ group: r.group_name, sheet: r.year }))
     .sort((a, b) => a.group.localeCompare(b.group, 'ru'));
+}
+
+export interface CatalogEntry {
+  group: string;
+  year: string;
+  studyform: string;
+}
+
+/** Перезаписывает каталог групп целиком — обновляется раз в сутки. */
+export async function replaceGroupsCatalog(entries: CatalogEntry[]): Promise<void> {
+  const now = new Date().toISOString();
+  const rows = entries.map((e) => ({
+    group_name: e.group,
+    year: e.year,
+    studyform: e.studyform,
+    updated_at: now,
+  }));
+
+  for (let i = 0; i < rows.length; i += 500) {
+    const res = await db()
+      .from('groups_catalog')
+      .upsert(rows.slice(i, i + 500), { onConflict: 'group_name' })
+      .select('group_name');
+    check(res, 'replaceGroupsCatalog.upsert');
+  }
+
+  // Группы, которых в новом обходе не оказалось (расформированы/переименованы),
+  // не должны продолжать висеть в списке выбора
+  const seen = new Set(entries.map((e) => e.group));
+  const existing = await db().from('groups_catalog').select('group_name');
+  const stale = ((check(existing, 'replaceGroupsCatalog.list') ?? []) as { group_name: string }[])
+    .map((r) => r.group_name)
+    .filter((g) => !seen.has(g));
+
+  if (stale.length > 0) {
+    const del = await db().from('groups_catalog').delete().in('group_name', stale).select('group_name');
+    check(del, 'replaceGroupsCatalog.delete');
+  }
+}
+
+/** Курс и форма обучения группы — нужны, чтобы запросить её расписание. */
+export async function catalogEntry(groupName: string): Promise<CatalogEntry | null> {
+  const res = await db()
+    .from('groups_catalog')
+    .select('group_name, year, studyform')
+    .eq('group_name', groupName)
+    .maybeSingle();
+  const row = check(res, 'catalogEntry') as { group_name: string; year: string; studyform: string } | null;
+  return row ? { group: row.group_name, year: row.year, studyform: row.studyform } : null;
 }
 
 /**
@@ -759,11 +809,15 @@ export async function errorCount(hours = 24): Promise<number> {
  * Приведение названия группы к сравнимому виду.
  *
  * Колледж меняет написание между файлами: «ИСП/П-24-11» превращается в
- * «ИСП/п 24-11». Регистр, пробелы и дефисы значения не имеют, а вот точка
- * с цифрой — имеет: «23-09.1» и «23-09.2» это разные группы.
+ * «ИСП/п 24-11», а с переходом сайта на AJAX-виджет — в «к/о/к ИСП/п 24-11».
+ * Регистр, пробелы, дефисы и префикс формы обучения значения не имеют, а вот
+ * точка с цифрой — имеет: «23-09.1» и «23-09.2» это разные группы.
  */
 export function normalizeGroup(name: string): string {
-  return name.toLowerCase().replace(/[\s-]+/g, '');
+  return name
+    .toLowerCase()
+    .replace(/^\s*к\/о\/к\s*/i, '')
+    .replace(/[\s-]+/g, '');
 }
 
 export interface GroupResolution {

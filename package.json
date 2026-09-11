@@ -14,8 +14,10 @@
     "e2e:bot": "tsx tools/e2e-bot.mts"
   },
   "dependencies": {
+    "@sparticuz/chromium": "^153.0.0",
     "@supabase/supabase-js": "^2.115.0",
     "next": "^15.5.25",
+    "playwright-core": "^1.63.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },

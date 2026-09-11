@@ -123,6 +123,16 @@ create table if not exists feedback (
 
 create index if not exists feedback_recent_idx on feedback (created_at desc);
 
+-- Каталог всех групп университета (курс + форма обучения), для кнопок выбора
+-- в /start. Обновляется раз в сутки полным обходом сайта; расписание же по
+-- часовому тику тянется только для уже подписанных групп (см. lib/sync.ts).
+create table if not exists groups_catalog (
+  group_name text primary key,
+  year       text not null,
+  studyform  text not null,
+  updated_at timestamptz not null default now()
+);
+
 -- Доступ только через service_role с сервера. Публичных политик нет.
 alter table access     enable row level security;
 alter table chats      enable row level security;
@@ -132,6 +142,7 @@ alter table logs       enable row level security;
 alter table rate_limit enable row level security;
 alter table app_state  enable row level security;
 alter table feedback   enable row level security;
+alter table groups_catalog enable row level security;
 
 -- Чистка старых логов и счётчиков rate limit.
 create or replace function prune_old_rows() returns void language sql as $$
