@@ -606,8 +606,14 @@ export async function tick(force = false): Promise<TickResult> {
   try {
     out.check = await checkSite();
     if (out.check.changed.length > 0) await refreshPinned();
+    // Проверка сайта прошла — если до этого была серия сбоев, она кончилась
+    await noteFileOk('Проверка сайта');
   } catch (error) {
-    await logError('Проверка сайта', error);
+    // Та же терпимость к разовым сбоям, что и для отдельной группы: шлюз
+    // Supabase или сайт МУИВ иногда отвечают с запинкой, и следующий тик
+    // через час обычно проходит — будить владельца на первом же промахе
+    // не нужно (см. shouldAlertOnStreak).
+    await noteFileFailure('Проверка сайта', error);
     out.check = {
       filesOnSite: 0,
       changed: [],
