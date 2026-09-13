@@ -4,6 +4,13 @@ const config: NextConfig = {
   poweredByHeader: false,
   // Бинарник Chromium не бандлится через webpack — грузится с диска в рантайме
   serverExternalPackages: ['playwright-core', '@sparticuz/chromium'],
+  // serverExternalPackages не спасает от трассировки файлов для serverless-бандла:
+  // Vercel копирует в /var/task только то, что нашёл статическим анализом require(),
+  // а chromium.executablePath() строит путь к бинарнику динамически — без явного
+  // включения каталог bin/ в бандл не попадает и в проде падает с ENOENT.
+  outputFileTracingIncludes: {
+    '/api/tick': ['./node_modules/@sparticuz/chromium/bin/**'],
+  },
   async headers() {
     return [
       {
