@@ -26,6 +26,8 @@ import {
   withReadCache,
   catalogEntry,
   replaceGroupsCatalog,
+  resolveGroups,
+  renameChatGroups,
   type Chat,
   type FileRow,
 } from './db';
@@ -68,6 +70,11 @@ async function ingestGroup(
   days: Day[],
 ): Promise<{ changed: boolean; row: FileRow | null; error?: string }> {
   const name = `ajax:${groupName}`;
+  // `files.url` уникален в схеме (раньше это гарантировал сам xlsx-адрес —
+  // разный при каждой перезаливке). В AJAX-модели у всех групп один и тот же
+  // SCHEDULE_URL, поэтому вставка второй группы падала бы с duplicate key —
+  // различаем адрес фрагментом с именем группы.
+  const url = `${SCHEDULE_URL}#group=${encodeURIComponent(groupName)}`;
   const existing = await getFileByName(name);
   const hash = sha256(JSON.stringify(days));
 
@@ -84,7 +91,7 @@ async function ingestGroup(
 
     const row = await upsertFile({
       name,
-      url: SCHEDULE_URL,
+      url,
       title: groupName,
       sha256: hash,
       size: JSON.stringify(days).length,
@@ -107,7 +114,7 @@ async function ingestGroup(
     const message = error instanceof Error ? error.message : String(error);
     await upsertFile({
       name,
-      url: SCHEDULE_URL,
+      url,
       title: groupName,
       sha256: hash,
       size: JSON.stringify(days).length,
@@ -207,6 +214,16 @@ export async function checkSite(): Promise<CheckResult> {
   const chats = await activeChats();
   const groupNames = [...new Set(chats.flatMap((c) => c.groups ?? []))];
 
+  // Имя в подписке чата и имя в каталоге сайта совпадают не всегда: колледж
+  // меняет написание («РЕК 25-09.1» → «к/о/к РЕК 25-09.1»), а точное
+  // совпадение строк тут не годится — нужна та же нормализация, что и при
+  // показе расписания (resolveGroups уже её делает для рендера).
+  const resolution = await resolveGroups(groupNames);
+  for (const chat of chats) {
+    if ((chat.groups ?? []).some((g) => resolution.renamed.some((r) => r.from === g))) {
+      await renameChatGroups(chat.chat_id, resolution.renamed);
+    }
+  }
   // Браузер поднимается в любом случае, даже без подписанных групп: раз в
   // сутки нужно обновить каталог для кнопок выбора группы (иначе на пустой
   // базе /start никогда не покажет ни одной группы)
@@ -217,10 +234,15 @@ export async function checkSite(): Promise<CheckResult> {
 
       const out = new Map<string, Day[] | Error>();
       for (const groupName of groupNames) {
+        const canonical = resolution.actual.get(groupName);
+        if (!canonical) {
+          out.set(groupName, new Error('Группы нет в каталоге сайта — возможно, переименована'));
+          continue;
+        }
         try {
-          const entry = await catalogEntry(groupName);
+          const entry = await catalogEntry(canonical);
           if (!entry) {
-            out.set(groupName, new Error('Группы нет в каталоге сайта — возможно, переименована'));
+            out.set(groupName, new Error(`Каталог рассинхронизирован: «${canonical}» не найдена`));
             continue;
           }
           out.set(groupName, await fetchGroupSchedule(session.page, entry));
@@ -242,18 +264,28 @@ export async function checkSite(): Promise<CheckResult> {
 
   result.filesOnSite = groupNames.length;
 
+  // Пишем в БД под каноническим именем каталога, а не под тем, что было в
+  // подписке чата до переименования — иначе schedules.group_name разойдётся
+  // с уже обновлённым chats.groups (renameChatGroups выше), и getWeek/getDay
+  // не найдёт свежие данные по новому имени.
+  const ingestedCanonical = new Set<string>();
+
   for (const groupName of groupNames) {
+    const canonical = resolution.actual.get(groupName) ?? groupName;
     const outcome = scheduleByGroup.get(groupName);
     try {
       if (outcome instanceof Error) throw outcome;
-      const ingested = await ingestGroup(groupName, outcome ?? []);
-      if (ingested.changed) result.changed.push(groupName);
-      if (ingested.error) result.errors.push(`${groupName}: ${ingested.error}`);
-      await noteFileOk(groupName);
+      if (ingestedCanonical.has(canonical)) continue; // уже записали под этим именем на этом тике
+      ingestedCanonical.add(canonical);
+
+      const ingested = await ingestGroup(canonical, outcome ?? []);
+      if (ingested.changed) result.changed.push(canonical);
+      if (ingested.error) result.errors.push(`${canonical}: ${ingested.error}`);
+      await noteFileOk(canonical);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       result.errors.push(`${groupName}: ${message}`);
-      await noteFileFailure(groupName, error);
+      await noteFileFailure(canonical, error);
     }
   }
 
