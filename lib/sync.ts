@@ -43,7 +43,7 @@ import {
   type SentMessage,
 } from './telegram';
 import { scheduleKeyboard } from './keyboard';
-import { dayNameOf, isSaturdayMsk, mskDateOffset, mskParts } from './time';
+import { dayNameOf, isSaturdayMsk, mskDateOffset, mskParts, mondayOf, weekAnchor } from './time';
 import { env } from './env';
 
 const LAST_CHECK_KEY = 'last_check';
@@ -67,9 +67,22 @@ function sha256(s: string): string {
  */
 async function ingestGroup(
   groupName: string,
-  days: Day[],
+  rawDays: Day[],
 ): Promise<{ changed: boolean; row: FileRow | null; error?: string }> {
   const name = `ajax:${groupName}`;
+
+  // AJAX-виджет отдаёт скользящее окно до 10-12 дней вперёд — шире одной
+  // календарной недели. Вся остальная модель (кнопки дней, «Вся неделя»,
+  // недельная навигация) исторически рассчитана на «один файл — одна неделя
+  // Пн–Сб»: без обрезки один и тот же день недели встречался бы в списке
+  // кнопок дважды (день из этой недели и день из следующей). Обрезаем до
+  // недели, которая актуальна прямо сейчас.
+  const monday = mondayOf(weekAnchor());
+  const saturday = new Date(`${monday}T00:00:00Z`);
+  saturday.setUTCDate(saturday.getUTCDate() + 5);
+  const saturdayIso = saturday.toISOString().slice(0, 10);
+  const days = rawDays.filter((d) => d.date >= monday && d.date <= saturdayIso);
+
   // `files.url` уникален в схеме (раньше это гарантировал сам xlsx-адрес —
   // разный при каждой перезаливке). В AJAX-модели у всех групп один и тот же
   // SCHEDULE_URL, поэтому вставка второй группы падала бы с duplicate key —
