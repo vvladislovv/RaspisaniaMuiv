@@ -64,6 +64,7 @@ import { dayNameOf, mskDateOffset, mskStamp, mskToday, weekAnchor } from './time
 import type { Day } from './parse';
 import { env } from './env';
 import { LAST_CHECK_KEY } from './sync';
+import { displayGroup } from './aliases';
 
 // ─── Типы апдейтов (только используемые поля) ────────────────────────────────
 
@@ -174,7 +175,7 @@ function menuScreen(chat: Chat | null, ctx: Context): Screen {
   if (groups.length > 0) {
     lines.push(
       `👥 ${groups.length > 1 ? 'Группы' : 'Группа'}: ` +
-        groups.map((g) => `*${esc(g)}*`).join(', '),
+        groups.map((g) => `*${esc(displayGroup(g))}*`).join(', '),
     );
     lines.push('');
     lines.push(esc('Проверяю сайт каждый час и обновляю закреплённое расписание.'));
@@ -435,7 +436,7 @@ async function adminScreen(): Promise<Screen> {
     lines.push('');
     lines.push(`*${esc('Группы')}*`);
     for (const row of stats.topGroups) {
-      lines.push(`${esc(row.group)} — ${row.chats}`);
+      lines.push(`${esc(displayGroup(row.group))} — ${row.chats}`);
     }
   }
 
@@ -593,7 +594,7 @@ async function statusScreen(chat: Chat | null): Promise<Screen> {
   const groups = chat?.groups ?? [];
   lines.push(
     `👥 ${groups.length > 1 ? 'Группы' : 'Группа'}: ` +
-      (groups.length > 0 ? groups.map((g) => `*${esc(g)}*`).join(', ') : '_не выбрана_'),
+      (groups.length > 0 ? groups.map((g) => `*${esc(displayGroup(g))}*`).join(', ') : '_не выбрана_'),
   );
   lines.push(`🔔 Автоотправка: ${chat?.enabled ? 'включена' : 'выключена'}`);
   lines.push('');
@@ -1342,7 +1343,11 @@ async function runCallback(
       return;
     }
 
-    ack(outcome === 'added' ? `Добавлено: ${picked.group}` : `Убрано: ${picked.group}`);
+    ack(
+      outcome === 'added'
+        ? `Добавлено: ${displayGroup(picked.group)}`
+        : `Убрано: ${displayGroup(picked.group)}`,
+    );
     await log('command', `Группы чата: ${outcome} ${picked.group}`, { chatId });
 
     // Остаёмся в списке: вторую группу выбирают тут же, не возвращаясь в меню

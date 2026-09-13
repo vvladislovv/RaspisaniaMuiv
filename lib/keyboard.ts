@@ -7,6 +7,7 @@
  */
 import type { Day } from './parse';
 import { shortDay } from './format';
+import { displayGroup } from './aliases';
 import type { InlineButton, InlineKeyboard } from './telegram';
 
 export function chunk<T>(items: T[], size: number): T[][] {
@@ -149,7 +150,10 @@ export function scheduleKeyboard(
   if (groupSwitch && groupSwitch.groups.length > 1) {
     rows.push(
       groupSwitch.groups.map((group, index) => ({
-        text: index === groupSwitch.activeIndex ? `· ${group} ·` : group,
+        text:
+          index === groupSwitch.activeIndex
+            ? `· ${displayGroup(group)} ·`
+            : displayGroup(group),
         callback_data: `wg:${index}:${groupSwitch.dateIso}`,
       })),
     );
@@ -219,7 +223,7 @@ export function groupKeyboard(
   // человек видит, что выбрал, не выходя из списка
   const rows: InlineKeyboard = chunk(
     current.map((g) => ({
-      text: selected.includes(g.group) ? `✓ ${g.group}` : g.group,
+      text: selected.includes(g.group) ? `✓ ${displayGroup(g.group)}` : displayGroup(g.group),
       callback_data: `g:${g.index}`,
     })),
     3,

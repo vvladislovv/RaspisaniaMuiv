@@ -1,5 +1,6 @@
 /** Форматирование расписания в сообщения Telegram (MarkdownV2). */
 import type { Day, Lesson } from './parse';
+import { displayGroup } from './aliases';
 
 const MDV2_SPECIAL = /[_*[\]()~`>#+\-=|{}.!\\]/g;
 
@@ -148,7 +149,7 @@ export function formatDayFor(
 
   for (const block of blocks) {
     parts.push('');
-    parts.push(`👥 *${esc(block.group)}*`);
+    parts.push(`👥 *${esc(displayGroup(block.group))}*`);
     parts.push(dayQuote(block.day));
   }
 
@@ -180,7 +181,7 @@ export function formatDay(day: Day, opts: DayMessageOptions): string {
 
   if (opts.heading) parts.push(`_${esc(opts.heading)}_`);
   parts.push(`📅 *${esc(day.name)}, ${esc(humanDate(day.date))}*`);
-  parts.push(`👥 *${esc(opts.group)}*`);
+  parts.push(`👥 *${esc(displayGroup(opts.group))}*`);
   parts.push('');
 
   if (day.lessons.length === 0) {
@@ -221,7 +222,7 @@ const TELEGRAM_LIMIT = 4096;
 export function formatWeek(days: Day[], opts: DayMessageOptions): string[] {
   const header = [
     `*${esc(opts.heading ?? 'Расписание на неделю')}*`,
-    `👥 *${esc(opts.group)}*`,
+    `👥 *${esc(displayGroup(opts.group))}*`,
     '',
   ];
 
