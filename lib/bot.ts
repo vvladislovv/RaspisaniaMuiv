@@ -664,6 +664,59 @@ async function creditEmoji(): Promise<CreditEmoji> {
   };
 }
 
+/**
+ * Обучалка после одобрения доступа: несколько экранов подряд, только
+ * «Далее»/«Назад» — без меню и лишних кнопок, чтобы не отвлекать до конца.
+ * Шаги: что за бот → как добавить в группу и какие права дать → как искать
+ * свою группу (после переименования специальностей 3–4 курса).
+ */
+const ONBOARDING_STEPS = 3;
+
+function onboardingScreen(step: number, username: string | null): Screen {
+  const s = Math.min(Math.max(step, 0), ONBOARDING_STEPS - 1);
+
+  const pages: string[] = [
+    [
+      '*Как пользоваться ботом*  ·  шаг 1 из 3',
+      '',
+      esc('Я присылаю расписание колледжа МУИВ. Проверяю сайт каждый час и слежу за изменениями.'),
+      '',
+      esc('Работаю и в личке (только для тебя), и в группе (для всех сразу) — на следующем шаге покажу, как добавить меня в группу.'),
+    ].join('\n'),
+    [
+      '*Как пользоваться ботом*  ·  шаг 2 из 3',
+      '',
+      esc('Добавление в группу:'),
+      username
+        ? `${esc('1. Кнопка')} «➕ Добавить в группу» ${esc('в меню, или ссылка')} https://t.me/${username}?startgroup=true`
+        : esc('1. Добавь меня в группу обычным способом Telegram — «Добавить участника».'),
+      esc('2. Сделай меня админом группы и дай право «Закрепление сообщений» — без него ежедневное расписание отправится, но не закрепится.'),
+      esc('3. Если в группе есть темы (форум) — открой нужную тему и напиши /start, расписание пойдёт именно туда, а не в «Общее».'),
+    ].join('\n'),
+    [
+      '*Как пользоваться ботом*  ·  шаг 3 из 3',
+      '',
+      esc('Как искать свою группу:'),
+      esc(
+        'Колледж переименовал специальности 3–4 курса — например, ИСП/П-23-09.1 теперь на сайте называется КБо 111п-23.',
+      ),
+      esc('В списке выбора я показываю оба варианта — привычное имя и рядом в скобках настоящее с сайта, — ищи по любому.'),
+      '',
+      esc('Дальше — жми «Выбрать группу» и находи свою.'),
+    ].join('\n'),
+  ];
+
+  const nav: InlineKeyboard[number] = [];
+  if (s > 0) nav.push({ text: '◀ Назад', callback_data: `ob:${s - 1}` });
+  nav.push(
+    s < ONBOARDING_STEPS - 1
+      ? { text: 'Далее ▶', callback_data: `ob:${s + 1}` }
+      : { text: '👥 Выбрать группу', callback_data: 'grp' },
+  );
+
+  return { text: pages[s], keyboard: [nav] };
+}
+
 function aboutScreen(credit: CreditEmoji): Screen {
   const source = 'https://www.muiv.ru/studentu/spo/raspisanie/';
   const author = 'https://hacktaika.ru';
@@ -1124,30 +1177,23 @@ async function runCallback(
     ack(approve ? 'Доступ открыт' : 'Отказано');
     await log('command', `Заявка ${approve ? 'одобрена' : 'отклонена'}: ${targetId}`);
 
-    // Человек должен узнать решение сам, не спрашивая
+    // Человек должен узнать решение сам, не спрашивая. Подробности (как
+    // добавить в группу, какие права дать, как искать свою группу) — в
+    // пошаговой обучалке по кнопке, а не всё сразу одним текстом.
     if (approve) {
       try {
         const username = await botUsername().catch(() => null);
+        const screen = onboardingScreen(0, username);
+        // Прямая ссылка «Добавить в группу» — отдельной строкой поверх
+        // шагов обучалки: чтобы не листать все шаги, если человек и так
+        // знает, что делать
+        const keyboard = username
+          ? [[{ text: '➕ Добавить в группу', url: `https://t.me/${username}?startgroup=true` }], ...screen.keyboard]
+          : screen.keyboard;
         await sendMessage(
           targetId,
-          [
-            `*${esc('Доступ открыт')}*`,
-            '',
-            esc('Теперь можно добавить меня в группу — кнопка ниже, дальше всё подскажу.'),
-            '',
-            esc(
-              'Как искать свою группу: колледж переименовал специальности 3–4 курса ' +
-                '(например, ИСП/П-23-09.1 теперь на сайте называется КБо 111п-23). ' +
-                'В списке выбора я показываю оба варианта — привычное имя и рядом в ' +
-                'скобках настоящее с сайта, — так что искать можно по любому.',
-            ),
-          ].join('\n'),
-          {
-            silent: false,
-            keyboard: username
-              ? [[{ text: '➕ Добавить в группу', url: `https://t.me/${username}?startgroup=true` }]]
-              : undefined,
-          },
+          `*${esc('Доступ открыт')}*\n\n${screen.text}`,
+          { silent: false, keyboard },
         );
       } catch (error) {
         await logError(`Уведомление об одобрении ${targetId}`, error);
@@ -1178,6 +1224,13 @@ async function runCallback(
   if (data === 'about') {
     ack();
     await edit(aboutScreen(await creditEmoji()));
+    return;
+  }
+
+  if (data.startsWith('ob:')) {
+    ack();
+    const username = await botUsername().catch(() => null);
+    await edit(onboardingScreen(Number(data.slice(3)), username));
     return;
   }
 
@@ -1474,7 +1527,9 @@ async function handleMembership(event: TgChatMemberUpdate): Promise<void> {
   // расписание отправится, но не закрепится
   const hints: string[] = [];
   if (event.chat.type !== 'private') {
-    hints.push(esc('Чтобы я мог закреплять расписание, дай мне право «Закрепление сообщений».'));
+    hints.push(
+      esc('Сделай меня админом и дай право «Закрепление сообщений» — иначе расписание отправится, но не закрепится.'),
+    );
   }
   // Добавили в форум: событие приходит без темы, и расписание пошло бы
   // в «Общее». Сказать про это надо сразу, а не когда оно туда упадёт.
