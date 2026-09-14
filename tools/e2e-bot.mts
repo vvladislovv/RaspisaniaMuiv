@@ -1070,6 +1070,13 @@ await resetRateLimit();
 head('Колледж перезалил неделю под новым именем');
 {
   const { upsertFile: put, weekStarts: weeks, dropSupersededWeeks } = await import('../lib/db');
+
+  // Тест сам себе готовит «оригинал» той же недели — раньше это делал общий
+  // подготовительный шаг (когда сайт был недоступен из песочницы и данные
+  // всегда брались из фикстуры), но теперь сайт достижим через браузер, и
+  // тот шаг фикстуру не грузит. Без явного посева тест ломается не из-за
+  // бага, а из-за отсутствия своей же исходной записи.
+  await seedFromFixture();
   const before = await weeks();
 
   // Та же неделя, но имя другое и начало сместилось на день — ровно так
@@ -1452,7 +1459,7 @@ head('Кэш не протекает между одновременными в�
     await read();
     await read();
   });
-  ok((await dbHits('schedules')) === 1, 'внутри одного вызова — одно чтение');
+  ok((await dbHits('groups_catalog')) === 1, 'внутри одного вызова — одно чтение');
 
   // Два наложившихся вызова: важно, что начатый раньше кончается раньше —
   // именно так общая переменная модуля оставляла свой кэш висеть навсегда,
@@ -1486,14 +1493,14 @@ head('Кэш не протекает между одновременными в�
   letBFinish();
   await b;
 
-  const overlapped = await dbHits('schedules');
+  const overlapped = await dbHits('groups_catalog');
   ok(overlapped === 2, `у каждого вызова свой кэш: чтений ${overlapped}`);
 
   // Ничего не осталось висеть: вне вызова чтение снова идёт в базу
   await resetDbHits();
   await read();
   await read();
-  const outside = await dbHits('schedules');
+  const outside = await dbHits('groups_catalog');
   ok(outside === 2, `вне вызова кэш не действует: чтений ${outside}`);
 }
 

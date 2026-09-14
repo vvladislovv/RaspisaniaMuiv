@@ -19,7 +19,6 @@ import {
   currentGroups,
   weekDates,
   fileForDate,
-  getWeekOfFile,
   requestAccess,
   decideAccess,
   isApproved,
@@ -63,7 +62,7 @@ import {
 import { dayNameOf, mskDateOffset, mskStamp, mskToday, weekAnchor } from './time';
 import type { Day } from './parse';
 import { env } from './env';
-import { LAST_CHECK_KEY } from './sync';
+import { LAST_CHECK_KEY, ingestGroupNow } from './sync';
 import { displayGroup } from './aliases';
 
 // ─── Типы апдейтов (только используемые поля) ────────────────────────────────
@@ -541,11 +540,17 @@ export async function weekScreen(
   const active = Math.min(Math.max(groupIndex, 0), Math.max(groups.length - 1, 0));
   const group = groups[active] ?? '';
 
-  // Неделя задаётся файлом, а не «ближайшим учебным днём группы»: иначе при
-  // переключении групп с разными днями менялась ещё и неделя.
-  const [file, weeks] = await Promise.all([fileForDate(fromIso), weekStarts()]);
+  // Файл теперь свой у каждой группы (не один на всех, как раньше с xlsx) —
+  // «файл на эту дату» без привязки к группе мог случайно попасть на файл
+  // другой группы или вообще без пар. getWeek уже ищет файл именно этой
+  // группы. Недели у групп почти всегда совпадают (обе обрезаны до одной
+  // календарной недели при скачивании — см. ingestGroup), поэтому кнопки
+  // при переключении группы не «съезжают».
+  const [{ days, file }, weeks] = await Promise.all([
+    group ? getWeek(group, fromIso) : Promise.resolve({ days: [] as Day[], file: null }),
+    weekStarts(),
+  ]);
 
-  const days = file && group ? await getWeekOfFile(group, file.id) : [];
   const allDates = file ? await weekDates(file.id) : [];
 
   const chunks = formatWeek(days, {
@@ -1349,6 +1354,11 @@ async function runCallback(
       ack(`Больше ${MAX_GROUPS} групп нельзя — сначала убери одну`);
       return;
     }
+
+    // Новую подписку часовой тик подхватит только через час (он тянет только
+    // уже подписанные группы) — без этого человек сразу после выбора видел бы
+    // пустую неделю. Тянем прямо сейчас, один раз, отдельно от общего тика.
+    if (outcome === 'added') await ingestGroupNow(picked.group);
 
     ack(
       outcome === 'added'
