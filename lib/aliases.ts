@@ -36,7 +36,12 @@ export const GROUP_ALIASES: Record<string, string> = {
   'КБо 111п-24': 'ИСП/П-24-09',
 };
 
-/** Имя группы для показа человеку — привычное старое, если оно есть. */
+/**
+ * Имя группы для показа человеку — привычное старое, а рядом в скобках
+ * настоящее имя с сайта (по нему группу ищут в официальных источниках,
+ * не только в этом боте, поэтому прятать его совсем не стоит).
+ */
 export function displayGroup(name: string): string {
-  return GROUP_ALIASES[name] ?? name;
+  const alias = GROUP_ALIASES[name];
+  return alias ? `${alias} (${name})` : name;
 }
