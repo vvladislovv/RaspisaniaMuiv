@@ -25,6 +25,8 @@ import {
   getAccess,
   pendingRequests,
   accessCounts,
+  accessList,
+  groupsInUse,
   MAX_GROUPS,
   upsertChat,
   getState,
@@ -452,10 +454,99 @@ async function adminScreen(): Promise<Screen> {
     ]);
   }
 
+  rows.push([
+    { text: '👥 Доступ', callback_data: 'admacc' },
+    { text: '📋 Все группы', callback_data: 'admgrp' },
+  ]);
   rows.push([{ text: '🔄 Обновить', callback_data: 'adm' }]);
   rows.push([{ text: '↩︎ Меню', callback_data: 'm' }]);
 
   return { text: lines.join('\n'), keyboard: rows };
+}
+
+const ADMIN_TO = { text: '↩︎ Сводка', callback_data: 'adm' };
+
+/**
+ * Полный список по доступу: кто одобрен, кто ждёт, кому отказано — с кнопкой
+ * поменять решение прямо тут. Сводка (`adm`) показывает только счётчики и
+ * заявки, ждущие решения — этот экран нужен, чтобы увидеть весь список.
+ */
+async function accessListScreen(): Promise<Screen> {
+  const [approved, pending, denied] = await Promise.all([
+    accessList('approved'),
+    accessList('pending'),
+    accessList('denied'),
+  ]);
+
+  const section = (title: string, rows: typeof approved) => {
+    const lines = [`*${esc(`${title} (${rows.length})`)}*`];
+    if (rows.length === 0) {
+      lines.push(esc('— пусто —'));
+    } else {
+      for (const row of rows) {
+        lines.push(`${esc(describeUser({ ...row, id: row.user_id }))} · \`${row.user_id}\``);
+      }
+    }
+    return lines.join('\n');
+  };
+
+  const text = [
+    section('Одобрено', approved),
+    '',
+    section('Ждут решения', pending),
+    '',
+    section('Отказано', denied),
+  ].join('\n');
+
+  const keyboard: InlineKeyboard = [];
+  for (const row of pending) {
+    keyboard.push([
+      { text: `✅ ${describeUser({ ...row, id: row.user_id })}`, callback_data: `ok:${row.user_id}:acc` },
+      { text: '⛔️', callback_data: `no:${row.user_id}:acc` },
+    ]);
+  }
+  // Решение можно поменять и для уже решённых заявок — не нужно лезть в базу руками
+  for (const row of approved) {
+    keyboard.push([
+      {
+        text: `🚫 Отозвать: ${describeUser({ ...row, id: row.user_id })}`,
+        callback_data: `no:${row.user_id}:acc`,
+      },
+    ]);
+  }
+  for (const row of denied) {
+    keyboard.push([
+      {
+        text: `✅ Разрешить: ${describeUser({ ...row, id: row.user_id })}`,
+        callback_data: `ok:${row.user_id}:acc`,
+      },
+    ]);
+  }
+  keyboard.push([{ text: '🔄 Обновить', callback_data: 'admacc' }, ADMIN_TO]);
+
+  return { text, keyboard };
+}
+
+/**
+ * Полный список групп, на которые сейчас подписан хоть один включённый
+ * чат — без обрезки до топ-8, как в сводке.
+ */
+async function groupsListScreen(): Promise<Screen> {
+  const groups = await groupsInUse();
+
+  const lines = [`*${esc(`Все группы в работе (${groups.length})`)}*`, ''];
+  if (groups.length === 0) {
+    lines.push(esc('Пока ни один чат не выбрал группу.'));
+  } else {
+    for (const { group, chats } of groups) {
+      const titles = chats.map((c) => c.title ?? `чат ${c.chat_id}`).join(', ');
+      lines.push(`${esc(displayGroup(group))} — ${chats.length}`);
+      lines.push(`_${esc(titles)}_`);
+      lines.push('');
+    }
+  }
+
+  return { text: lines.join('\n').trimEnd(), keyboard: [[ADMIN_TO]] };
 }
 
 /**
@@ -1179,7 +1270,8 @@ async function runCallback(
       return;
     }
 
-    const targetId = Number(data.slice(3));
+    const [, idRaw, origin] = data.split(':');
+    const targetId = Number(idRaw);
     const approve = data.startsWith('ok:');
     await decideAccess(targetId, approve ? 'approved' : 'denied');
     ack(approve ? 'Доступ открыт' : 'Отказано');
@@ -1208,7 +1300,7 @@ async function runCallback(
       }
     }
 
-    await edit(await adminScreen());
+    await edit(origin === 'acc' ? await accessListScreen() : await adminScreen());
     return;
   }
 
@@ -1220,6 +1312,16 @@ async function runCallback(
     }
     ack();
     await edit(await adminScreen());
+    return;
+  }
+
+  if (data === 'admacc' || data === 'admgrp') {
+    if (query.from.id !== env.adminTelegramId) {
+      ack('Недоступно');
+      return;
+    }
+    ack();
+    await edit(data === 'admacc' ? await accessListScreen() : await groupsListScreen());
     return;
   }
 

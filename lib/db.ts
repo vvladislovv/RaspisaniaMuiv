@@ -794,6 +794,35 @@ export async function chatStats(): Promise<ChatStats> {
   };
 }
 
+/**
+ * Все группы, на которые сейчас подписан хотя бы один чат, с полным
+ * списком чатов у каждой — для экрана «Все группы» в сводке владельца
+ * (chatStats.topGroups обрезан до 8, этот список — без обрезки).
+ */
+export async function groupsInUse(): Promise<
+  { group: string; chats: { chat_id: number; title: string | null }[] }[]
+> {
+  const res = await db().from('chats').select('chat_id, title, groups, enabled').eq('enabled', true);
+  const rows = (check(res, 'groupsInUse') ?? []) as {
+    chat_id: number;
+    title: string | null;
+    groups: string[] | null;
+  }[];
+
+  const byGroup = new Map<string, { chat_id: number; title: string | null }[]>();
+  for (const row of rows) {
+    for (const group of row.groups ?? []) {
+      const list = byGroup.get(group) ?? [];
+      list.push({ chat_id: row.chat_id, title: row.title });
+      byGroup.set(group, list);
+    }
+  }
+
+  return [...byGroup]
+    .map(([group, chats]) => ({ group, chats }))
+    .sort((a, b) => b.chats.length - a.chats.length || a.group.localeCompare(b.group, 'ru'));
+}
+
 /** Сколько ошибок записано за последние сутки. */
 export async function errorCount(hours = 24): Promise<number> {
   const since = new Date(Date.now() - hours * 3_600_000).toISOString();
@@ -996,6 +1025,18 @@ export async function accessCounts(): Promise<Record<AccessStatus, number>> {
     approved: rows.filter((r) => r.status === 'approved').length,
     denied: rows.filter((r) => r.status === 'denied').length,
   };
+}
+
+/** Полный список заявок по статусу — для экрана «Доступ» в сводке владельца. */
+export async function accessList(status: AccessStatus, limit = 50): Promise<AccessRow[]> {
+  const res = await db()
+    .from('access')
+    .select('*')
+    .eq('status', status)
+    .order('decided_at', { ascending: false, nullsFirst: false })
+    .order('requested_at', { ascending: false })
+    .limit(limit);
+  return (check(res, 'accessList') ?? []) as AccessRow[];
 }
 
 /** Полный сброс подключённых чатов и заявок: начинаем с чистого листа. */
