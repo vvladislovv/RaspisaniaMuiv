@@ -162,6 +162,30 @@ async function maybeRefreshCatalog(session: BrowserSession): Promise<void> {
   });
 }
 
+/**
+ * Тянет расписание одной группы сразу после того, как её выбрали в чате —
+ * не дожидаясь часового тика.
+ *
+ * Часовой тик тянет только уже подписанные группы (см. `checkSite`), а
+ * значит свежую подписку он подхватит только через час. Без этого человек,
+ * только что выбравший группу, первое время видел бы пустую неделю. Ошибки
+ * тут не бросаем — не получилось сейчас, получится на следующем тике.
+ */
+export async function ingestGroupNow(groupName: string): Promise<void> {
+  try {
+    await withBrowserSession(SCHEDULE_URL, async (session) => {
+      const entry = await catalogEntry(groupName);
+      if (!entry) return;
+      const days = await fetchGroupSchedule(session.page, entry);
+      await ingestGroup(groupName, days);
+    });
+  } catch (error) {
+    await log('skip', `Мгновенная подгрузка «${groupName}» не удалась, будет на следующем тике`, {
+      details: { reason: error instanceof Error ? error.message : String(error) },
+    });
+  }
+}
+
 /** Проверяет сайт и обновляет БД. Возвращает список изменившихся файлов. */
 /**
  * Будить ли владельца на N-м подряд сбое одного файла.

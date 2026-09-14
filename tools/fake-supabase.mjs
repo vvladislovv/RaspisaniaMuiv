@@ -20,6 +20,7 @@ const PRIMARY_KEYS = {
   app_state: ['key'],
   access: ['user_id'],
   feedback: ['id'],
+  groups_catalog: ['group_name'],
 };
 
 /** Значения по умолчанию из schema.sql — заглушка их не знает сама. */
@@ -50,6 +51,7 @@ const tables = existsSync(snapshot)
       app_state: [],
       access: [],
       feedback: [],
+      groups_catalog: [],
     };
 
 /**
