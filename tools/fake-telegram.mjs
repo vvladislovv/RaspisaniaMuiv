@@ -33,6 +33,58 @@ let goneTopics = new Set();
 /** Последний текст правки на чат — чтобы изображать «message is not modified». */
 const lastEdit = new Map();
 
+/**
+ * Грубая, но полезная проверка MarkdownV2 — настоящий Telegram именно так
+ * ронял бы sendMessage/editMessageText с этим текстом. Раньше заглушка
+ * молча принимала любой текст, и опечатка в экранировании (например, сырой
+ * URL с точкой прямо в тексте) обнаруживалась только в проде.
+ *
+ * Логика: вырезаем все правильно оформленные сущности (жирный, курсив, код,
+ * зачёркивание, спойлер, ссылки — с учётом их формальных пар), а всё, что
+ * осталось, должно иметь любой из 18 зарезервированных символов
+ * экранированным обратным слэшем.
+ */
+const MDV2_RESERVED = '_*[]()~`>#+-=|{}.!';
+
+function stripEntities(text) {
+  let prev;
+  let out = text;
+  do {
+    prev = out;
+    out = out
+      // Раскрывающаяся блок-цитата: **>...|| — свой тип сущности Telegram,
+      // не «пустой жирный» + обычная цитата (см. lib/format.ts: quote())
+      .replace(/\*\*>([\s\S]*?)\|\|/g, '$1')
+      // Ссылка или кастомный эмодзи (![глиф](tg://emoji?id=...)) — текст
+      // внутри всё равно проверяется дальше как обычный
+      .replace(/!?\[([^\]\n]*)\]\(([^)\n\\]|\\.)*\)/g, '$1')
+      // Жирный/подчёркивание/зачёркивание/код — одинарные маркеры вокруг непустого текста
+      .replace(/\*([^*\n]+)\*/g, '$1')
+      .replace(/(?<![a-zA-Zа-яА-Я0-9])_([^_\n]+)_(?![a-zA-Zа-яА-Я0-9])/g, '$1')
+      .replace(/~([^~\n]+)~/g, '$1')
+      .replace(/`([^`\n]+)`/g, '$1')
+      .replace(/\|\|([^|\n]+)\|\|/g, '$1')
+      // Блок-цитата: `>` в начале строки — легальный маркер, не текст
+      .replace(/^>/gm, '');
+  } while (out !== prev);
+  return out;
+}
+
+/** Возвращает текст ошибки, если разметка невалидна, иначе null. */
+function checkMarkdownV2(text) {
+  // Сначала снимаем все экранированные символы — их наличие само по себе
+  // законно везде, включая внутри и снаружи сущностей
+  const withoutEscapes = text.replace(/\\./g, '');
+  const stripped = stripEntities(withoutEscapes);
+
+  for (const ch of stripped) {
+    if (MDV2_RESERVED.includes(ch)) {
+      return `Bad Request: can't parse entities: Character '${ch}' is reserved and must be escaped with the preceding '\\'`;
+    }
+  }
+  return null;
+}
+
 /** Кто считается админом чата — задаётся через переменную окружения. */
 const admins = new Set(
   (process.env.FAKE_TG_ADMINS ?? '')
@@ -144,6 +196,21 @@ http
         );
         return;
       }
+      if (
+        (method === 'sendMessage' || method === 'editMessageText') &&
+        body.parse_mode === 'MarkdownV2' &&
+        typeof body.text === 'string'
+      ) {
+        const markdownError = checkMarkdownV2(body.text);
+        if (markdownError) {
+          calls.push({ method, body, failed: true, markdownError });
+          writeFileSync(logPath, JSON.stringify(calls, null, 2));
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error_code: 400, description: markdownError }));
+          return;
+        }
+      }
+
       if (method === 'editMessageText') lastEdit.set(String(body.chat_id), body.text);
 
       calls.push({ method, body });
