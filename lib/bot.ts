@@ -1101,7 +1101,15 @@ async function runCallback(
   // Баги и предложения принимаем от кого угодно, в том числе из личек,
   // которых нет в базе: у неодобренного человека записи о чате не будет
   const isFeedback = data === 'fb' || data.startsWith('fb:');
-  if (!chat && !isDecision && !isFeedback && !(ctx.isPrivate && data === 'm')) {
+  // Обучалка и весь путь выбора группы из неё («Выбрать группу» → курс →
+  // группа) приходят в личку сразу после одобрения — до первого /start,
+  // то есть раньше, чем в базе появится запись о чате. Сама группа (data
+  // начинается с «g:») создаёт запись через upsertChat перед сохранением,
+  // а до этого шага чат ещё не нужен — только смотрим списки.
+  const isSetupFlow =
+    ctx.isPrivate &&
+    (data.startsWith('ob:') || data === 'grp' || data.startsWith('s:') || data.startsWith('g:'));
+  if (!chat && !isDecision && !isFeedback && !isSetupFlow && !(ctx.isPrivate && data === 'm')) {
     await answerCallbackQuery(query.id, 'Чат не подключён');
     return;
   }
