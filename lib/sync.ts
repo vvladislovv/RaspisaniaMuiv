@@ -83,6 +83,24 @@ async function ingestGroup(
   const saturdayIso = saturday.toISOString().slice(0, 10);
   const days = rawDays.filter((d) => d.date >= monday && d.date <= saturdayIso);
 
+  // Сайт отдаёт день только если у группы в нём есть хоть одна пара — если у
+  // подгруппы в четверг пар нет, сайт просто не пришлёт для неё <h2> с этой
+  // датой. Раньше это значило, что дня не было и в нашей неделе вовсе — кнопка
+  // дня пропадала из клавиатуры целиком, и выглядело как баг («куда делся
+  // четверг»), хотя на самом деле пар действительно нет. Дозаполняем пропуски
+  // пустыми днями, чтобы кнопка осталась и явно показывала «пар нет».
+  const byDate = new Map(days.map((d) => [d.date, d]));
+  const cursor = new Date(`${monday}T00:00:00Z`);
+  while (cursor.toISOString().slice(0, 10) <= saturdayIso) {
+    const date = cursor.toISOString().slice(0, 10);
+    if (!byDate.has(date)) {
+      byDate.set(date, { date, name: dayNameOf(date), lessons: [] });
+    }
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  days.length = 0;
+  days.push(...[...byDate.values()].sort((a, b) => a.date.localeCompare(b.date)));
+
   // `files.url` уникален в схеме (раньше это гарантировал сам xlsx-адрес —
   // разный при каждой перезаливке). В AJAX-модели у всех групп один и тот же
   // SCHEDULE_URL, поэтому вставка второй группы падала бы с duplicate key —
