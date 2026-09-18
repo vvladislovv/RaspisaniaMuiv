@@ -59,11 +59,19 @@ export function pairsWord(count: number): string {
   return 'пар';
 }
 
+/**
+ * Сайт иногда сам кладёт «ауд.» в ячейку («ауд.206 (колледж)»), иногда нет
+ * («503»). Срезаем чужой префикс, чтобы не получить «ауд. ауд.206».
+ */
+function normalizeRoom(raw: string): string {
+  return raw.replace(/^ауд\.?\s*/i, '').trim();
+}
+
 /** Строки одной пары внутри цитаты. */
 function lessonLines(lesson: Lesson): string[] {
   const meta: string[] = [];
   if (lesson.teacher) meta.push(esc(shortName(lesson.teacher)));
-  if (lesson.room) meta.push(esc(`ауд. ${lesson.room}`));
+  if (lesson.room) meta.push(esc(`ауд. ${normalizeRoom(lesson.room)}`));
 
   const lines = [
     `*${lesson.pair}\\.* *${esc(prettyTime(lesson.time))}*`,
