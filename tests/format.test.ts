@@ -69,6 +69,16 @@ test('formatWeek делает дни раскрывающимися цитата
   assert.match(chunks[0], /1 пара/);
 });
 
+test('formatDay не задваивает «ауд.», если сайт уже положил префикс в ячейку', () => {
+  const withPrefix: Day = {
+    ...day,
+    lessons: [{ ...day.lessons[0], room: 'ауд.206 (колледж)' }],
+  };
+  const text = formatDay(withPrefix, { group: 'ИСП/П-24-11' });
+  assert.match(text, /ауд\\\. 206 \\\(колледж\\\)/);
+  assert.doesNotMatch(text, /ауд\\\. ауд/);
+});
+
 test('formatDay без пар пишет «Пар нет»', () => {
   const text = formatDay({ date: '2026-09-06', name: 'Воскресенье', lessons: [] }, { group: 'ИСП/П-24-11' });
   assert.match(text, /Пар нет/);
