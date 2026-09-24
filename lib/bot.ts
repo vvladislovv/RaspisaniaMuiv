@@ -1603,8 +1603,11 @@ async function handleMembership(event: TgChatMemberUpdate): Promise<void> {
   const chat = await getChat(chatId);
 
   // Подключить чат может только одобренный человек. Иначе бот не остаётся
-  // в группе: молча висеть без дела — хуже, чем честно уйти.
-  if (!chat && !(await isApproved(event.from.id))) {
+  // в группе: молча висеть без дела — хуже, чем честно уйти. Личку это не
+  // касается — там это просто нажатие Start, и Telegram не даёт «выйти»
+  // из личного чата (leaveChat падает с Bad Request), а /start сам покажет
+  // экран без доступа.
+  if (event.chat.type !== 'private' && !chat && !(await isApproved(event.from.id))) {
     await log('skip', `Бота добавили без доступа в чат ${chatId}`, {
       chatId,
       details: { addedBy: event.from.id, title: event.chat.title },
