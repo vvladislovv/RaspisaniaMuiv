@@ -79,6 +79,24 @@ test('formatDay не задваивает «ауд.», если сайт уже 
   assert.doesNotMatch(text, /ауд\\\. ауд/);
 });
 
+test('formatDay добавляет «ГК», если сайт не указал здание аудитории', () => {
+  const bare: Day = {
+    ...day,
+    lessons: [{ ...day.lessons[0], room: '503' }],
+  };
+  const text = formatDay(bare, { group: 'ИСП/П-24-11' });
+  assert.match(text, /ауд\\\. 503 ГК/);
+});
+
+test('formatDay не приписывает «ГК» аудитории колледжа', () => {
+  const college: Day = {
+    ...day,
+    lessons: [{ ...day.lessons[0], room: 'ауд.206 (колледж)' }],
+  };
+  const text = formatDay(college, { group: 'ИСП/П-24-11' });
+  assert.doesNotMatch(text, /ГК/);
+});
+
 test('formatDay без пар пишет «Пар нет»', () => {
   const text = formatDay({ date: '2026-09-06', name: 'Воскресенье', lessons: [] }, { group: 'ИСП/П-24-11' });
   assert.match(text, /Пар нет/);
