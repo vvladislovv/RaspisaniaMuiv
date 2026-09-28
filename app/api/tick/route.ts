@@ -1,6 +1,6 @@
 /** Часовой тик: вызывается внешним кроном (cron-job.org) и Vercel Cron. */
 import { checkCronSecret } from '@/lib/auth';
-import { tick, noteFileFailure, noteFileOk } from '@/lib/sync';
+import { tick, noteFileFailure, noteFileOk, refreshPinned } from '@/lib/sync';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -13,7 +13,19 @@ async function run(request: Request): Promise<Response> {
     return Response.json({ error: 'unauthorized' }, { status: 401 });
   }
 
-  const force = new URL(request.url).searchParams.get('force') === '1';
+  const url = new URL(request.url);
+
+  // Перерисовывает уже закреплённые сообщения текущим кодом форматирования,
+  // не трогая сайт. Обычный тик правит закреп только когда сайт сам что-то
+  // изменил (см. tick() в lib/sync.ts) — этот путь нужен, когда меняется
+  // только код показа (например, дописали «ГК» к номеру аудитории), а
+  // расписание на сайте то же самое, и ждать естественного повода нет смысла.
+  if (url.searchParams.get('refreshPinned') === '1') {
+    const updated = await refreshPinned();
+    return Response.json({ ok: true, refreshedPinned: updated });
+  }
+
+  const force = url.searchParams.get('force') === '1';
 
   try {
     const result = await tick(force);
