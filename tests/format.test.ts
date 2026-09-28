@@ -97,6 +97,17 @@ test('formatDay не приписывает «ГК» аудитории колл
   assert.doesNotMatch(text, /ГК/);
 });
 
+test('formatDay пишет «Вебинар» вместо аудитории «Д» — это дистанционное занятие, а не корпус', () => {
+  const remote: Day = {
+    ...day,
+    lessons: [{ ...day.lessons[0], room: 'Д' }],
+  };
+  const text = formatDay(remote, { group: 'ИСП/П-24-11' });
+  assert.match(text, /Вебинар/);
+  assert.doesNotMatch(text, /ауд\\\. Д/);
+  assert.doesNotMatch(text, /ГК/);
+});
+
 test('formatDay без пар пишет «Пар нет»', () => {
   const text = formatDay({ date: '2026-09-06', name: 'Воскресенье', lessons: [] }, { group: 'ИСП/П-24-11' });
   assert.match(text, /Пар нет/);
