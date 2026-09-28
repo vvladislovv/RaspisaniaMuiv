@@ -10,6 +10,15 @@ on:
   schedule:
     - cron: '0 * * * *'
   workflow_dispatch:
+    inputs:
+      refresh_pinned:
+        description: >-
+          Перерисовать уже закреплённые сообщения текущим кодом, не трогая
+          сайт (нужно после правки форматирования, когда ждать реального
+          обновления сайта незачем)
+        required: false
+        default: 'false'
+        type: boolean
 
 concurrency:
   group: tick
@@ -24,16 +33,22 @@ jobs:
         env:
           TICK_URL: ${{ secrets.TICK_URL }}
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          REFRESH_PINNED: ${{ github.event.inputs.refresh_pinned }}
         run: |
           if [ -z "$TICK_URL" ] || [ -z "$CRON_SECRET" ]; then
             echo "Не заданы секреты TICK_URL и CRON_SECRET"
             exit 1
           fi
 
+          url="$TICK_URL"
+          if [ "$REFRESH_PINNED" = "true" ]; then
+            url="$TICK_URL?refreshPinned=1"
+          fi
+
           code=$(curl -sS -o response.json -w '%{http_code}' \
             --max-time 120 --retry 2 --retry-delay 10 \
             -H "Authorization: Bearer $CRON_SECRET" \
-            "$TICK_URL")
+            "$url")
 
           echo "HTTP $code"
           cat response.json
