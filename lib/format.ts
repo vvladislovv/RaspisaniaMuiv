@@ -72,11 +72,24 @@ function normalizeRoom(raw: string): string {
   return /колледж|ГК/i.test(room) ? room : `${room} ГК`;
 }
 
+/**
+ * Одна буква «Д» вместо номера — это не аудитория, а обозначение
+ * дистанционного занятия (вебинара). Писать «ауд. Д ГК» неправильно: это
+ * не корпус и не аудитория вовсе, и добавление «ГК» тут вводит в заблуждение.
+ */
+function isRemoteRoom(raw: string): boolean {
+  return /^д\.?$/i.test(raw.replace(/^ауд\.?\s*/i, '').trim());
+}
+
 /** Строки одной пары внутри цитаты. */
 function lessonLines(lesson: Lesson): string[] {
   const meta: string[] = [];
   if (lesson.teacher) meta.push(esc(shortName(lesson.teacher)));
-  if (lesson.room) meta.push(esc(`ауд. ${normalizeRoom(lesson.room)}`));
+  if (lesson.room) {
+    meta.push(
+      isRemoteRoom(lesson.room) ? esc('Вебинар') : esc(`ауд. ${normalizeRoom(lesson.room)}`),
+    );
+  }
 
   const lines = [
     `*${lesson.pair}\\.* *${esc(prettyTime(lesson.time))}*`,
