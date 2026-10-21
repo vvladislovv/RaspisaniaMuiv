@@ -80,6 +80,29 @@ async function waitOutChallenge(page: Page): Promise<void> {
   }
 }
 
+/** Подпись страницы техработ muiv.ru — на неё сайт отвечает вместо любого раздела. */
+const MAINTENANCE_MARKER = /Сервис временно недоступен/i;
+
+/** Сколько символов не-JSON ответа оставлять в тексте ошибки. */
+const ERROR_SNIPPET_CHARS = 200;
+
+/**
+ * Разбирает ответ `ajax.php`. Вместо JSON сайт может прислать HTML — когда он на
+ * техобслуживании раздел расписания отдаёт 301 на `/`, а там страница-заглушка.
+ * Такую причину называем прямо: иначе в алерт попадает обрезанный `<!DOCTYPE`,
+ * из которого не понять, что сломался сайт, а не бот.
+ */
+export function parseAjaxResponse(text: string): Record<string, string> {
+  try {
+    return JSON.parse(text);
+  } catch {
+    if (MAINTENANCE_MARKER.test(text)) {
+      throw new Error('сайт МУИВ на техобслуживании («Сервис временно недоступен»), расписание не отдаёт');
+    }
+    throw new Error(`ajax.php вернул не JSON: ${text.slice(0, ERROR_SNIPPET_CHARS)}`);
+  }
+}
+
 /**
  * POST на `ajax.php` из контекста страницы — теми же куками и фингерпринтом,
  * что и у обычного посетителя. Обычный `page.request` (вне рендерера) сюда не
@@ -89,20 +112,16 @@ export async function postAjax(
   page: Page,
   body: Record<string, string>,
 ): Promise<Record<string, string>> {
-  return page.evaluate(
+  const text = await page.evaluate(
     async ({ body }) => {
       const res = await fetch('/services/timetable/ajax.php', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
         body,
       });
-      const text = await res.text();
-      try {
-        return JSON.parse(text);
-      } catch {
-        throw new Error(`ajax.php вернул не JSON: ${text.slice(0, 200)}`);
-      }
+      return res.text();
     },
     { body: new URLSearchParams(body).toString() },
   );
+  return parseAjaxResponse(text);
 }
