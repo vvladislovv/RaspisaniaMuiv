@@ -47,6 +47,27 @@ test('mondayOf опознаёт неделю по её понедельнику'
   assert.equal(mondayOf('2026-09-12'), '2026-09-07');
 });
 
+test('mskDayStart — полночь по Москве, а не по UTC', async () => {
+  const { mskDayStart } = await import('../lib/time');
+
+  // 23 октября 13:00 МСК — сутки начались в 21:00 UTC накануне
+  assert.equal(mskDayStart(new Date('2026-10-23T10:00:00Z')), '2026-10-22T21:00:00.000Z');
+  // 23 октября 23:30 по UTC — это уже 24-е по Москве
+  assert.equal(mskDayStart(new Date('2026-10-23T21:30:00Z')), '2026-10-23T21:00:00.000Z');
+  // Минута до полуночи по Москве — ещё 23-е
+  assert.equal(mskDayStart(new Date('2026-10-23T20:59:00Z')), '2026-10-22T21:00:00.000Z');
+});
+
+test('isIsoDate пропускает только настоящие даты', async () => {
+  const { isIsoDate } = await import('../lib/time');
+
+  assert.equal(isIsoDate('2026-10-24'), true);
+  assert.equal(isIsoDate('2028-02-29'), true);
+  for (const bad of ['2026-13-01', '2026-02-30', '2027-02-29', '2026-1-1', 'abc', '', '2026-10-24x']) {
+    assert.equal(isIsoDate(bad), false, bad);
+  }
+});
+
 test('weekAnchor переводит на следующую неделю только в воскресенье', async () => {
   const { weekAnchor } = await import('../lib/time');
 

@@ -104,6 +104,13 @@ export function parseAjaxResponse(text: string): Record<string, string> {
 }
 
 /**
+ * Сколько ждать один ответ `ajax.php`. Без потолка зависший ответ сайта
+ * держал бы весь тик, пока функцию не убьёт лимит Vercel, — и уже скачанные
+ * группы так и не попали бы в базу.
+ */
+const AJAX_TIMEOUT_MS = 10_000;
+
+/**
  * POST на `ajax.php` из контекста страницы — теми же куками и фингерпринтом,
  * что и у обычного посетителя. Обычный `page.request` (вне рендерера) сюда не
  * годится: WAF отличает его от запроса, сделанного самой страницей.
@@ -113,15 +120,16 @@ export async function postAjax(
   body: Record<string, string>,
 ): Promise<Record<string, string>> {
   const text = await page.evaluate(
-    async ({ body }) => {
+    async ({ body, timeoutMs }) => {
       const res = await fetch('/services/timetable/ajax.php', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
         body,
+        signal: AbortSignal.timeout(timeoutMs),
       });
       return res.text();
     },
-    { body: new URLSearchParams(body).toString() },
+    { body: new URLSearchParams(body).toString(), timeoutMs: AJAX_TIMEOUT_MS },
   );
   return parseAjaxResponse(text);
 }

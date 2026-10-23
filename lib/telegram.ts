@@ -173,6 +173,13 @@ export async function editMessageText(
     // сообщение, иначе повторное нажатие плодило бы дубликаты в чате.
     if (/message is not modified/i.test(reason)) return true;
 
+    // Telegram просит притормозить: новое сообщение вместо правки упрётся
+    // в тот же лимит и только добавит нагрузки
+    if (error instanceof TelegramError && error.code === 429) {
+      console.warn('editMessageText упёрся в лимит Telegram, новое сообщение не шлю:', reason);
+      return false;
+    }
+
     if (opts.fallbackToSend === false) {
       console.warn('editMessageText не прошёл, новое сообщение слать не будем:', reason);
       return false;

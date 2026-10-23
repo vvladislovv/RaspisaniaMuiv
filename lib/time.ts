@@ -40,6 +40,28 @@ export function mskDateOffset(offset: number, now: Date = new Date()): string {
   return iso(shifted.getUTCFullYear(), shifted.getUTCMonth() + 1, shifted.getUTCDate());
 }
 
+/**
+ * Начало сегодняшних суток по МСК в UTC: `2026-10-23T00:00 МСК` →
+ * `2026-10-22T21:00:00.000Z`. Нужно для лимитов «в день» — они должны
+ * обнуляться в полночь по Москве, а не через 24 часа от первого сообщения.
+ */
+export function mskDayStart(now: Date = new Date()): string {
+  const p = mskParts(now);
+  return new Date(Date.UTC(p.year, p.month - 1, p.day) - MSK_OFFSET_MS).toISOString();
+}
+
+/**
+ * Настоящая ли это дата `ГГГГ-ММ-ДД`. Даты приходят в нажатиях кнопок, а
+ * подделать нажатие может любой клиент: мусор вроде `2026-13-45` не должен
+ * доходить до базы и превращаться в ошибку с алертом владельцу.
+ */
+export function isIsoDate(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const [y, m, d] = value.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+
 /** Название дня недели для ISO-даты. */
 export function dayNameOf(isoDate: string): string {
   const [y, m, d] = isoDate.split('-').map(Number);

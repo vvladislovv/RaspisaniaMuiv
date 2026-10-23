@@ -178,3 +178,49 @@ test('подпись автора: белая птица из набора «Х�
   // Ссылка стоит на слове, а не на адресе
   assert.doesNotMatch(line, /\[hacktaika/);
 });
+
+test('formatDayFor не выдаёт отсутствие данных за «Пар нет»', async () => {
+  const { formatDayFor, NOT_LOADED_TEXT } = await import('../lib/format');
+
+  // Тот самый случай из жалобы: у группы суббота с парами, но её неделя ещё
+  // не скачана — честно говорим «не загружено», а не «пар нет»
+  const text = formatDayFor('2026-10-24', 'Суббота', [
+    { group: 'к/о/к ЮР/са 25-09', day: null, noData: true },
+  ]);
+  assert.ok(text.includes(esc(NOT_LOADED_TEXT)));
+  assert.ok(!text.includes('Пар нет'));
+
+  // Неделя загружена, а дня нет — это действительно день без пар
+  const empty = formatDayFor('2026-10-25', 'Воскресенье', [
+    { group: 'к/о/к ЮР/са 25-09', day: null, noData: false },
+  ]);
+  assert.match(empty, /Пар нет/);
+
+  // Две группы: у одной пары, у другой данных нет — каждая со своим текстом
+  const mixed = formatDayFor('2026-09-01', 'Вторник', [
+    { group: 'ИСП/П-24-11', day },
+    { group: 'КБо 21-24', day: null, noData: true },
+  ]);
+  assert.match(mixed, /Поддержка и тестирование/);
+  assert.ok(mixed.includes(esc(NOT_LOADED_TEXT)));
+});
+
+test('formatWeek без данных говорит «не загружено»', async () => {
+  const { NOT_LOADED_TEXT } = await import('../lib/format');
+  const [chunk] = formatWeek([], { group: 'КБо 21-24' });
+  assert.ok(chunk.includes(esc(NOT_LOADED_TEXT)));
+});
+
+test('fitText режет по целым строкам и укладывается в лимит Telegram', async () => {
+  const { fitText } = await import('../lib/format');
+
+  const short = fitText(['раз', 'два']);
+  assert.equal(short, 'раз\nдва');
+
+  const lines = Array.from({ length: 500 }, (_, i) => `строка номер ${i} с текстом`);
+  const fitted = fitText(lines);
+  assert.ok(fitted.length < 4096, `длина ${fitted.length}`);
+  assert.match(fitted, /и ещё \d+ строк/);
+  // Ни одна строка не разорвана посередине
+  for (const line of fitted.split('\n').slice(0, -1)) assert.ok(lines.includes(line), line);
+});

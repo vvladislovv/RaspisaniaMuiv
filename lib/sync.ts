@@ -13,26 +13,29 @@ import {
   getFileByName,
   latestFile,
   replaceSchedules,
+  markFileParsed,
   setPinnedMessage,
   setState,
   getState,
   clearState,
   touchFile,
   upsertFile,
-  getWeek,
   weekStarts,
-  currentGroups,
-  weekDates,
   withReadCache,
-  catalogEntry,
+  acquireLock,
+  pruneOldRows,
+  releaseLock,
+  catalogEntries,
+  groupFileName,
+  groupFileStatus,
+  listGroups,
   replaceGroupsCatalog,
   resolveGroups,
   renameChatGroups,
   type Chat,
-  type FileRow,
 } from './db';
 import { log, logError } from './log';
-import { formatDayFor, type GroupDay } from './format';
+import { renderDay } from './render';
 import {
   TelegramError,
   editMessageText,
@@ -42,11 +45,19 @@ import {
   type InlineKeyboard,
   type SentMessage,
 } from './telegram';
-import { scheduleKeyboard } from './keyboard';
-import { dayNameOf, isSaturdayMsk, mskDateOffset, mskParts, mondayOf, weekAnchor } from './time';
+import { isSaturdayMsk, mskDateOffset, mskParts, mondayOf, weekAnchor } from './time';
 import { env } from './env';
+import {
+  LAST_CHECK_KEY,
+  SWEEP_ATTEMPTS_KEY,
+  forEachUntil,
+  planSweep,
+  weekBounds,
+  weekOfGroup,
+  type CheckRecord,
+  type SweepReport,
+} from './sweep';
 
-const LAST_CHECK_KEY = 'last_check';
 const LAST_SEND_KEY = 'last_send_date';
 
 export interface CheckResult {
@@ -60,151 +71,103 @@ function sha256(s: string): string {
 }
 
 /**
- * Разбор дней для одной группы — то, что раньше было «файлом» на сайте
- * (`.xlsx`), теперь получено по AJAX и не имеет ни адреса, ни своего веса в
- * байтах. Имя всё равно нужно стабильное: по нему ищется существующая
- * запись, а адрес и размер в новой модели чисто описательные.
+ * Записывает неделю одной группы в базу.
+ *
+ * Расписание приходит по AJAX и не имеет ни адреса, ни своего веса в байтах,
+ * поэтому запись в `files` ключуется именем группы (см. `groupFileName`).
+ * Неделя без единой пары не пишется вовсе — см. `weekOfGroup`.
  */
 async function ingestGroup(
   groupName: string,
   rawDays: Day[],
-): Promise<{ changed: boolean; row: FileRow | null; error?: string }> {
-  const name = `ajax:${groupName}`;
+): Promise<{ changed: boolean; empty: boolean }> {
+  const name = groupFileName(groupName);
+  const days = weekOfGroup(rawDays, weekAnchor());
+  if (!days) return { changed: false, empty: true };
 
-  // AJAX-виджет отдаёт скользящее окно до 10-12 дней вперёд — шире одной
-  // календарной недели. Вся остальная модель (кнопки дней, «Вся неделя»,
-  // недельная навигация) исторически рассчитана на «один файл — одна неделя
-  // Пн–Сб»: без обрезки один и тот же день недели встречался бы в списке
-  // кнопок дважды (день из этой недели и день из следующей). Обрезаем до
-  // недели, которая актуальна прямо сейчас.
-  const monday = mondayOf(weekAnchor());
-  const saturday = new Date(`${monday}T00:00:00Z`);
-  saturday.setUTCDate(saturday.getUTCDate() + 5);
-  const saturdayIso = saturday.toISOString().slice(0, 10);
-  const days = rawDays.filter((d) => d.date >= monday && d.date <= saturdayIso);
-
-  // Сайт отдаёт день только если у группы в нём есть хоть одна пара — если у
-  // подгруппы в четверг пар нет, сайт просто не пришлёт для неё <h2> с этой
-  // датой. Раньше это значило, что дня не было и в нашей неделе вовсе — кнопка
-  // дня пропадала из клавиатуры целиком, и выглядело как баг («куда делся
-  // четверг»), хотя на самом деле пар действительно нет. Дозаполняем пропуски
-  // пустыми днями, чтобы кнопка осталась и явно показывала «пар нет».
-  const byDate = new Map(days.map((d) => [d.date, d]));
-  const cursor = new Date(`${monday}T00:00:00Z`);
-  while (cursor.toISOString().slice(0, 10) <= saturdayIso) {
-    const date = cursor.toISOString().slice(0, 10);
-    if (!byDate.has(date)) {
-      byDate.set(date, { date, name: dayNameOf(date), lessons: [] });
-    }
-    cursor.setUTCDate(cursor.getUTCDate() + 1);
-  }
-  days.length = 0;
-  days.push(...[...byDate.values()].sort((a, b) => a.date.localeCompare(b.date)));
-
-  // `files.url` уникален в схеме (раньше это гарантировал сам xlsx-адрес —
-  // разный при каждой перезаливке). В AJAX-модели у всех групп один и тот же
-  // SCHEDULE_URL, поэтому вставка второй группы падала бы с duplicate key —
-  // различаем адрес фрагментом с именем группы.
+  // `files.url` уникален в схеме, а у всех групп один SCHEDULE_URL —
+  // различаем адрес фрагментом с именем группы
   const url = `${SCHEDULE_URL}#group=${encodeURIComponent(groupName)}`;
   const existing = await getFileByName(name);
   const hash = sha256(JSON.stringify(days));
 
   if (existing && existing.sha256 === hash && existing.parsed_ok) {
     await touchFile(name);
-    return { changed: false, row: existing };
+    return { changed: false, empty: false };
   }
 
-  const weekStart = days[0]?.date ?? null;
-  const workbook: Workbook = { weekStart, groups: [{ group: groupName, sheet: '', days }] };
+  const workbook: Workbook = {
+    weekStart: days[0].date,
+    groups: [{ group: groupName, sheet: '', days }],
+  };
 
-  try {
-    if (days.length === 0) throw new Error('Нет ни одного дня в расписании группы');
+  // Ошибку базы здесь не глотаем: её поймает обход и сложит в общий отчёт.
+  // Отдельный алерт на каждую группу при сбое Supabase — это десятки
+  // одинаковых сообщений владельцу за один тик.
+  //
+  // «Разобран» ставим только после записи дней. Иначе сбой на вставке дней
+  // оставлял бы файл с новым хешем и `parsed_ok`, и следующий тик счёл бы
+  // группу загруженной, хотя дней у неё в базе уже нет.
+  const row = await upsertFile({
+    name,
+    url,
+    title: groupName,
+    sha256: hash,
+    size: JSON.stringify(days).length,
+    siteUpdated: null,
+    weekStart: workbook.weekStart,
+    parsedOk: false,
+    parseError: 'дни недели ещё записываются',
+  });
+  const inserted = await replaceSchedules(row.id, workbook);
+  await markFileParsed(row.id);
 
-    const row = await upsertFile({
-      name,
-      url,
-      title: groupName,
-      sha256: hash,
-      size: JSON.stringify(days).length,
-      siteUpdated: null,
-      weekStart: workbook.weekStart,
-      parsedOk: true,
-      parseError: null,
-    });
-    const inserted = await replaceSchedules(row.id, workbook);
-
-    // Дублей недели тут не бывает: имя файла — стабильный ключ группы
-    // (`ajax:<group>`), upsertFile обновляет тот же ряд, а не создаёт новый.
-    // dropSupersededWeeks здесь не нужен и опасен: он чистит весь `files` без
-    // привязки к группе, а теперь на каждую группу свой ряд с той же неделей.
-    await log('file_changed', `Расписание «${groupName}» обновлено`, {
-      details: { days: days.length, rows: inserted, weekStart: workbook.weekStart },
-    });
-    return { changed: true, row };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await upsertFile({
-      name,
-      url,
-      title: groupName,
-      sha256: hash,
-      size: JSON.stringify(days).length,
-      siteUpdated: null,
-      weekStart: null,
-      parsedOk: false,
-      parseError: message,
-    });
-    await logError(`Разбор расписания «${groupName}»`, error);
-    return { changed: false, row: null, error: message };
-  }
+  await log('file_changed', `Расписание «${groupName}» обновлено`, {
+    details: { days: days.length, rows: inserted, weekStart: workbook.weekStart },
+  });
+  return { changed: true, empty: false };
 }
 
 const CATALOG_REFRESH_KEY = 'catalog_refreshed_date';
 
 /**
  * Раз в сутки обходит весь каталог университета (курс × форма обучения) и
- * обновляет `groups_catalog` — список для кнопок выбора группы в /start.
- * Часовой тик каталог не трогает: он тянет расписание только уже подписанных
- * групп, а полный обход дороже и нужен реже.
- */
-async function maybeRefreshCatalog(session: BrowserSession): Promise<void> {
-  const today = mskDateOffset(0);
-  const lastRefresh = await getState<string>(CATALOG_REFRESH_KEY);
-  if (lastRefresh === today) return;
-
-  const catalog = await fetchCatalog(session.page);
-  await replaceGroupsCatalog(catalog);
-  await setState(CATALOG_REFRESH_KEY, today);
-  await log('check', `Каталог групп обновлён: ${catalog.length}`, {
-    details: { groups: catalog.length },
-  });
-}
-
-/**
- * Тянет расписание одной группы сразу после того, как её выбрали в чате —
- * не дожидаясь часового тика.
+ * обновляет `groups_catalog` — список для кнопок выбора и очередь обхода.
  *
- * Часовой тик тянет только уже подписанные группы (см. `checkSite`), а
- * значит свежую подписку он подхватит только через час. Без этого человек,
- * только что выбравший группу, первое время видел бы пустую неделю. Ошибки
- * тут не бросаем — не получилось сейчас, получится на следующем тике.
+ * Сбой здесь не роняет тик: вчерашний каталог ничем не хуже, а расписание
+ * групп скачать всё равно нужно. Курс, пришедший без единой группы, — сбой
+ * сайта, а не расформирование всех групп разом: группы такого курса
+ * оставляем как были, иначе сотни подписок разом стали бы «группы больше
+ * нет». Остальные курсы обновляются как обычно.
  */
-export async function ingestGroupNow(groupName: string): Promise<void> {
+async function maybeRefreshCatalog(session: BrowserSession, site: SiteAccess): Promise<void> {
+  const today = mskDateOffset(0);
+  if ((await getState<string>(CATALOG_REFRESH_KEY)) === today) return;
+
   try {
-    await withBrowserSession(SCHEDULE_URL, async (session) => {
-      const entry = await catalogEntry(groupName);
-      if (!entry) return;
-      const days = await fetchGroupSchedule(session.page, entry);
-      await ingestGroup(groupName, days);
+    const catalog = await site.fetchCatalog(session.page);
+    const known = await listGroups();
+    const lostCourses = [...new Set(known.map((g) => g.sheet))].filter(
+      (year): year is string => !!year && !catalog.some((e) => e.year === year),
+    );
+
+    await replaceGroupsCatalog(catalog, lostCourses);
+    await setState(CATALOG_REFRESH_KEY, today);
+    await log('check', `Каталог групп обновлён: ${catalog.length}`, {
+      details: { groups: catalog.length, keptCourses: lostCourses },
     });
+    if (lostCourses.length > 0) {
+      await log('skip', `Сайт не отдал ни одной группы: ${lostCourses.join(', ')} — оставляю прежние`, {
+        details: { courses: lostCourses },
+      });
+    }
   } catch (error) {
-    await log('skip', `Мгновенная подгрузка «${groupName}» не удалась, будет на следующем тике`, {
+    await log('skip', 'Каталог групп не обновлён, остаётся прежний', {
       details: { reason: error instanceof Error ? error.message : String(error) },
     });
   }
 }
 
-/** Проверяет сайт и обновляет БД. Возвращает список изменившихся файлов. */
 /**
  * Будить ли владельца на N-м подряд сбое одного файла.
  *
@@ -220,11 +183,17 @@ export function shouldAlertOnStreak(streak: number): boolean {
 
 const failKey = (title: string): string => `siteFail:${title}`.slice(0, 200);
 
-/** Записывает сбой скачивания и решает, беспокоить ли владельца. */
-export async function noteFileFailure(title: string, error: unknown): Promise<void> {
+/** Ещё один сбой подряд. Возвращает длину серии. */
+async function bumpFailStreak(title: string): Promise<number> {
   const key = failKey(title);
   const streak = ((await getState<number>(key)) ?? 0) + 1;
   await setState(key, streak);
+  return streak;
+}
+
+/** Записывает сбой скачивания и решает, беспокоить ли владельца. */
+export async function noteFileFailure(title: string, error: unknown): Promise<void> {
+  const streak = await bumpFailStreak(title);
 
   if (shouldAlertOnStreak(streak)) {
     await logError(`Скачивание файла «${title}»`, error, { streak });
@@ -242,70 +211,153 @@ export async function noteFileOk(title: string): Promise<void> {
 }
 
 /**
+ * Чем ходить на сайт. По умолчанию — настоящий браузер; проверки подставляют
+ * свою заглушку, чтобы гонять обход, не трогая сайт колледжа.
+ */
+export interface SiteAccess {
+  openSession: typeof withBrowserSession;
+  fetchCatalog: typeof fetchCatalog;
+  fetchGroupSchedule: typeof fetchGroupSchedule;
+}
+
+const REAL_SITE: SiteAccess = {
+  openSession: withBrowserSession,
+  fetchCatalog,
+  fetchGroupSchedule,
+};
+
+/**
+ * Сколько групп качаем одновременно. Два запроса разом — обычное поведение
+ * страницы в браузере; больше не берём, чтобы не злить защиту сайта.
+ */
+const FETCH_CONCURRENCY = 2;
+
+/**
+ * Сколько времени отдаём обходу сайта, если его вызвали без дедлайна.
+ * Начатый запрос может идти ещё до 10 секунд (таймаут ajax.php) — это
+ * учтено в общем окне тика.
+ */
+const SWEEP_BUDGET_MS = 32_000;
+
+/**
  * Проверяет сайт и обновляет БД.
  *
- * Тянет расписание только для групп, на которые сейчас подписан хотя бы один
- * включённый чат — не весь каталог университета: один прогон поднимает
- * настоящий Chromium, и укладываться нужно в 60-секундный лимит функции.
- * Каталог всех групп (для кнопок выбора) обновляется отдельно, раз в сутки —
- * см. `maybeRefreshCatalog`.
+ * Держит в базе текущую неделю каждой группы каталога, а не только
+ * подписанных: выбранная группа сразу показывает расписание, и бот не
+ * поднимает браузер на каждое нажатие (это и роняло его под нагрузкой —
+ * `ERR_INSUFFICIENT_RESOURCES`). Очерёдность — в `planSweep`.
+ *
+ * Каждая группа пишется в базу сразу после скачивания: если время кончится,
+ * сделанное не пропадёт, а следующий тик продолжит с того же места.
  */
-export async function checkSite(): Promise<CheckResult> {
+export async function checkSite(
+  deadline: number = Date.now() + SWEEP_BUDGET_MS,
+  site: SiteAccess = REAL_SITE,
+): Promise<CheckResult> {
   const started = Date.now();
   const result: CheckResult = { filesOnSite: 0, changed: [], errors: [] };
+  const report: SweepReport = {
+    monday: weekBounds(weekAnchor()).monday,
+    planned: 0,
+    fetched: 0,
+    empty: [],
+    failed: [],
+  };
+
+  // Когда какую группу пробовали: по этому очередь вращается, а не упирается
+  // в одни и те же пустые группы (см. SweepCandidate.attemptedAt)
+  const previousAttempts = (await getState<Record<string, string>>(SWEEP_ATTEMPTS_KEY)) ?? {};
+  const attempts = new Map<string, string>();
+  let catalogNames: Set<string> | null = null;
 
   // Отметку о проверке пишем в любом случае — даже если сайт не ответил.
   // Иначе на статус-странице выглядело бы, будто крон умер, хотя недоступен сайт.
   const record = async () => {
-    await setState(LAST_CHECK_KEY, {
+    if (attempts.size > 0) {
+      const merged = Object.fromEntries(
+        [...Object.entries(previousAttempts), ...attempts].filter(
+          ([group]) => !catalogNames || catalogNames.has(group),
+        ),
+      );
+      await setState(SWEEP_ATTEMPTS_KEY, merged);
+    }
+    const value: CheckRecord = {
       at: new Date().toISOString(),
       filesOnSite: result.filesOnSite,
       changed: result.changed,
       errors: result.errors,
       durationMs: Date.now() - started,
-    });
+      sweep: report,
+    };
+    await setState(LAST_CHECK_KEY, value);
   };
 
   const chats = await activeChats();
-  const groupNames = [...new Set(chats.flatMap((c) => c.groups ?? []))];
+  const stored = [...new Set(chats.flatMap((c) => c.groups ?? []))];
 
   // Имя в подписке чата и имя в каталоге сайта совпадают не всегда: колледж
   // меняет написание («РЕК 25-09.1» → «к/о/к РЕК 25-09.1»), а точное
   // совпадение строк тут не годится — нужна та же нормализация, что и при
-  // показе расписания (resolveGroups уже её делает для рендера).
-  const resolution = await resolveGroups(groupNames);
+  // показе расписания.
+  const resolution = await resolveGroups(stored);
   for (const chat of chats) {
     if ((chat.groups ?? []).some((g) => resolution.renamed.some((r) => r.from === g))) {
       await renameChatGroups(chat.chat_id, resolution.renamed);
     }
   }
-  // Браузер поднимается в любом случае, даже без подписанных групп: раз в
-  // сутки нужно обновить каталог для кнопок выбора группы (иначе на пустой
-  // базе /start никогда не покажет ни одной группы)
-  let scheduleByGroup: Map<string, Day[] | Error>;
-  try {
-    scheduleByGroup = await withBrowserSession(SCHEDULE_URL, async (session) => {
-      await maybeRefreshCatalog(session);
+  const subscribed = new Set(resolution.actual.values());
 
-      const out = new Map<string, Day[] | Error>();
-      for (const groupName of groupNames) {
-        const canonical = resolution.actual.get(groupName);
-        if (!canonical) {
-          out.set(groupName, new Error('Группы нет в каталоге сайта — возможно, переименована'));
-          continue;
-        }
+  // Сбои подписанных групп копим и шлём владельцу одним сообщением: при
+  // аварии сайта иначе пришло бы по алерту на каждую группу
+  const alertDue: { group: string; reason: string }[] = [];
+  const noteSubscribedFailure = async (group: string, reason: string) => {
+    result.errors.push(`${group}: ${reason}`);
+    if (shouldAlertOnStreak(await bumpFailStreak(group))) alertDue.push({ group, reason });
+  };
+
+  for (const name of resolution.missing) {
+    await noteSubscribedFailure(name, 'Группы нет в каталоге сайта — возможно, переименована');
+  }
+
+  try {
+    await site.openSession(SCHEDULE_URL, async (session) => {
+      await maybeRefreshCatalog(session, site);
+
+      const [catalog, files] = await Promise.all([catalogEntries(), groupFileStatus()]);
+      const byName = new Map(catalog.map((entry) => [entry.group, entry]));
+      catalogNames = new Set(byName.keys());
+      const plan = planSweep(
+        catalog.map((entry) => {
+          const file = files.get(entry.group);
+          return {
+            group: entry.group,
+            subscribed: subscribed.has(entry.group),
+            fetchedAt: file?.fetchedAt ?? null,
+            attemptedAt: previousAttempts[entry.group] ?? null,
+            storedMonday: file?.weekStart ? mondayOf(file.weekStart) : null,
+          };
+        }),
+        report.monday,
+        Date.now(),
+      );
+      report.planned = plan.length;
+
+      await forEachUntil(plan, FETCH_CONCURRENCY, deadline, async (group) => {
+        const entry = byName.get(group);
+        if (!entry) return;
+        attempts.set(group, new Date().toISOString());
         try {
-          const entry = await catalogEntry(canonical);
-          if (!entry) {
-            out.set(groupName, new Error(`Каталог рассинхронизирован: «${canonical}» не найдена`));
-            continue;
-          }
-          out.set(groupName, await fetchGroupSchedule(session.page, entry));
+          const ingested = await ingestGroup(group, await site.fetchGroupSchedule(session.page, entry));
+          report.fetched++;
+          if (ingested.changed) result.changed.push(group);
+          if (ingested.empty) report.empty.push(group);
+          if (subscribed.has(group)) await noteFileOk(group);
         } catch (error) {
-          out.set(groupName, error instanceof Error ? error : new Error(String(error)));
+          const reason = (error instanceof Error ? error.message : String(error)).slice(0, 300);
+          report.failed.push({ group, reason });
+          if (subscribed.has(group)) await noteSubscribedFailure(group, reason);
         }
-      }
-      return out;
+      });
     });
   } catch (error) {
     result.errors.push(error instanceof Error ? error.message : String(error));
@@ -317,42 +369,45 @@ export async function checkSite(): Promise<CheckResult> {
     throw error;
   }
 
-  result.filesOnSite = groupNames.length;
+  result.filesOnSite = report.fetched;
 
-  // Пишем в БД под каноническим именем каталога, а не под тем, что было в
-  // подписке чата до переименования — иначе schedules.group_name разойдётся
-  // с уже обновлённым chats.groups (renameChatGroups выше), и getWeek/getDay
-  // не найдёт свежие данные по новому имени.
-  const ingestedCanonical = new Set<string>();
-
-  for (const groupName of groupNames) {
-    const canonical = resolution.actual.get(groupName) ?? groupName;
-    const outcome = scheduleByGroup.get(groupName);
-    try {
-      if (outcome instanceof Error) throw outcome;
-      if (ingestedCanonical.has(canonical)) continue; // уже записали под этим именем на этом тике
-      ingestedCanonical.add(canonical);
-
-      const ingested = await ingestGroup(canonical, outcome ?? []);
-      if (ingested.changed) result.changed.push(canonical);
-      if (ingested.error) result.errors.push(`${canonical}: ${ingested.error}`);
-      await noteFileOk(canonical);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      result.errors.push(`${groupName}: ${message}`);
-      await noteFileFailure(canonical, error);
-    }
+  if (alertDue.length > 0) {
+    await logError(
+      'Скачивание расписания',
+      new Error(
+        `не скачались ${alertDue.length} групп больше часа подряд: ` +
+          alertDue.map((a) => `${a.group} (${a.reason})`).join('; '),
+      ),
+    );
   }
 
   await record();
 
-  await log('check', `Проверка сайта: групп ${result.filesOnSite}, изменилось ${result.changed.length}`, {
-    durationMs: Date.now() - started,
-    details: { changed: result.changed, errors: result.errors },
-  });
+  await log(
+    'check',
+    `Проверка сайта: скачано ${report.fetched} из ${report.planned}, изменилось ${result.changed.length}`,
+    {
+      durationMs: Date.now() - started,
+      details: {
+        changed: result.changed,
+        empty: report.empty,
+        failed: report.failed,
+        errors: result.errors,
+      },
+    },
+  );
 
   return result;
 }
+
+/** Группы, чьи закрепы прошлый тик не успел перерисовать. */
+const PINNED_STALE_KEY = 'pinned_stale_groups';
+
+/** Сколько закрепов правим одновременно: Telegram терпит ~30 сообщений в секунду. */
+const REFRESH_CONCURRENCY = 4;
+
+/** Сколько времени отдаём перерисовке, если её вызвали без дедлайна. */
+const REFRESH_BUDGET_MS = 40_000;
 
 /**
  * Перерисовывает закреплённое расписание, когда колледж поменял файл.
@@ -361,29 +416,53 @@ export async function checkSite(): Promise<CheckResult> {
  * это спам, да ещё и со ссылками на команды, которых больше нет. Теперь просто
  * правим уже закреплённое сообщение: там всегда актуальные пары, а новых
  * сообщений в чате не появляется. Если править нечего или не вышло — молчим.
+ *
+ * С `groups` правятся только чаты этих групп: при двухстах чатах перерисовка
+ * всех подряд из-за одной изменившейся группы съедала бы весь тик. Чаты, до
+ * которых не дошли руки, запоминаются и идут первыми на следующем тике —
+ * иначе их закреп так и остался бы старым.
  */
-export async function refreshPinned(): Promise<number> {
-  return withReadCache(runRefreshPinned);
+export async function refreshPinned(
+  groups?: string[],
+  deadline: number = Date.now() + REFRESH_BUDGET_MS,
+): Promise<number> {
+  return withReadCache(() => runRefreshPinned(groups, deadline));
 }
 
-async function runRefreshPinned(): Promise<number> {
-  const chats = await activeChats();
+async function runRefreshPinned(groups: string[] | undefined, deadline: number): Promise<number> {
+  const leftover = groups ? ((await getState<string[]>(PINNED_STALE_KEY)) ?? []) : [];
+  const wanted = groups ? new Set([...groups, ...leftover]) : null;
+  if (wanted && wanted.size === 0) return 0;
+
   const today = mskDateOffset(0);
+  const chats = (await activeChats()).filter(
+    (chat) =>
+      (chat.groups ?? []).length > 0 &&
+      chat.pinned_msg_id &&
+      // День уже прошёл — перерисовывать нечего
+      chat.pinned_date &&
+      chat.pinned_date >= today &&
+      (!wanted || chat.groups.some((g) => wanted.has(g))),
+  );
   const weeks = await weekStarts();
+  const touched = new Set<number>();
   let updated = 0;
 
-  for (const chat of chats) {
-    const date = chat.pinned_date;
-    if ((chat.groups ?? []).length === 0 || !chat.pinned_msg_id || !date) continue;
-    // День уже прошёл — перерисовывать нечего
-    if (date < today) continue;
-
+  await forEachUntil(chats, REFRESH_CONCURRENCY, deadline, async (chat) => {
+    touched.add(chat.chat_id);
+    const date = chat.pinned_date!;
     try {
-      const rendered = await renderDay(chat.chat_id, chat.groups, date, weeks, date === today);
+      const rendered = await renderDay(
+        chat.chat_id,
+        chat.groups,
+        date,
+        weeks,
+        date === today ? 'Расписание на сегодня' : 'Расписание на завтра',
+      );
 
       const ok = await editMessageText(
         chat.chat_id,
-        chat.pinned_msg_id,
+        chat.pinned_msg_id!,
         rendered.text,
         rendered.keyboard,
         { fallbackToSend: false },
@@ -397,85 +476,40 @@ async function runRefreshPinned(): Promise<number> {
         });
       }
     } catch (error) {
-      await logError(`Обновление закреплённого сообщения в чате ${chat.chat_id}`, error);
+      // Чат — в подробностях, а не в заголовке: иначе алерты по разным
+      // чатам не схлопываются, и сбой Telegram давал бы сотню сообщений
+      await logError('Обновление закреплённого сообщения', error, { chatId: chat.chat_id });
+    }
+  });
+
+  if (wanted) {
+    const stale = [
+      ...new Set(
+        chats
+          .filter((chat) => !touched.has(chat.chat_id))
+          .flatMap((chat) => chat.groups.filter((g) => wanted.has(g))),
+      ),
+    ];
+    if (stale.length > 0) {
+      await setState(PINNED_STALE_KEY, stale);
+      await log('skip', `Не успели перерисовать закрепы: ${stale.length} групп ждут следующего тика`, {
+        details: { groups: stale },
+      });
+    } else if (leftover.length > 0) {
+      await clearState(PINNED_STALE_KEY);
     }
   }
 
   return updated;
 }
 
-/**
- * Дни недели для клавиатуры: берём все даты недели из файла, а не только те,
- * где у группы есть пары. Иначе у группы с двумя учебными днями клавиатура
- * состояла бы из двух кнопок, и в пустой день нельзя было бы заглянуть.
- */
-async function keyboardDays(
-  perGroup: { days: Day[]; file: { id: number } | null }[],
-): Promise<Day[]> {
-  const withLessons = new Map<string, Day>();
-  for (const { days } of perGroup) {
-    for (const day of days) {
-      const known = withLessons.get(day.date);
-      if (!known || known.lessons.length === 0) withLessons.set(day.date, day);
-    }
-  }
-
-  const file = perGroup.find((w) => w.file)?.file ?? null;
-  const dates = file ? await weekDates(file.id) : [...withLessons.keys()];
-
-  return dates.sort().map(
-    (date) =>
-      withLessons.get(date) ?? { date, name: dayNameOf(date), lessons: [] },
-  );
-}
-
-/**
- * Текст и кнопки расписания на день сразу по всем группам чата.
- * Общий код для рассылки и для перерисовки закреплённого сообщения.
- */
-async function renderDay(
-  chatId: number,
-  stored: string[],
-  dateIso: string,
-  weeks: string[],
-  isToday = false,
-): Promise<{ text: string; keyboard: ReturnType<typeof scheduleKeyboard> }> {
-  const { groups, missing } = await currentGroups(chatId, stored);
-  const perGroup = await Promise.all(groups.map((group) => getWeek(group, dateIso)));
-
-  const blocks: GroupDay[] = groups.map((group, index) => ({
-    group,
-    day: perGroup[index].days.find((d) => d.date === dateIso) ?? null,
-  }));
-
-  const file = perGroup.find((w) => w.file)?.file ?? null;
-
-  const merged = await keyboardDays(perGroup);
-  const hasDay = blocks.some((b) => b.day);
-
-  return {
-    text: formatDayFor(dateIso, dayNameOf(dateIso), blocks, {
-      siteUpdated: file?.site_updated ?? null,
-      heading: isToday ? 'Расписание на сегодня' : 'Расписание на завтра',
-      missing,
-    }),
-    keyboard: scheduleKeyboard(
-      merged,
-      hasDay ? dateIso : null,
-      file?.week_start ?? null,
-      weeks,
-      undefined,
-      missing,
-    ),
-  };
-}
-
 /** Сколько чатов обслуживаем одновременно. Telegram допускает ~30 сообщений в секунду. */
 const SEND_CONCURRENCY = 8;
 
 /**
- * Сколько времени отводим рассылке. Лимит функции — 60 секунд; останавливаемся
- * заранее, чтобы успеть записать состояние и вернуть ответ.
+ * Сколько времени отводим рассылке, если её вызвали без дедлайна. Лимит
+ * функции — 60 секунд; останавливаемся заранее, чтобы успеть записать
+ * состояние и вернуть ответ.
  */
 const SEND_BUDGET_MS = 45_000;
 
@@ -509,17 +543,29 @@ async function sendToTopic(
   }
 }
 
-/** Отправляет расписание одному чату. Возвращает, удалось ли. */
+type SendOutcome = 'sent' | 'failed' | 'disabled' | 'waiting';
+
+/**
+ * Отправляет расписание одному чату.
+ *
+ * Если расписание какой-то из групп чата на эту дату ещё не скачано и
+ * `allowUnready` не задан, ничего не шлёт и отвечает `waiting`: такой чат
+ * остаётся в очереди и уйдёт на следующем тике, когда данные появятся.
+ */
 async function sendToChat(
   chat: Chat,
   dateIso: string,
   weeks: string[],
-): Promise<'sent' | 'failed' | 'disabled'> {
+  allowUnready: boolean,
+): Promise<{ outcome: SendOutcome; unready: string[] }> {
   const groups = chat.groups ?? [];
-  if (groups.length === 0) return 'failed';
+  if (groups.length === 0) return { outcome: 'failed', unready: [] };
 
   try {
-    const rendered = await renderDay(chat.chat_id, groups, dateIso, weeks);
+    const rendered = await renderDay(chat.chat_id, groups, dateIso, weeks, 'Расписание на завтра');
+    if (rendered.unready.length > 0 && !allowUnready) {
+      return { outcome: 'waiting', unready: rendered.unready };
+    }
 
     // Кнопки и под закреплённым сообщением: можно листать дни, не набирая команды
     const message = await sendToTopic(chat, rendered.text, rendered.keyboard);
@@ -549,9 +595,9 @@ async function sendToChat(
 
     await log('send', `Расписание на ${dateIso} отправлено`, {
       chatId: chat.chat_id,
-      details: { groups },
+      details: { groups, unready: rendered.unready },
     });
-    return 'sent';
+    return { outcome: 'sent', unready: rendered.unready };
   } catch (error) {
     // Бота выгнали или заблокировали — выключаем чат, иначе он будет
     // впустую отъедать время рассылки каждый день
@@ -561,11 +607,11 @@ async function sendToChat(
         chatId: chat.chat_id,
         details: { reason: error.description },
       });
-      return 'disabled';
+      return { outcome: 'disabled', unready: [] };
     }
 
-    await logError(`Отправка расписания в чат ${chat.chat_id}`, error);
-    return 'failed';
+    await logError('Отправка расписания', error, { chatId: chat.chat_id });
+    return { outcome: 'failed', unready: [] };
   }
 }
 
@@ -573,7 +619,9 @@ export interface SendResult {
   sent: number;
   failed: number;
   disabled: number;
-  /** Чаты, до которых не дошли из-за нехватки времени. */
+  /** Чаты, ждущие расписания своих групп: уйдут на следующем тике. */
+  waiting: number;
+  /** Чаты, до которых не дошли из-за нехватки времени или ждущие данных. */
   pending: number;
 }
 
@@ -584,49 +632,64 @@ export interface SendResult {
  * упирался в лимит функции, и остаток молча оставался без расписания.
  * Если время всё же кончается, работа прерывается штатно — уже отправленные
  * чаты помечены датой, и следующий тик продолжит с места обрыва.
+ *
+ * `allowUnready: false` придерживает чаты, чьё расписание на завтра ещё не
+ * скачано: лучше прислать на час позже, чем разослать «Пар нет» при парах.
  */
-export async function sendTomorrow(): Promise<SendResult> {
+export async function sendTomorrow(
+  deadline: number = Date.now() + SEND_BUDGET_MS,
+  allowUnready = true,
+): Promise<SendResult> {
   // Расписание одно на всех: внутри кэша список групп и недели читаются
   // из базы один раз, а не по разу на каждый чат
-  return withReadCache(runSendTomorrow);
+  return withReadCache(() => runSendTomorrow(deadline, allowUnready));
 }
 
-async function runSendTomorrow(): Promise<SendResult> {
+async function runSendTomorrow(deadline: number, allowUnready: boolean): Promise<SendResult> {
   const dateIso = mskDateOffset(1);
   const weeks = await weekStarts();
-  const deadline = Date.now() + SEND_BUDGET_MS;
 
   const all = await activeChats();
   const queue = all.filter(
     (chat) => (chat.groups ?? []).length > 0 && chat.pinned_date !== dateIso,
   );
 
-  const result: SendResult = { sent: 0, failed: 0, disabled: 0, pending: 0 };
-  let next = 0;
+  const result: SendResult = { sent: 0, failed: 0, disabled: 0, waiting: 0, pending: 0 };
+  const waitingFor = new Set<string>();
+  const sentWithout = new Set<string>();
 
-  const worker = async () => {
-    while (true) {
-      if (Date.now() > deadline) return;
-      const index = next++;
-      if (index >= queue.length) return;
+  await forEachUntil(queue, SEND_CONCURRENCY, deadline, async (chat) => {
+    const { outcome, unready } = await sendToChat(chat, dateIso, weeks, allowUnready);
+    if (outcome === 'sent') result.sent++;
+    else if (outcome === 'disabled') result.disabled++;
+    else if (outcome === 'waiting') result.waiting++;
+    else result.failed++;
 
-      const outcome = await sendToChat(queue[index], dateIso, weeks);
-      if (outcome === 'sent') result.sent++;
-      else if (outcome === 'disabled') result.disabled++;
-      else result.failed++;
-    }
-  };
-
-  await Promise.all(
-    Array.from({ length: Math.min(SEND_CONCURRENCY, queue.length) }, () => worker()),
-  );
+    for (const group of unready) (outcome === 'waiting' ? waitingFor : sentWithout).add(group);
+  });
 
   result.pending = Math.max(0, queue.length - result.sent - result.failed - result.disabled);
 
-  if (result.pending > 0) {
-    await log('skip', `Не хватило времени: ${result.pending} чатов ждут следующего тика`, {
+  if (result.waiting > 0) {
+    await log('skip', `Ждём расписание на ${dateIso}: ${result.waiting} чатов`, {
+      details: { groups: [...waitingFor] },
+    });
+  }
+
+  const outOfTime = result.pending - result.waiting;
+  if (outOfTime > 0) {
+    await log('skip', `Не хватило времени: ${outOfTime} чатов ждут следующего тика`, {
       details: { queue: queue.length, ...result },
     });
+  }
+
+  // Ждать дальше было нельзя, и часть чатов получила «ещё не загружено».
+  // Владелец должен узнать об этом сам, а не от студентов утром
+  if (sentWithout.size > 0) {
+    await logError(
+      'Рассылка без расписания',
+      new Error(`на ${dateIso} не загрузилось: ${[...sentWithout].join(', ')}`),
+    );
   }
 
   return result;
@@ -634,20 +697,99 @@ async function runSendTomorrow(): Promise<SendResult> {
 
 export interface TickResult {
   check: CheckResult | null;
+  /** Другой тик ещё идёт — этот ничего не делал. */
+  locked?: boolean;
   autoSend: 'sent' | 'skipped-saturday' | 'skipped-hour' | 'skipped-already' | 'skipped-parse-error' | null;
   sent?: number;
   failed?: number;
   disabled?: number;
+  waiting?: number;
   pending?: number;
 }
 
+/**
+ * Время тика. Лимит функции — 60 секунд, и всё расписано так, чтобы
+ * закончить раньше: обход сайта, перерисовка закрепов и рассылка делят
+ * одно окно, а не берут каждый по своему. Раньше обход и рассылка
+ * укладывались по отдельности, а вместе выходили за лимит.
+ */
+const TICK_BUDGET_MS = 45_000;
+
+/**
+ * В час рассылки сайту достаётся меньше: группы на завтра уже скачаны
+ * прошлыми тиками, а отправка при сотнях чатов занимает заметное время.
+ */
+const SWEEP_BUDGET_SEND_MS = 15_000;
+
+/** Перерисовке закрепов — после обхода, но не дольше этого. */
+const REFRESH_AFTER_SWEEP_MS = 10_000;
+
+/**
+ * Сколько часов после часа рассылки ждём расписание на завтра. Дальше
+ * рассылаем что есть: позднее сообщение никому не поможет.
+ */
+const SEND_WAIT_HOURS = 4;
+
+/** Почему рассылки на этом тике нет; null — пора рассылать. */
+async function sendSkipReason(now: Date): Promise<TickResult['autoSend']> {
+  if (isSaturdayMsk(now)) return 'skipped-saturday';
+  // «Не раньше», а не «ровно в»: если тик в нужный час пропал (крон опоздал,
+  // Vercel был недоступен), рассылка уйдёт на следующем тике, а не потеряется.
+  if (mskParts(now).hour < env.sendHourMsk) return 'skipped-hour';
+  if ((await getState<string>(LAST_SEND_KEY)) === mskDateOffset(0, now)) return 'skipped-already';
+  return null;
+}
+
+const PRUNE_KEY = 'pruned_date';
+
+/** Раз в сутки чистит старые логи и счётчики частоты. Сбой — не повод ронять тик. */
+async function maybePrune(): Promise<void> {
+  const today = mskDateOffset(0);
+  try {
+    if ((await getState<string>(PRUNE_KEY)) === today) return;
+    await pruneOldRows();
+    await setState(PRUNE_KEY, today);
+  } catch (error) {
+    await log('skip', 'Чистка старых строк не удалась, попробую на следующем тике', {
+      details: { reason: error instanceof Error ? error.message : String(error) },
+    });
+  }
+}
+
+/** Замок тика и сколько он живёт, если его не сняли: чуть дольше лимита функции. */
+const TICK_LOCK_KEY = 'tick_lock';
+const TICK_LOCK_TTL_MS = 75_000;
+
 /** Один часовой тик: проверить сайт, при необходимости разослать. */
 export async function tick(force = false): Promise<TickResult> {
-  const out: TickResult = { check: null, autoSend: null };
+  if (!(await acquireLock(TICK_LOCK_KEY, TICK_LOCK_TTL_MS))) {
+    await log('skip', 'Предыдущий тик ещё идёт — этот пропускаю');
+    return { check: null, autoSend: null, locked: true };
+  }
 
   try {
-    out.check = await checkSite();
-    if (out.check.changed.length > 0) await refreshPinned();
+    return await runTick(force);
+  } finally {
+    // Не сняли — не страшно: замок протухнет сам через TICK_LOCK_TTL_MS
+    await releaseLock(TICK_LOCK_KEY).catch((error) =>
+      console.warn('Замок тика не снят:', error instanceof Error ? error.message : String(error)),
+    );
+  }
+}
+
+async function runTick(force: boolean): Promise<TickResult> {
+  const started = Date.now();
+  const now = new Date(started);
+  const out: TickResult = { check: null, autoSend: null };
+
+  // Про рассылку решаем до обхода сайта: от этого зависит, сколько времени
+  // можно отдать сайту, а сколько оставить на отправку
+  const skip = force ? null : await sendSkipReason(now);
+  const sweepUntil = started + (skip ? SWEEP_BUDGET_MS : SWEEP_BUDGET_SEND_MS);
+  const tickUntil = started + TICK_BUDGET_MS;
+
+  try {
+    out.check = await checkSite(sweepUntil);
     // Проверка сайта прошла — если до этого была серия сбоев, она кончилась
     await noteFileOk('Проверка сайта');
   } catch (error) {
@@ -663,27 +805,20 @@ export async function tick(force = false): Promise<TickResult> {
     };
   }
 
-  const now = new Date();
-  const { hour } = mskParts(now);
-  const today = mskDateOffset(0, now);
+  // Отдельно от проверки: сбой перерисовки не должен выдавать себя за сбой
+  // сайта и стирать отчёт о том, что скачалось
+  try {
+    await refreshPinned(out.check.changed, Math.min(tickUntil, sweepUntil + REFRESH_AFTER_SWEEP_MS));
+  } catch (error) {
+    await logError('Перерисовка закреплённых сообщений', error);
+  }
 
-  if (!force) {
-    if (isSaturdayMsk(now)) {
-      out.autoSend = 'skipped-saturday';
-      await log('skip', 'Суббота — автоотправку не делаем');
-      return out;
-    }
-    // «Не раньше», а не «ровно в»: если тик в нужный час пропал (крон опоздал,
-    // Vercel был недоступен), рассылка уйдёт на следующем тике, а не потеряется.
-    if (hour < env.sendHourMsk) {
-      out.autoSend = 'skipped-hour';
-      return out;
-    }
-    const lastSend = await getState<string>(LAST_SEND_KEY);
-    if (lastSend === today) {
-      out.autoSend = 'skipped-already';
-      return out;
-    }
+  await maybePrune();
+
+  if (skip) {
+    out.autoSend = skip;
+    if (skip === 'skipped-saturday') await log('skip', 'Суббота — автоотправку не делаем');
+    return out;
   }
 
   const file = await latestFile();
@@ -693,16 +828,19 @@ export async function tick(force = false): Promise<TickResult> {
     return out;
   }
 
-  const outcome = await sendTomorrow();
+  const allowUnready =
+    force || mskParts(now).hour >= Math.min(23, env.sendHourMsk + SEND_WAIT_HOURS);
+  const outcome = await sendTomorrow(tickUntil, allowUnready);
   out.autoSend = 'sent';
   out.sent = outcome.sent;
   out.failed = outcome.failed;
   out.disabled = outcome.disabled;
+  out.waiting = outcome.waiting;
   out.pending = outcome.pending;
 
   // День помечаем отправленным, только когда очередь разошлась полностью,
   // иначе остаток чатов никогда не получит расписание
-  if (outcome.pending === 0) await setState(LAST_SEND_KEY, today);
+  if (outcome.pending === 0) await setState(LAST_SEND_KEY, mskDateOffset(0, now));
 
   return out;
 }

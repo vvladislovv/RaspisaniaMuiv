@@ -136,10 +136,19 @@ export interface DayMessageOptions {
 export interface GroupDay {
   group: string;
   day: Day | null;
+  /**
+   * Недели с этой датой в базе нет вовсе: расписание ещё не скачано или
+   * сайт его не выложил. «Пар нет» тут было бы враньём.
+   */
+  noData?: boolean;
 }
 
+/** Что показать вместо пар, пока расписания группы в базе нет. */
+export const NOT_LOADED_TEXT = 'Расписание ещё не загружено — обновлю, как только оно появится на сайте';
+
 /** Пары одной группы в виде цитаты. */
-function dayQuote(day: Day | null): string {
+function dayQuote(day: Day | null, noData = false): string {
+  if (noData) return quote([`⏳ _${esc(NOT_LOADED_TEXT)}_`]);
   if (!day || day.lessons.length === 0) return quote([`_${esc('Пар нет')}_`]);
 
   const lines: string[] = [];
@@ -176,7 +185,7 @@ export function formatDayFor(
   for (const block of blocks) {
     parts.push('');
     parts.push(`👥 *${esc(displayGroup(block.group))}*`);
-    parts.push(dayQuote(block.day));
+    parts.push(dayQuote(block.day, block.noData));
   }
 
   if (blocks.length === 0 && (opts.missing?.length ?? 0) === 0) {
@@ -241,6 +250,31 @@ export function formatEmptyDay(
 const TELEGRAM_LIMIT = 4096;
 
 /**
+ * Склеивает строки экрана, не вылезая за лимит сообщения Telegram.
+ *
+ * Списки владельца (группы, заявки, сбои) растут вместе с числом людей, и
+ * сообщение длиннее 4096 символов Telegram просто не принимает — экран
+ * переставал открываться ровно тогда, когда людей становилось много.
+ * Режем по целым строкам, чтобы не разорвать разметку посередине.
+ */
+export function fitText(lines: string[], limit = TELEGRAM_LIMIT - 200): string {
+  const out: string[] = [];
+  let length = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const next = length + lines[i].length + 1;
+    if (next > limit) {
+      out.push(`_${esc(`…и ещё ${lines.length - i} строк`)}_`);
+      break;
+    }
+    out.push(lines[i]);
+    length = next;
+  }
+
+  return out.join('\n');
+}
+
+/**
  * Сообщение со всей неделей: каждый день — раскрывающаяся цитата, поэтому
  * сообщение читается как список дней, а подробности открываются тапом.
  * Режет на части, если не влезает в лимит.
@@ -267,7 +301,7 @@ export function formatWeek(days: Day[], opts: DayMessageOptions): string[] {
     return quote(lines, true);
   });
 
-  if (blocks.length === 0) blocks.push(quote(['_Нет данных за эту неделю_']));
+  if (blocks.length === 0) blocks.push(quote([`⏳ _${esc(NOT_LOADED_TEXT)}_`]));
 
   const footer = opts.siteUpdated ? ['', `_Файл обновлён: ${esc(opts.siteUpdated)}_`] : [];
 
