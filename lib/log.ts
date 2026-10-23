@@ -28,6 +28,13 @@ export async function log(
  */
 const ALERT_REPEAT_MS = 60 * 60 * 1000;
 
+/**
+ * Отметки об алертах на случай, когда база недоступна. Без них при упавшей
+ * базе каждое входящее обновление присылало бы владельцу по алерту: сотня
+ * нажатий — сотня одинаковых сообщений.
+ */
+const alertedWithoutDb = new Map<string, number>();
+
 /** Не пора ли снова беспокоить владельца этой же ошибкой. */
 async function shouldAlert(context: string): Promise<boolean> {
   const key = `alert:${context}`.slice(0, 200);
@@ -37,7 +44,11 @@ async function shouldAlert(context: string): Promise<boolean> {
     await setState(key, new Date().toISOString());
     return true;
   } catch {
-    // Не смогли прочитать состояние — лучше предупредить, чем промолчать
+    // Не смогли прочитать состояние — лучше предупредить, чем промолчать,
+    // но не чаще раза в час на процесс
+    const last = alertedWithoutDb.get(key);
+    if (last && Date.now() - last < ALERT_REPEAT_MS) return false;
+    alertedWithoutDb.set(key, Date.now());
     return true;
   }
 }

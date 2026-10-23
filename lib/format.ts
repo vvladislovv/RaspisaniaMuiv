@@ -60,36 +60,46 @@ export function pairsWord(count: number): string {
 }
 
 /**
- * Сайт иногда сам кладёт «ауд.» в ячейку («ауд.206 (колледж)»), иногда нет
- * («503»). Срезаем чужой префикс, чтобы не получить «ауд. ауд.206».
- *
- * Здание сайт пишет только для колледжа — «(колледж)». Для главного корпуса
- * здание не указывает вовсе, и голый номер («503») легко спутать с
- * колледжем, поэтому там, где сайт не написал колледж, добавляем «ГК» сами.
+ * Пометка «ауд.» как отдельное слово, с точкой или без: «ауд.536»,
+ * «ауд. 536», «536 ауд.». Слова вроде «Аудитория» не трогает.
  */
-function normalizeRoom(raw: string): string {
-  const room = raw.replace(/^ауд\.?\s*/i, '').trim();
-  return /колледж|ГК/i.test(room) ? room : `${room} ГК`;
-}
+const ROOM_MARK = /(?<![а-яё])ауд(?:\.|(?![а-яё]))/gi;
 
 /**
- * Одна буква «Д» вместо номера — это не аудитория, а обозначение
- * дистанционного занятия (вебинара). Писать «ауд. Д ГК» неправильно: это
- * не корпус и не аудитория вовсе, и добавление «ГК» тут вводит в заблуждение.
+ * Как показать аудиторию пары. null — показывать нечего.
+ *
+ * Сайт пишет аудиторию как придётся (все виды — в тестах `tests/format.test.ts`):
+ * - «ауд.» бывает в начале, в конце и дважды («ауд.ауд. 536.»), а в конце
+ *   бывает лишняя точка. Всё это срезаем и ставим одно «ауд.» сами.
+ * - Здание сайт пишет только для колледжа — «(колледж)». Для главного
+ *   корпуса не пишет, и голый номер («503») легко спутать с колледжем,
+ *   поэтому номеру без колледжа дописываем «ГК».
+ * - Одна буква «Д» — не аудитория, а дистанционное занятие (вебинар).
+ * - Место без номера («спортзал», «Стадион "Торпедо"») — не аудитория и
+ *   не корпус: «ауд.» и «ГК» к нему не приписываем.
  */
-function isRemoteRoom(raw: string): boolean {
-  return /^д\.?$/i.test(raw.replace(/^ауд\.?\s*/i, '').trim());
+export function roomLabel(raw: string): string | null {
+  const room = raw
+    .replace(ROOM_MARK, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/^[\s.]+|[\s.]+$/g, '');
+
+  if (room === '') return null;
+  if (/^д$/i.test(room)) return 'Вебинар';
+
+  if (/\d/.test(room)) {
+    return /колледж|ГК/i.test(room) ? `ауд. ${room}` : `ауд. ${room} ГК`;
+  }
+
+  return room[0].toUpperCase() + room.slice(1);
 }
 
 /** Строки одной пары внутри цитаты. */
 function lessonLines(lesson: Lesson): string[] {
   const meta: string[] = [];
   if (lesson.teacher) meta.push(esc(shortName(lesson.teacher)));
-  if (lesson.room) {
-    meta.push(
-      isRemoteRoom(lesson.room) ? esc('Вебинар') : esc(`ауд. ${normalizeRoom(lesson.room)}`),
-    );
-  }
+  const room = lesson.room ? roomLabel(lesson.room) : null;
+  if (room) meta.push(esc(room));
 
   const lines = [
     `*${lesson.pair}\\.* *${esc(prettyTime(lesson.time))}*`,
@@ -136,10 +146,19 @@ export interface DayMessageOptions {
 export interface GroupDay {
   group: string;
   day: Day | null;
+  /**
+   * Недели с этой датой в базе нет вовсе: расписание ещё не скачано или
+   * сайт его не выложил. «Пар нет» тут было бы враньём.
+   */
+  noData?: boolean;
 }
 
+/** Что показать вместо пар, пока расписания группы в базе нет. */
+export const NOT_LOADED_TEXT = 'Расписание ещё не загружено — обновлю, как только оно появится на сайте';
+
 /** Пары одной группы в виде цитаты. */
-function dayQuote(day: Day | null): string {
+function dayQuote(day: Day | null, noData = false): string {
+  if (noData) return quote([`⏳ _${esc(NOT_LOADED_TEXT)}_`]);
   if (!day || day.lessons.length === 0) return quote([`_${esc('Пар нет')}_`]);
 
   const lines: string[] = [];
@@ -176,7 +195,7 @@ export function formatDayFor(
   for (const block of blocks) {
     parts.push('');
     parts.push(`👥 *${esc(displayGroup(block.group))}*`);
-    parts.push(dayQuote(block.day));
+    parts.push(dayQuote(block.day, block.noData));
   }
 
   if (blocks.length === 0 && (opts.missing?.length ?? 0) === 0) {
@@ -241,6 +260,31 @@ export function formatEmptyDay(
 const TELEGRAM_LIMIT = 4096;
 
 /**
+ * Склеивает строки экрана, не вылезая за лимит сообщения Telegram.
+ *
+ * Списки владельца (группы, заявки, сбои) растут вместе с числом людей, и
+ * сообщение длиннее 4096 символов Telegram просто не принимает — экран
+ * переставал открываться ровно тогда, когда людей становилось много.
+ * Режем по целым строкам, чтобы не разорвать разметку посередине.
+ */
+export function fitText(lines: string[], limit = TELEGRAM_LIMIT - 200): string {
+  const out: string[] = [];
+  let length = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const next = length + lines[i].length + 1;
+    if (next > limit) {
+      out.push(`_${esc(`…и ещё ${lines.length - i} строк`)}_`);
+      break;
+    }
+    out.push(lines[i]);
+    length = next;
+  }
+
+  return out.join('\n');
+}
+
+/**
  * Сообщение со всей неделей: каждый день — раскрывающаяся цитата, поэтому
  * сообщение читается как список дней, а подробности открываются тапом.
  * Режет на части, если не влезает в лимит.
@@ -267,7 +311,7 @@ export function formatWeek(days: Day[], opts: DayMessageOptions): string[] {
     return quote(lines, true);
   });
 
-  if (blocks.length === 0) blocks.push(quote(['_Нет данных за эту неделю_']));
+  if (blocks.length === 0) blocks.push(quote([`⏳ _${esc(NOT_LOADED_TEXT)}_`]));
 
   const footer = opts.siteUpdated ? ['', `_Файл обновлён: ${esc(opts.siteUpdated)}_`] : [];
 

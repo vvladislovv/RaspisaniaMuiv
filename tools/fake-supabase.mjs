@@ -112,8 +112,15 @@ function applyFilters(rows, params) {
           return String(cell) > String(value);
         case 'lt':
           return String(cell) < String(value);
-        case 'in':
-          return String(value).split(',').includes(String(cell));
+        case 'in': {
+          // PostgREST шлёт список как `in.(1,2)` или `in.("а","б")`
+          const list = rest
+            .join('.')
+            .replace(/^\(|\)$/g, '')
+            .split(',')
+            .map((item) => item.replace(/^"|"$/g, ''));
+          return list.includes(String(cell));
+        }
         case 'like':
         case 'ilike': {
           // PostgREST использует * как подстановочный знак

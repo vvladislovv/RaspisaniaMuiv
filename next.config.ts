@@ -9,10 +9,10 @@ const config: NextConfig = {
   // а chromium.executablePath() строит путь к бинарнику динамически — без явного
   // включения каталог bin/ в бандл не попадает и в проде падает с ENOENT.
   outputFileTracingIncludes: {
+    // Только тик: бот браузер больше не поднимает — расписание всех групп
+    // заранее лежит в базе (см. lib/sweep.ts), а Chromium на каждое нажатие
+    // под наплывом людей ронял функцию с ERR_INSUFFICIENT_RESOURCES
     '/api/tick': ['./node_modules/@sparticuz/chromium/bin/**'],
-    // /api/bot тоже поднимает Chromium — сразу после выбора группы подтягивает
-    // её расписание, не дожидаясь часового тика (см. ingestGroupNow)
-    '/api/bot': ['./node_modules/@sparticuz/chromium/bin/**'],
   },
   async headers() {
     return [

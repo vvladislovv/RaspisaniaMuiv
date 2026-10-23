@@ -8,34 +8,30 @@ import {
   allowRequest,
   getChat,
   getWeek,
-  latestFile,
   listGroups,
-  chatStats,
-  errorCount,
   migrateChat,
   setChatEnabled,
   setChatTopic,
   toggleChatGroup,
   currentGroups,
   weekDates,
-  fileForDate,
   requestAccess,
   decideAccess,
   isApproved,
   getAccess,
-  pendingRequests,
-  accessCounts,
-  accessList,
-  groupsInUse,
+  accessRequestsSince,
+  getFileByName,
+  groupFileName,
+  resolveGroups,
   MAX_GROUPS,
   upsertChat,
   getState,
   setState,
+  takeState,
   weekStarts,
   clearState,
   addFeedback,
-  feedbackFrom,
-  feedbackStats,
+  feedbackSince,
   type Chat,
   type FeedbackKind,
 } from './db';
@@ -50,22 +46,35 @@ import {
   TelegramError,
   type InlineKeyboard,
 } from './telegram';
-import { emojiTag, esc, formatDayFor, formatWeek, humanDate, quote, type GroupDay } from './format';
+import { emojiTag, esc, formatWeek, humanDate, quote } from './format';
 import {
   feedbackButton,
   feedbackCancelKeyboard,
   feedbackKindKeyboard,
   groupKeyboard,
+  isAccessSection,
   menuKeyboard,
   scheduleKeyboard,
   sheetKeyboard,
   statusKeyboard,
+  type Screen,
 } from './keyboard';
-import { dayNameOf, mskDateOffset, mskStamp, mskToday, weekAnchor } from './time';
+import { dayNameOf, isIsoDate, mskDateOffset, mskDayStart, mskStamp, mskToday, weekAnchor } from './time';
 import type { Day } from './parse';
 import { env } from './env';
-import { LAST_CHECK_KEY, ingestGroupNow } from './sync';
+import { LAST_CHECK_KEY, weekCovers, type CheckRecord } from './sweep';
+import { renderDay } from './render';
+import {
+  accessOverviewScreen,
+  accessSectionScreen,
+  adminScreen,
+  groupsListScreen,
+  loadScreen,
+} from './admin';
+import { describeUser } from './people';
 import { displayGroup } from './aliases';
+
+export { describeUser };
 
 // ─── Типы апдейтов (только используемые поля) ────────────────────────────────
 
@@ -124,12 +133,6 @@ export interface TgUpdate {
   callback_query?: TgCallbackQuery;
   /** Бота добавили в чат или удалили из него. */
   my_chat_member?: TgChatMemberUpdate;
-}
-
-/** Один экран: текст сообщения и кнопки под ним. */
-interface Screen {
-  text: string;
-  keyboard: InlineKeyboard;
 }
 
 // ─── Экраны ──────────────────────────────────────────────────────────────────
@@ -245,66 +248,6 @@ function accessScreen(status: 'pending' | 'denied'): Screen {
   return { text: lines.join('\n'), keyboard: [[feedbackButton(true, null)]] };
 }
 
-/**
- * Как назвать человека в заявке.
- *
- * Имя в Telegram часто совпадает с юзернеймом («Deviil_clown03» и
- * «@Devil_clown03»), и печатать оба — значит показывать одно и то же дважды.
- * Поэтому сравниваем без учёта регистра и подчёркиваний.
- */
-/** Расстояние редактирования: сколько правок отделяет одну строку от другой. */
-function editDistance(a: string, b: string): number {
-  if (a === b) return 0;
-  if (a.length === 0 || b.length === 0) return Math.max(a.length, b.length);
-
-  let previous = Array.from({ length: b.length + 1 }, (_, i) => i);
-
-  for (let i = 1; i <= a.length; i++) {
-    const current = [i];
-    for (let j = 1; j <= b.length; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      current[j] = Math.min(current[j - 1] + 1, previous[j] + 1, previous[j - 1] + cost);
-    }
-    previous = current;
-  }
-
-  return previous[b.length];
-}
-
-/**
- * Имя и юзернейм — про одного и того же человека?
- *
- * Люди ставят имя почти как юзернейм и делают опечатки: «Deviil_clown03» при
- * «@Devil_clown03». Точное сравнение такое не поймает, поэтому допускаем
- * пару правок — но только на достаточно длинных строках, чтобы не склеить
- * действительно разные короткие имена.
- */
-function looksLikeSameHandle(name: string, handle: string): boolean {
-  const plain = (value: string) => value.toLowerCase().replace(/[_\s.\-]/g, '');
-  const a = plain(name);
-  const b = plain(handle);
-
-  if (a === b) return true;
-  if (Math.min(a.length, b.length) < 6) return false;
-  if (Math.abs(a.length - b.length) > 2) return false;
-
-  return editDistance(a, b) <= 2;
-}
-
-export function describeUser(user: {
-  username?: string | null;
-  first_name?: string | null;
-  id?: number;
-}): string {
-  const name = user.first_name?.trim() || null;
-  const handle = user.username?.trim() || null;
-
-  if (handle && (!name || looksLikeSameHandle(name, handle))) return `@${handle}`;
-  if (name && handle) return `${name} (@${handle})`;
-  if (name) return name;
-  return user.id ? `ID ${user.id}` : 'без имени';
-}
-
 // ─── Баги и предложения ──────────────────────────────────────────────────────
 
 /**
@@ -316,8 +259,25 @@ const FEEDBACK_KINDS: Record<FeedbackKind, { title: string; emoji: string; tag: 
   idea: { title: 'Предложение', emoji: '💡', tag: '#предложение' },
 };
 
-/** Сколько сообщений от одного человека в час бот согласен передать. */
-const FEEDBACK_PER_HOUR = 5;
+/**
+ * Сколько багов и предложений человек может передать за день (сутки по МСК).
+ *
+ * Без одобренного доступа — одно: написать может кто угодно, и это главная
+ * дверь для спама. С доступом — три: хватит описать пару поломок, но не
+ * хватит, чтобы завалить владельца.
+ */
+export const FEEDBACK_PER_DAY = { approved: 3, other: 1 } as const;
+
+export function feedbackLimit(approved: boolean): number {
+  return approved ? FEEDBACK_PER_DAY.approved : FEEDBACK_PER_DAY.other;
+}
+
+/**
+ * Сколько уведомлений об обратной связи в час владелец получает от всех
+ * вместе. Сверх этого сообщения сохраняются и видны в сводке, но в личку
+ * не идут: тысяча новых аккаунтов по одному сообщению — та же тысяча.
+ */
+const FEEDBACK_NOTIFY_PER_HOUR = 30;
 
 /** Длиннее не примем: это заметка автору, а не переписка. */
 const FEEDBACK_MAX_LEN = 1000;
@@ -335,20 +295,59 @@ interface FeedbackWait {
   at: string;
 }
 
+/** «1 сообщение», «3 сообщения», «5 сообщений». */
+function messagesWord(count: number): string {
+  const mod100 = count % 100;
+  const mod10 = count % 10;
+  if (mod100 >= 11 && mod100 <= 14) return 'сообщений';
+  if (mod10 === 1) return 'сообщение';
+  if (mod10 >= 2 && mod10 <= 4) return 'сообщения';
+  return 'сообщений';
+}
+
+/** Сколько человек ещё может отправить сегодня. */
+async function feedbackLeft(userId: number): Promise<{ limit: number; left: number }> {
+  const [approved, used] = await Promise.all([
+    isApproved(userId),
+    feedbackSince(mskDayStart(), userId),
+  ]);
+  const limit = feedbackLimit(approved);
+  return { limit, left: Math.max(0, limit - used) };
+}
+
+/** Лимит на сегодня исчерпан: говорим прямо, сколько можно и когда снова. */
+function feedbackLimitScreen(limit: number): Screen {
+  const more =
+    limit < FEEDBACK_PER_DAY.approved
+      ? ` С одобренным доступом — до ${FEEDBACK_PER_DAY.approved}.`
+      : '';
+  return {
+    text: [
+      '*Баг или предложение*',
+      '',
+      esc(`На сегодня всё: в день можно передать ${limit} ${messagesWord(limit)}.${more}`),
+      esc('Завтра можно снова — лимит обнуляется в полночь по Москве.'),
+    ].join('\n'),
+    keyboard: [[{ text: '↩︎ Меню', callback_data: 'm' }]],
+  };
+}
+
 /** Экран выбора тега. */
-function feedbackScreen(): Screen {
+function feedbackScreen(left: number): Screen {
   return {
     text: [
       '*Баг или предложение*',
       '',
       esc('Нашёл ошибку или придумал, чего не хватает? Выбери, что это, и напиши одним сообщением — я передам автору.'),
+      '',
+      `_${esc(`Сегодня можно ещё: ${left}`)}_`,
     ].join('\n'),
     keyboard: feedbackKindKeyboard(),
   };
 }
 
 /** Экран ожидания текста. */
-function feedbackComposeScreen(kind: FeedbackKind): Screen {
+function feedbackComposeScreen(kind: FeedbackKind, left: number): Screen {
   const info = FEEDBACK_KINDS[kind];
   return {
     text: [
@@ -360,10 +359,29 @@ function feedbackComposeScreen(kind: FeedbackKind): Screen {
           : 'Напиши следующим сообщением, чего не хватает.',
       ),
       '',
-      `_${esc(`Одно сообщение, до ${FEEDBACK_MAX_LEN} символов.`)}_`,
+      `_${esc(`Одно сообщение, до ${FEEDBACK_MAX_LEN} символов. Сегодня можно ещё: ${left}.`)}_`,
     ].join('\n'),
     keyboard: feedbackCancelKeyboard(),
   };
+}
+
+/**
+ * Экран обратной связи с учётом лимита: выбор тега, ожидание текста или
+ * «на сегодня всё». Ожидание текста заводится только если лимит не исчерпан,
+ * иначе человек напишет длинное сообщение, а бот его не примет.
+ */
+async function feedbackEntry(userId: number, kind: FeedbackKind | null): Promise<Screen> {
+  const { limit, left } = await feedbackLeft(userId);
+  if (left === 0) {
+    await clearState(feedbackKey(userId));
+    return feedbackLimitScreen(limit);
+  }
+  if (!kind) {
+    await clearState(feedbackKey(userId));
+    return feedbackScreen(left);
+  }
+  await setState(feedbackKey(userId), { kind, at: new Date().toISOString() });
+  return feedbackComposeScreen(kind, left);
 }
 
 /** Уведомление владельцу: тег видно первой строкой. */
@@ -377,6 +395,22 @@ function feedbackNotice(kind: FeedbackKind, user: TgUser, text: string): string 
     '',
     quote(text.split('\n').map((line) => esc(line))),
   ].join('\n');
+}
+
+/**
+ * Сколько уведомлений о новых заявках владелец получает в час. Обычный
+ * наплыв (двести человек за утро) сюда укладывается; сверх — заявки всё
+ * равно видны в разделе «Ждут решения».
+ */
+const ACCESS_NOTIFY_PER_HOUR = 60;
+
+async function shouldNotifyRequest(): Promise<boolean> {
+  const lastHour = await accessRequestsSince(new Date(Date.now() - 3_600_000).toISOString());
+  if (lastHour <= ACCESS_NOTIFY_PER_HOUR) return true;
+  await log('skip', 'Заявка без уведомления владельцу: слишком много за час', {
+    details: { lastHour },
+  });
+  return false;
 }
 
 /** Уведомление владельцу о новой заявке. */
@@ -399,181 +433,6 @@ function requestScreen(user: TgUser): Screen {
   };
 }
 
-/** Сводка для владельца бота: сколько чатов, какие группы, есть ли ошибки. */
-async function adminScreen(): Promise<Screen> {
-  const [stats, errors, check, file, access, pending, feedback] = await Promise.all([
-    chatStats(),
-    errorCount(24),
-    getState<{ at: string; filesOnSite: number; errors: string[] }>(LAST_CHECK_KEY),
-    fileForDate(weekAnchor()),
-    accessCounts(),
-    pendingRequests(8),
-    feedbackStats(24),
-  ]);
-
-  const lines = ['*Сводка*', ''];
-  lines.push(`Чатов: *${stats.total}*, включено ${stats.enabled}, с группой ${stats.withGroup}`);
-  lines.push(`Ошибок за сутки: ${errors === 0 ? '*0*' : `*${errors}*`}`);
-  lines.push(
-    `Доступ: одобрено ${access.approved}, ждут *${access.pending}*, отказано ${access.denied}`,
-  );
-  lines.push(`За сутки: 🐞 ${feedback.bugs}, 💡 ${feedback.ideas}`);
-
-  if (check) {
-    lines.push(`Проверка сайта: ${esc(mskStamp(new Date(check.at)))}`);
-    if (check.errors.length > 0) lines.push(`⚠️ ${esc(check.errors.join('; ').slice(0, 200))}`);
-  }
-  if (file) lines.push(`Текущая неделя: ${esc(file.title)}`);
-
-  if (pending.length > 0) {
-    lines.push('');
-    lines.push(`*${esc('Ждут решения')}*`);
-    for (const row of pending) {
-      lines.push(`${esc(describeUser({ ...row, id: row.user_id }))} · \`${row.user_id}\``);
-    }
-  }
-
-  if (stats.topGroups.length > 0) {
-    lines.push('');
-    lines.push(`*${esc('Группы')}*`);
-    for (const row of stats.topGroups) {
-      lines.push(`${esc(displayGroup(row.group))} — ${row.chats}`);
-    }
-  }
-
-  const rows: InlineKeyboard = [];
-
-  // Заявки решаются прямо из сводки: отдельного экрана для этого не нужно
-  for (const row of pending) {
-    rows.push([
-      {
-        text: `✅ ${describeUser({ ...row, id: row.user_id })}`,
-        callback_data: `ok:${row.user_id}`,
-      },
-      { text: '⛔️', callback_data: `no:${row.user_id}` },
-    ]);
-  }
-
-  rows.push([
-    { text: '👥 Доступ', callback_data: 'admacc' },
-    { text: '📋 Все группы', callback_data: 'admgrp' },
-  ]);
-  rows.push([{ text: '🔄 Обновить', callback_data: 'adm' }]);
-  rows.push([{ text: '↩︎ Меню', callback_data: 'm' }]);
-
-  return { text: lines.join('\n'), keyboard: rows };
-}
-
-const ADMIN_TO = { text: '↩︎ Сводка', callback_data: 'adm' };
-
-/**
- * Полный список по доступу: кто одобрен, кто ждёт, кому отказано — с кнопкой
- * поменять решение прямо тут. Сводка (`adm`) показывает только счётчики и
- * заявки, ждущие решения — этот экран нужен, чтобы увидеть весь список.
- */
-async function accessListScreen(): Promise<Screen> {
-  const [approved, pending, denied] = await Promise.all([
-    accessList('approved'),
-    accessList('pending'),
-    accessList('denied'),
-  ]);
-
-  const section = (title: string, rows: typeof approved) => {
-    const lines = [`*${esc(`${title} (${rows.length})`)}*`];
-    if (rows.length === 0) {
-      lines.push(esc('— пусто —'));
-    } else {
-      for (const row of rows) {
-        lines.push(`${esc(describeUser({ ...row, id: row.user_id }))} · \`${row.user_id}\``);
-      }
-    }
-    return lines.join('\n');
-  };
-
-  const text = [
-    section('Одобрено', approved),
-    '',
-    section('Ждут решения', pending),
-    '',
-    section('Отказано', denied),
-  ].join('\n');
-
-  const keyboard: InlineKeyboard = [];
-  for (const row of pending) {
-    keyboard.push([
-      { text: `✅ ${describeUser({ ...row, id: row.user_id })}`, callback_data: `ok:${row.user_id}:acc` },
-      { text: '⛔️', callback_data: `no:${row.user_id}:acc` },
-    ]);
-  }
-  // Решение можно поменять и для уже решённых заявок — не нужно лезть в базу руками
-  for (const row of approved) {
-    keyboard.push([
-      {
-        text: `🚫 Отозвать: ${describeUser({ ...row, id: row.user_id })}`,
-        callback_data: `no:${row.user_id}:acc`,
-      },
-    ]);
-  }
-  for (const row of denied) {
-    keyboard.push([
-      {
-        text: `✅ Разрешить: ${describeUser({ ...row, id: row.user_id })}`,
-        callback_data: `ok:${row.user_id}:acc`,
-      },
-    ]);
-  }
-  keyboard.push([{ text: '🔄 Обновить', callback_data: 'admacc' }, ADMIN_TO]);
-
-  return { text, keyboard };
-}
-
-/**
- * Полный список групп, на которые сейчас подписан хоть один включённый
- * чат — без обрезки до топ-8, как в сводке.
- */
-async function groupsListScreen(): Promise<Screen> {
-  const groups = await groupsInUse();
-
-  const lines = [`*${esc(`Все группы в работе (${groups.length})`)}*`, ''];
-  if (groups.length === 0) {
-    lines.push(esc('Пока ни один чат не выбрал группу.'));
-  } else {
-    for (const { group, chats } of groups) {
-      const titles = chats.map((c) => c.title ?? `чат ${c.chat_id}`).join(', ');
-      lines.push(`${esc(displayGroup(group))} — ${chats.length}`);
-      lines.push(`_${esc(titles)}_`);
-      lines.push('');
-    }
-  }
-
-  return { text: lines.join('\n').trimEnd(), keyboard: [[ADMIN_TO]] };
-}
-
-/**
- * Дни недели для клавиатуры: берём все даты недели из файла, а не только те,
- * где у группы есть пары. Иначе у группы с двумя учебными днями клавиатура
- * состояла бы из двух кнопок, и в пустой день нельзя было бы заглянуть.
- */
-async function keyboardDays(
-  perGroup: { days: Day[]; file: { id: number } | null }[],
-): Promise<Day[]> {
-  const withLessons = new Map<string, Day>();
-  for (const { days } of perGroup) {
-    for (const day of days) {
-      const known = withLessons.get(day.date);
-      if (!known || known.lessons.length === 0) withLessons.set(day.date, day);
-    }
-  }
-
-  const file = perGroup.find((w) => w.file)?.file ?? null;
-  const dates = file ? await weekDates(file.id) : [...withLessons.keys()];
-
-  return dates.sort().map(
-    (date) =>
-      withLessons.get(date) ?? { date, name: dayNameOf(date), lessons: [] },
-  );
-}
-
 /**
  * Экран одного дня сразу по всем выбранным группам: в один день пары обеих
  * групп читаются рядом, и переключать ничего не нужно.
@@ -584,37 +443,8 @@ export async function dayScreen(
   dateIso: string,
   heading?: string,
 ): Promise<Screen> {
-  const weeks = await weekStarts();
-  const { groups, missing } = await currentGroups(chatId, stored);
-  const perGroup = await Promise.all(groups.map((group) => getWeek(group, dateIso)));
-
-  const blocks: GroupDay[] = groups.map((group, index) => ({
-    group,
-    day: perGroup[index].days.find((d) => d.date === dateIso) ?? null,
-  }));
-
-  const file = perGroup.find((w) => w.file)?.file ?? null;
-
-  // Для клавиатуры дни объединяем: точка «пар нет» гаснет, если пары есть
-  // хотя бы у одной группы
-  const merged = await keyboardDays(perGroup);
-  const hasDay = blocks.some((b) => b.day);
-
-  return {
-    text: formatDayFor(dateIso, dayNameOf(dateIso), blocks, {
-      siteUpdated: file?.site_updated ?? null,
-      heading,
-      missing,
-    }),
-    keyboard: scheduleKeyboard(
-      merged,
-      hasDay ? dateIso : null,
-      file?.week_start ?? null,
-      weeks,
-      undefined,
-      missing,
-    ),
-  };
+  const { text, keyboard } = await renderDay(chatId, stored, dateIso, await weekStarts(), heading);
+  return { text, keyboard };
 }
 
 /**
@@ -674,50 +504,48 @@ export async function weekScreen(
   };
 }
 
+/**
+ * Статус чата: что с расписанием именно его групп. Раньше здесь стояла
+ * «текущая неделя» одного общего файла — с AJAX у каждой группы свой файл,
+ * и в строку попадало имя случайной чужой группы.
+ */
 async function statusScreen(chat: Chat | null): Promise<Screen> {
-  const today = weekAnchor();
-  const [file, newest, check] = await Promise.all([
-    // Файл, по которому отвечаем сегодня, а не самый поздний на сайте:
-    // на странице лежат две недели сразу, и путать их нельзя
-    fileForDate(today),
-    latestFile(),
-    getState<{ at: string; filesOnSite: number; changed: string[]; errors: string[] }>(
-      LAST_CHECK_KEY,
-    ),
+  const groups = chat?.groups ?? [];
+  const [check, resolution] = await Promise.all([
+    getState<CheckRecord>(LAST_CHECK_KEY),
+    resolveGroups(groups),
   ]);
+  const canonical = groups.map((g) => resolution.actual.get(g) ?? g);
+  const files = await Promise.all(canonical.map((g) => getFileByName(groupFileName(g))));
 
   const lines = ['*Статус*', ''];
-  const groups = chat?.groups ?? [];
   lines.push(
     `👥 ${groups.length > 1 ? 'Группы' : 'Группа'}: ` +
       (groups.length > 0 ? groups.map((g) => `*${esc(displayGroup(g))}*`).join(', ') : '_не выбрана_'),
   );
   lines.push(`🔔 Автоотправка: ${chat?.enabled ? 'включена' : 'выключена'}`);
-  lines.push('');
 
-  if (check) {
-    lines.push(`Последняя проверка сайта: ${esc(mskStamp(new Date(check.at)))}`);
-    lines.push(`Групп проверено: ${check.filesOnSite}`);
-    if (check.errors.length > 0) {
-      lines.push(`⚠️ ${esc(check.errors.join('; ').slice(0, 300))}`);
-    }
-  } else {
-    lines.push('_Проверок ещё не было_');
+  if (canonical.length > 0) {
+    lines.push('');
+    const today = weekAnchor();
+    canonical.forEach((group, index) => {
+      const file = files[index];
+      const state =
+        file?.parsed_ok && weekCovers(file, today)
+          ? `неделя с ${humanDate(file.week_start!)}, проверено ${mskStamp(new Date(file.last_seen))}`
+          : 'расписание этой недели ещё не загружено';
+      lines.push(esc(`📦 ${displayGroup(group)}: ${state}`));
+    });
   }
 
-  if (file) {
-    lines.push('');
-    lines.push(`Текущая неделя: ${esc(file.title)}`);
-    if (file.site_updated) lines.push(`Обновлён на сайте: ${esc(file.site_updated)}`);
-
-    // Следующая неделя обычно появляется заранее — про неё стоит сказать
-    // отдельно, чтобы не выглядело, будто она уже действует
-    if (newest && newest.id !== file.id && newest.week_start) {
-      lines.push(`Уже выложена неделя с ${esc(humanDate(newest.week_start))}`);
-    }
+  lines.push('');
+  if (check) {
+    lines.push(`Последняя проверка сайта: ${esc(mskStamp(new Date(check.at)))}`);
+    // Только ошибки своих групп: чужие человеку ничего не скажут
+    const own = check.errors.filter((e) => canonical.some((g) => e.startsWith(`${g}:`)));
+    if (own.length > 0) lines.push(`⚠️ ${esc(own.join('; ').slice(0, 300))}`);
   } else {
-    lines.push('');
-    lines.push('_Расписание ещё не загружено_');
+    lines.push('_Проверок ещё не было_');
   }
 
   return { text: lines.join('\n'), keyboard: statusKeyboard(chat?.enabled ?? false) };
@@ -967,16 +795,20 @@ async function handleFeedbackText(chatId: number, user: TgUser, raw: string): Pr
     return true;
   }
 
-  // Потолок на человека в час: писать может кто угодно, и без потолка
-  // одному скучающему хватит минуты, чтобы завалить владельца
-  if ((await feedbackFrom(user.id, 1)) >= FEEDBACK_PER_HOUR) {
-    await clearState(key);
-    await sendMessage(
+  // Ожидание забираем атомарно: два сообщения подряд, доставленные
+  // параллельно, иначе оба прошли бы проверку лимита ниже
+  if (!(await takeState<FeedbackWait>(key))) return true;
+
+  // Лимит проверяем ещё раз: экран с тегом могли открыть вчера или в двух
+  // окнах сразу, а считается только то, что реально передано
+  const { limit, left } = await feedbackLeft(user.id);
+  if (left === 0) {
+    const screen = feedbackLimitScreen(limit);
+    await sendMessage(chatId, screen.text, { silent: true, keyboard: screen.keyboard });
+    await log('skip', `Обратная связь: дневной лимит у ${user.id}`, {
       chatId,
-      esc('Пока хватит — больше пяти сообщений в час я не передаю. Возвращайся через час.'),
-      { silent: true },
-    );
-    await log('skip', `Обратная связь: лимит у ${user.id}`, { chatId, details: { userId: user.id } });
+      details: { userId: user.id, limit },
+    });
     return true;
   }
 
@@ -990,16 +822,23 @@ async function handleFeedbackText(chatId: number, user: TgUser, raw: string): Pr
     kind: wait.kind,
     text,
   });
-  await clearState(key);
 
   // Уведомление владельцу — не критично для человека: он своё сообщение
   // уже отдал, и «спасибо» он должен увидеть даже если Telegram подвёл
-  try {
-    await sendMessage(env.adminTelegramId, feedbackNotice(wait.kind, user, text), {
-      silent: false,
+  const lastHour = await feedbackSince(new Date(Date.now() - 3_600_000).toISOString());
+  if (lastHour > FEEDBACK_NOTIFY_PER_HOUR) {
+    await log('skip', 'Обратная связь сохранена без уведомления: слишком много за час', {
+      chatId,
+      details: { userId: user.id, lastHour },
     });
-  } catch (error) {
-    await logError('Уведомление владельца об обратной связи', error);
+  } else {
+    try {
+      await sendMessage(env.adminTelegramId, feedbackNotice(wait.kind, user, text), {
+        silent: false,
+      });
+    } catch (error) {
+      await logError('Уведомление владельца об обратной связи', error);
+    }
   }
 
   await sendMessage(
@@ -1066,11 +905,7 @@ async function handleMessage(message: TgMessage): Promise<void> {
     // Это до проверки доступа: сообщить о поломке может кто угодно.
     const payload = startPayload(message.text ?? '');
     if (payload) {
-      const kind = payload === 'fb' ? null : payload;
-      if (kind) {
-        await setState(feedbackKey(user.id), { kind, at: new Date().toISOString() });
-      }
-      const screen = kind ? feedbackComposeScreen(kind) : feedbackScreen();
+      const screen = await feedbackEntry(user.id, payload === 'fb' ? null : payload);
       await sendMessage(chatId, screen.text, { silent: true, keyboard: screen.keyboard });
       await log('command', `Обратная связь: экран ${payload}`, {
         chatId,
@@ -1094,8 +929,10 @@ async function handleMessage(message: TgMessage): Promise<void> {
         details: { userId: user.id, username: user.username },
       });
 
-      // Владельцу сообщаем только о новой заявке, чтобы не дёргать повторами
-      if (isNew) {
+      // Владельцу сообщаем только о новой заявке, чтобы не дёргать повторами.
+      // Волна заявок сверх потолка ждёт в «Доступ → Ждут решения» без
+      // уведомления: сотни сообщений подряд в личку — это уже атака
+      if (isNew && (await shouldNotifyRequest())) {
         const notice = requestScreen(user);
         try {
           await sendMessage(env.adminTelegramId, notice.text, {
@@ -1189,6 +1026,10 @@ async function runCallback(
   // Кнопки работают только в подключённом чате. Исключение — решения по
   // заявкам: они приходят владельцу в личку, где чата в базе может не быть.
   const isDecision = data.startsWith('ok:') || data.startsWith('no:');
+  // Экраны владельца тоже: сводку и заявки он открывает из уведомлений в
+  // личке, и запись о его личке в базе для этого не нужна
+  const isOwnerScreen =
+    ctx.isOwner && ctx.isPrivate && (data.startsWith('adm') || data.startsWith('acc:'));
   // Баги и предложения принимаем от кого угодно, в том числе из личек,
   // которых нет в базе: у неодобренного человека записи о чате не будет
   const isFeedback = data === 'fb' || data.startsWith('fb:');
@@ -1200,19 +1041,40 @@ async function runCallback(
   const isSetupFlow =
     ctx.isPrivate &&
     (data.startsWith('ob:') || data === 'grp' || data.startsWith('s:') || data.startsWith('g:'));
-  if (!chat && !isDecision && !isFeedback && !isSetupFlow && !(ctx.isPrivate && data === 'm')) {
-    await answerCallbackQuery(query.id, 'Чат не подключён');
+  if (
+    !chat &&
+    !isDecision &&
+    !isOwnerScreen &&
+    !isFeedback &&
+    !isSetupFlow &&
+    !(ctx.isPrivate && data === 'm')
+  ) {
+    // Через ack, а не напрямую: иначе на нажатие уходило два ответа
+    ack('Чат не подключён');
     return;
   }
 
   // В группе кнопки жмут все участники сразу, поэтому лимит выше, чем на команды
-  if (!(await allowRequest(chatId, 60))) {
+  if (!(await allowRequest(chatId, 60, 'button'))) {
     ack('Слишком часто, подожди минуту');
     return;
   }
 
   const edit = (screen: Screen) =>
     editMessageText(chatId, message.message_id, screen.text, screen.keyboard);
+
+  // В личке пользоваться ботом можно только с одобренным доступом — и
+  // проверяем это на каждом нажатии, а не только на /start: иначе
+  // отозванный доступ продолжал бы работать по старым кнопкам. Баги и
+  // предложения принимаем от всех, решения по заявкам — от владельца.
+  if (ctx.isPrivate && !isFeedback && !isDecision && !isOwnerScreen) {
+    const access = await getAccess(query.from.id);
+    if (!ctx.isOwner && access?.status !== 'approved') {
+      ack(data === 'm' ? undefined : 'Доступ не открыт');
+      if (data === 'm') await edit(accessScreen(access?.status === 'denied' ? 'denied' : 'pending'));
+      return;
+    }
+  }
 
   /** Возвращает группы чата либо возвращает в меню с подсказкой. */
   const requireGroups = async (): Promise<string[] | null> => {
@@ -1227,13 +1089,6 @@ async function runCallback(
 
   if (data === 'm') {
     ack();
-    // Личка без записи в базе — это неодобренный человек: меню ему показывать
-    // нечего, зато видно, на какой стадии его заявка
-    if (!chat && ctx.isPrivate) {
-      const status = (await getAccess(query.from.id))?.status;
-      await edit(accessScreen(status === 'denied' ? 'denied' : 'pending'));
-      return;
-    }
     await edit(menuScreen(chat, ctx));
     return;
   }
@@ -1241,9 +1096,8 @@ async function runCallback(
   // ─── Баги и предложения ────────────────────────────────────────────────────
 
   if (data === 'fb') {
-    await clearState(feedbackKey(query.from.id));
     ack();
-    await edit(feedbackScreen());
+    await edit(await feedbackEntry(query.from.id, null));
     return;
   }
 
@@ -1257,9 +1111,8 @@ async function runCallback(
     }
 
     const kind: FeedbackKind = data === 'fb:bug' ? 'bug' : 'idea';
-    await setState(feedbackKey(query.from.id), { kind, at: new Date().toISOString() });
     ack();
-    await edit(feedbackComposeScreen(kind));
+    await edit(await feedbackEntry(query.from.id, kind));
     return;
   }
 
@@ -1270,17 +1123,27 @@ async function runCallback(
       return;
     }
 
-    const [, idRaw, origin] = data.split(':');
+    const [, idRaw, origin, pageRaw] = data.split(':');
     const targetId = Number(idRaw);
+    // Нажатие можно подделать: в базу и в Telegram идёт только настоящий id
+    if (!Number.isSafeInteger(targetId) || targetId <= 0) {
+      ack('Кнопка устарела');
+      return;
+    }
+
     const approve = data.startsWith('ok:');
+    const before = (await getAccess(targetId))?.status ?? null;
     await decideAccess(targetId, approve ? 'approved' : 'denied');
+    // Отозвали доступ — расписание в его личку больше не шлём
+    if (!approve) await setChatEnabled(targetId, false);
     ack(approve ? 'Доступ открыт' : 'Отказано');
     await log('command', `Заявка ${approve ? 'одобрена' : 'отклонена'}: ${targetId}`);
 
     // Человек должен узнать решение сам, не спрашивая. Подробности (как
     // добавить в группу, какие права дать, как искать свою группу) — в
-    // пошаговой обучалке по кнопке, а не всё сразу одним текстом.
-    if (approve) {
+    // пошаговой обучалке по кнопке, а не всё сразу одним текстом. Повторное
+    // нажатие «Разрешить» уже одобренному обучалку второй раз не шлёт.
+    if (approve && before !== 'approved') {
       try {
         const username = await botUsername().catch(() => null);
         const screen = onboardingScreen(0, username);
@@ -1296,32 +1159,44 @@ async function runCallback(
           { silent: false, keyboard },
         );
       } catch (error) {
-        await logError(`Уведомление об одобрении ${targetId}`, error);
+        await logError('Уведомление об одобрении', error, { userId: targetId });
       }
     }
 
-    await edit(origin === 'acc' ? await accessListScreen() : await adminScreen());
+    // Возвращаемся туда, откуда решали: в раздел и на ту же страницу
+    if (isAccessSection(origin)) {
+      await edit(await accessSectionScreen(origin, Number(pageRaw) || 0));
+    } else {
+      await edit(origin === 'acc' ? await accessOverviewScreen() : await adminScreen());
+    }
     return;
   }
 
-  // Сводка — только владельцу бота
-  if (data === 'adm') {
+  // Сводка и её разделы — только владельцу бота
+  if (data.startsWith('adm') || data.startsWith('acc:')) {
     if (query.from.id !== env.adminTelegramId) {
       ack('Недоступно');
       return;
     }
     ack();
-    await edit(await adminScreen());
-    return;
-  }
 
-  if (data === 'admacc' || data === 'admgrp') {
-    if (query.from.id !== env.adminTelegramId) {
-      ack('Недоступно');
+    if (data.startsWith('acc:')) {
+      const [, section, pageRaw] = data.split(':');
+      await edit(
+        isAccessSection(section)
+          ? await accessSectionScreen(section, Number(pageRaw) || 0)
+          : await accessOverviewScreen(),
+      );
       return;
     }
-    ack();
-    await edit(data === 'admacc' ? await accessListScreen() : await groupsListScreen());
+
+    const screens: Record<string, () => Promise<Screen>> = {
+      adm: adminScreen,
+      admacc: accessOverviewScreen,
+      admgrp: groupsListScreen,
+      admload: loadScreen,
+    };
+    await edit(await (screens[data] ?? adminScreen)());
     return;
   }
 
@@ -1340,7 +1215,7 @@ async function runCallback(
   if (data.startsWith('ob:')) {
     ack();
     const username = await botUsername().catch(() => null);
-    await edit(onboardingScreen(Number(data.slice(3)), username));
+    await edit(onboardingScreen(Number(data.slice(3)) || 0, username));
     return;
   }
 
@@ -1351,10 +1226,7 @@ async function runCallback(
     }
     const enable = data === 'on';
     await setChatEnabled(chatId, enable);
-    await answerCallbackQuery(
-      query.id,
-      enable ? 'Автоотправка включена' : 'Автоотправка выключена',
-    );
+    ack(enable ? 'Автоотправка включена' : 'Автоотправка выключена');
     await log('command', `Автоотправка ${enable ? 'включена' : 'выключена'}`, { chatId });
     await edit(await statusScreen(await getChat(chatId)));
     return;
@@ -1387,7 +1259,13 @@ async function runCallback(
     const groups = await requireGroups();
     if (!groups) return;
 
+    // Нажатие можно подделать, а `mskDateOffset(NaN)` — это «NaN-NaN-NaN»
+    // в запросе к базе и алерт владельцу на ровном месте
     const offset = Number(data.slice(4));
+    if (offset !== 0 && offset !== 1) {
+      ack('Кнопка устарела');
+      return;
+    }
     ack();
     await edit(
       await dayScreen(
@@ -1406,6 +1284,10 @@ async function runCallback(
     if (!groups) return;
 
     const key = data.slice(2);
+    if (key !== 'all' && !/^\d$/.test(key) && !isIsoDate(key)) {
+      ack('Кнопка устарела');
+      return;
+    }
     ack();
 
     if (key === 'all') {
@@ -1429,9 +1311,13 @@ async function runCallback(
     const groups = await requireGroups();
     if (!groups) return;
 
+    const from = data === 'week' ? weekAnchor() : data.slice(2);
+    if (!isIsoDate(from)) {
+      ack('Кнопка устарела');
+      return;
+    }
     ack();
 
-    const from = data === 'week' ? weekAnchor() : data.slice(2);
     const { chunks, keyboard } = await weekScreen(chatId, groups, from);
     await editMessageText(chatId, message.message_id, chunks[0], keyboard);
 
@@ -1546,12 +1432,9 @@ async function runCallback(
       ),
     });
 
-    // Новую подписку часовой тик подхватит только через час (он тянет только
-    // уже подписанные группы) — без этого человек первое время видел бы
-    // пустую неделю. Тянем сейчас, но уже после того, как человек увидел
-    // результат нажатия — ingestGroupNow поднимает браузер на несколько
-    // секунд, и делать это до ack/edit ощущалось как «долго выбирается».
-    if (outcome === 'added') await ingestGroupNow(picked.group);
+    // Расписание группы уже лежит в базе: тик держит неделю каждой группы
+    // каталога. Браузер здесь не поднимаем — именно он под наплывом людей
+    // ронял бота (`ERR_INSUFFICIENT_RESOURCES`) и тормозил нажатия до 9 секунд.
     return;
   }
 
@@ -1566,7 +1449,7 @@ async function runCallback(
     const { chunks, keyboard } = await weekScreen(
       chatId,
       chosen,
-      dateIso || weekAnchor(),
+      isIsoDate(dateIso ?? '') ? dateIso : weekAnchor(),
       Number(indexRaw) || 0,
     );
     await editMessageText(chatId, message.message_id, chunks[0], keyboard);
@@ -1600,14 +1483,29 @@ async function handleMembership(event: TgChatMemberUpdate): Promise<void> {
     return;
   }
 
+  // Блокировать и разблокировать бота в личке можно сколько угодно быстро,
+  // и каждое такое событие — запись в базу и сообщение. Лимит тот же, что
+  // на команды
+  if (!(await allowRequest(chatId))) {
+    await log('skip', `Rate limit на событиях участия в чате ${chatId}`, { chatId });
+    return;
+  }
+
   const chat = await getChat(chatId);
 
-  // Подключить чат может только одобренный человек. Иначе бот не остаётся
-  // в группе: молча висеть без дела — хуже, чем честно уйти. Личку это не
-  // касается — там это просто нажатие Start, и Telegram не даёт «выйти»
-  // из личного чата (leaveChat падает с Bad Request), а /start сам покажет
-  // экран без доступа.
-  if (event.chat.type !== 'private' && !chat && !(await isApproved(event.from.id))) {
+  // Подключить чат может только одобренный человек.
+  //
+  // В личке это нажатие Start (или разблокировка бота): заводить чат здесь
+  // нельзя — иначе неодобренный и даже отклонённый человек получал бы чат
+  // в базе и, через него, все кнопки. Экран без доступа покажет /start.
+  // Из лички Telegram «выйти» не даёт (leaveChat падает с Bad Request).
+  if (!chat && event.chat.type === 'private' && !(await isApproved(event.from.id))) {
+    await log('skip', `Личка без доступа: ${chatId}`, { chatId });
+    return;
+  }
+
+  // В группе бот не остаётся: молча висеть без дела — хуже, чем честно уйти
+  if (!chat && !(await isApproved(event.from.id))) {
     await log('skip', `Бота добавили без доступа в чат ${chatId}`, {
       chatId,
       details: { addedBy: event.from.id, title: event.chat.title },
@@ -1619,9 +1517,17 @@ async function handleMembership(event: TgChatMemberUpdate): Promise<void> {
         esc('Доступ не открыт. Напиши мне в личку и дождись одобрения.'),
         { silent: true },
       );
+    } catch (error) {
+      await log('skip', `Не смог объяснить отказ в чате ${chatId}`, {
+        chatId,
+        details: { reason: error instanceof Error ? error.message : String(error) },
+      });
+    }
+    // Уходим, даже если объяснить не вышло (например, писать запрещено)
+    try {
       await leaveChat(chatId);
     } catch (error) {
-      await logError(`Выход из чата ${chatId} без доступа`, error);
+      await logError('Выход из чата без доступа', error, { chatId });
     }
     return;
   }
@@ -1683,6 +1589,9 @@ function chatIdOf(update: TgUpdate): number | null {
   );
 }
 
+/** С какой длительности нажатие считается медленным и попадает в журнал. */
+const SLOW_PRESS_MS = 1500;
+
 /** Точка входа для вебхука. Никогда не бросает — Telegram не должен ретраить. */
 export async function handleUpdate(update: TgUpdate): Promise<void> {
   const started = Date.now();
@@ -1690,11 +1599,16 @@ export async function handleUpdate(update: TgUpdate): Promise<void> {
     if (update.message) await handleMessage(update.message);
     else if (update.callback_query) {
       await handleCallback(update.callback_query);
-      // Длительность пишем в журнал: по ней видно, тормозит бот или сеть
-      await log('command', `Нажатие ${update.callback_query.data ?? '—'}`, {
-        chatId: update.callback_query.message?.chat.id ?? null,
-        durationMs: Date.now() - started,
-      });
+      // В журнал — только медленные нажатия: по ним видно, тормозит бот или
+      // сеть. Писать каждое значило бы десятки тысяч строк в день на пару
+      // сотен человек и забитую бесплатную базу от одного любителя кликать
+      const durationMs = Date.now() - started;
+      if (durationMs >= SLOW_PRESS_MS) {
+        await log('command', `Медленное нажатие ${update.callback_query.data ?? '—'}`, {
+          chatId: update.callback_query.message?.chat.id ?? null,
+          durationMs,
+        });
+      }
     } else if (update.my_chat_member) await handleMembership(update.my_chat_member);
   } catch (error) {
     // Чата уже нет: бота выгнали или он сам ушёл, пока апдейт лежал в очереди.

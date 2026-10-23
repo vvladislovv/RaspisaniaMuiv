@@ -113,9 +113,34 @@ export function withReadCache<T>(fn: () => Promise<T>): Promise<T> {
   return cacheStore.run(new Map(), fn);
 }
 
+/**
+ * Вне `withReadCache` (то есть в вебхуке бота) каталог групп и список недель
+ * держим в памяти процесса пару минут. Они нужны почти каждому нажатию, а
+ * меняются раз в сутки и раз в час: без этого каждый клик тянул из базы весь
+ * каталог, и при сотнях людей трафик бесплатного Supabase уходил на одно это.
+ */
+const SHARED_TTL_MS = 2 * 60 * 1000;
+const SHARED_KEYS = new Set(['listGroups', 'weekStarts']);
+const shared = new Map<string, { at: number; value: Promise<unknown> }>();
+
+function sharedCached<T>(key: string, load: () => Promise<T>): Promise<T> {
+  const hit = shared.get(key);
+  if (hit && Date.now() - hit.at < SHARED_TTL_MS) return hit.value as Promise<T>;
+
+  const fresh = load();
+  shared.set(key, { at: Date.now(), value: fresh });
+  fresh.catch(() => shared.delete(key));
+  return fresh;
+}
+
+/** Забывает общий кэш — после того как каталог или недели поменялись. */
+export function forgetSharedCache(): void {
+  shared.clear();
+}
+
 function cached<T>(key: string, load: () => Promise<T>): Promise<T> {
   const store = cacheStore.getStore();
-  if (!store) return load();
+  if (!store) return SHARED_KEYS.has(key) ? sharedCached(key, load) : load();
 
   const hit = store.get(key) as Promise<T> | undefined;
   if (hit) return hit;
@@ -247,11 +272,31 @@ export async function setPinnedMessage(
   check(res, 'setPinnedMessage');
 }
 
-/** Чаты, готовые к автоотправке: включены и хотя бы с одной группой. */
+/**
+ * Сколько строк Supabase отдаёт за один запрос. Больше — молча обрезает,
+ * поэтому длинные списки читаем страницами.
+ */
+const PAGE_ROWS = 1000;
+
+/**
+ * Чаты, готовые к автоотправке: включены и хотя бы с одной группой.
+ * Страницами по порядку: без этого на тысяче с лишним чатов часть молча
+ * выпадала бы из рассылки, и каждый раз разная.
+ */
 export async function activeChats(): Promise<Chat[]> {
-  const res = await db().from('chats').select('*').eq('enabled', true);
-  const rows = (check(res, 'activeChats') ?? []) as Chat[];
-  return rows.filter((chat) => (chat.groups ?? []).length > 0);
+  const pages: Chat[][] = [];
+  for (let from = 0; ; from += PAGE_ROWS) {
+    const res = await db()
+      .from('chats')
+      .select('*')
+      .eq('enabled', true)
+      .order('chat_id', { ascending: true })
+      .range(from, from + PAGE_ROWS - 1);
+    const page = (check(res, 'activeChats') ?? []) as Chat[];
+    pages.push(page);
+    if (page.length < PAGE_ROWS) break;
+  }
+  return pages.flat().filter((chat) => (chat.groups ?? []).length > 0);
 }
 
 export async function allChats(): Promise<Chat[]> {
@@ -350,6 +395,22 @@ export async function upsertFile(input: FileUpsert): Promise<FileRow> {
   return check(res, 'upsertFile') as FileRow;
 }
 
+/**
+ * Помечает файл разобранным. Отдельным шагом после записи дней: если запись
+ * упала посередине, файл остаётся `parsed_ok = false`, и следующий тик
+ * перекачает группу, а не сочтёт её загруженной по совпавшему хешу.
+ */
+export async function markFileParsed(fileId: number): Promise<void> {
+  const res = await db()
+    .from('files')
+    .update({ parsed_ok: true, parse_error: null })
+    .eq('id', fileId)
+    .select('id');
+  check(res, 'markFileParsed');
+  // Неделя появилась или сменилась — список недель в памяти устарел
+  forgetSharedCache();
+}
+
 /** Перезаписывает расписание для файла целиком. */
 export async function replaceSchedules(fileId: number, workbook: Workbook): Promise<number> {
   const del = await db().from('schedules').delete().eq('file_id', fileId).select('id');
@@ -430,8 +491,15 @@ export interface CatalogEntry {
   studyform: string;
 }
 
-/** Перезаписывает каталог групп целиком — обновляется раз в сутки. */
-export async function replaceGroupsCatalog(entries: CatalogEntry[]): Promise<void> {
+/**
+ * Перезаписывает каталог групп целиком — обновляется раз в сутки.
+ * Группы курсов из `keepYears` не удаляются, даже если их нет в обходе:
+ * пустой курс в ответе сайта — это сбой, а не выпуск всех групп разом.
+ */
+export async function replaceGroupsCatalog(
+  entries: CatalogEntry[],
+  keepYears: string[] = [],
+): Promise<void> {
   const now = new Date().toISOString();
   const rows = entries.map((e) => ({
     group_name: e.group,
@@ -451,15 +519,32 @@ export async function replaceGroupsCatalog(entries: CatalogEntry[]): Promise<voi
   // Группы, которых в новом обходе не оказалось (расформированы/переименованы),
   // не должны продолжать висеть в списке выбора
   const seen = new Set(entries.map((e) => e.group));
-  const existing = await db().from('groups_catalog').select('group_name');
-  const stale = ((check(existing, 'replaceGroupsCatalog.list') ?? []) as { group_name: string }[])
-    .map((r) => r.group_name)
-    .filter((g) => !seen.has(g));
+  const existing = await db().from('groups_catalog').select('group_name, year');
+  const stale = (
+    (check(existing, 'replaceGroupsCatalog.list') ?? []) as { group_name: string; year: string }[]
+  )
+    .filter((r) => !seen.has(r.group_name) && !keepYears.includes(r.year))
+    .map((r) => r.group_name);
 
   if (stale.length > 0) {
     const del = await db().from('groups_catalog').delete().in('group_name', stale).select('group_name');
     check(del, 'replaceGroupsCatalog.delete');
   }
+  forgetSharedCache();
+}
+
+/** Весь каталог с курсом и формой обучения — для обхода всех групп. */
+export async function catalogEntries(): Promise<CatalogEntry[]> {
+  const res = await db()
+    .from('groups_catalog')
+    .select('group_name, year, studyform')
+    .order('group_name', { ascending: true });
+  const rows = (check(res, 'catalogEntries') ?? []) as {
+    group_name: string;
+    year: string;
+    studyform: string;
+  }[];
+  return rows.map((r) => ({ group: r.group_name, year: r.year, studyform: r.studyform }));
 }
 
 /** Курс и форма обучения группы — нужны, чтобы запросить её расписание. */
@@ -524,9 +609,12 @@ async function loadWeek(
 
   const picked = check(upcoming, 'getWeek.pick') as { file_id: number } | null;
 
-  // Впереди учебных дней нет — показываем последнюю известную неделю
-  const fileId = picked?.file_id ?? (await latestFile())?.id;
-  if (fileId === undefined) return { days: [], file: null };
+  // Впереди учебных дней нет — показываем последнюю известную неделю этой же
+  // группы. Раньше здесь брался самый свежий файл вообще, но у каждой группы
+  // теперь свой файл: группа, чьё расписание ещё не скачано, получала чужой
+  // файл, не находила в нём своих дней и показывала «Пар нет» при живых парах.
+  const fileId = picked?.file_id ?? (await lastFileOfGroup(groupName));
+  if (fileId === null) return { days: [], file: null };
 
   const [rowsRes, fileRes] = await Promise.all([
     db()
@@ -550,6 +638,59 @@ async function loadWeek(
   };
 }
 
+/** Файл с самым поздним днём группы; null — расписания группы в базе нет. */
+async function lastFileOfGroup(groupName: string): Promise<number | null> {
+  const res = await db()
+    .from('schedules')
+    .select('file_id')
+    .eq('group_name', groupName)
+    .order('day_date', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  const row = check(res, 'getWeek.last') as { file_id: number } | null;
+  return row?.file_id ?? null;
+}
+
+/**
+ * Имя записи о расписании группы в `files`. Адреса и веса у AJAX-ответа нет,
+ * поэтому ключом служит имя группы — запись у группы одна, и правится она
+ * же, а не плодится новая на каждое изменение.
+ */
+export function groupFileName(groupName: string): string {
+  return `ajax:${groupName}`;
+}
+
+/** Что лежит в базе по группе: когда последний раз скачана и какая неделя. */
+export interface GroupFileStatus {
+  fetchedAt: string;
+  weekStart: string | null;
+}
+
+/**
+ * Состояние всех групп разом — одним запросом, а не по запросу на группу:
+ * по нему строится очередь обхода и сводка «сколько загружено».
+ */
+export async function groupFileStatus(): Promise<Map<string, GroupFileStatus>> {
+  const res = await db()
+    .from('files')
+    .select('name, week_start, last_seen')
+    .eq('parsed_ok', true)
+    .like('name', groupFileName('*'));
+
+  const rows = (check(res, 'groupFileStatus') ?? []) as {
+    name: string;
+    week_start: string | null;
+    last_seen: string;
+  }[];
+
+  const prefix = groupFileName('');
+  return new Map(
+    rows
+      .filter((r) => r.name.startsWith(prefix))
+      .map((r) => [r.name.slice(prefix.length), { fetchedAt: r.last_seen, weekStart: r.week_start }]),
+  );
+}
+
 // ─── Состояние ───────────────────────────────────────────────────────────────
 
 export async function getState<T>(key: string): Promise<T | null> {
@@ -566,17 +707,74 @@ export async function setState(key: string, value: unknown): Promise<void> {
   check(res, 'setState');
 }
 
+/**
+ * Забирает значение и удаляет его одним запросом. Из двух одновременных
+ * вызовов значение достанется только одному: второй получит null. Так
+ * одно ожидание текста не превращается в два принятых сообщения, если
+ * человек отправил два подряд и Telegram доставил их параллельно.
+ */
+export async function takeState<T>(key: string): Promise<T | null> {
+  const res = await db().from('app_state').delete().eq('key', key).select('value');
+  const rows = (check(res, 'takeState') ?? []) as { value: T }[];
+  return rows[0]?.value ?? null;
+}
+
 /** Забывает значение: `value` в таблице not null, «пустого» состояния нет. */
 export async function clearState(key: string): Promise<void> {
   const res = await db().from('app_state').delete().eq('key', key).select('key');
   check(res, 'clearState');
 }
 
+/**
+ * Замок на одну операцию за раз — поверх `app_state`.
+ *
+ * Тик дёргают два крона (pg_cron и GitHub Actions), и иногда в одну минуту.
+ * Два тика разом — это два Chromium в одном процессе (ровно так бот уже
+ * падал с `ERR_INSUFFICIENT_RESOURCES`) и две рассылки, которые шлют одному
+ * чату дважды. Вставка по первичному ключу атомарна: второй получает отказ.
+ * Замок, который не сняли (функцию убил лимит), протухает через `ttlMs`.
+ */
+export async function acquireLock(key: string, ttlMs: number): Promise<boolean> {
+  const cutoff = new Date(Date.now() - ttlMs).toISOString();
+  const stale = await db()
+    .from('app_state')
+    .delete()
+    .eq('key', key)
+    .lt('updated_at', cutoff)
+    .select('key');
+  check(stale, 'acquireLock.stale');
+
+  const now = new Date().toISOString();
+  const res = await db().from('app_state').insert({ key, value: now, updated_at: now }).select('key');
+  // Ключ уже занят — замок держит другой тик
+  if (res.error?.code === '23505') return false;
+  check(res, 'acquireLock');
+  return true;
+}
+
+export async function releaseLock(key: string): Promise<void> {
+  await clearState(key);
+}
+
 // ─── Rate limit ──────────────────────────────────────────────────────────────
 
+/**
+ * Счётчики команд и нажатий раздельные: иначе десяток нажатий одного
+ * участника группы съедал лимит команд, и /start в этой группе молча не
+ * работал до конца минуты. Ключ счётчика — (чат, начало окна); чтобы не
+ * менять схему, окно нажатий сдвинуто на секунду внутри той же минуты.
+ */
+const BUCKET_OFFSET_MS = { command: 0, button: 1000 } as const;
+
 /** Возвращает true, если запрос разрешён. Окно — минута. */
-export async function allowRequest(chatId: number, limit = 10): Promise<boolean> {
-  const windowStart = new Date(Math.floor(Date.now() / 60_000) * 60_000).toISOString();
+export async function allowRequest(
+  chatId: number,
+  limit = 10,
+  bucket: keyof typeof BUCKET_OFFSET_MS = 'command',
+): Promise<boolean> {
+  const windowStart = new Date(
+    Math.floor(Date.now() / 60_000) * 60_000 + BUCKET_OFFSET_MS[bucket],
+  ).toISOString();
 
   const inc = await db().rpc('increment_rate_limit', {
     p_chat_id: chatId,
@@ -590,6 +788,16 @@ export async function allowRequest(chatId: number, limit = 10): Promise<boolean>
   }
 
   return Number(inc.data) <= limit;
+}
+
+/**
+ * Чистит старые логи и счётчики частоты (функция `prune_old_rows` из
+ * schema.sql). Без этого обе таблицы растут без конца, а бесплатная база
+ * упирается в 500 МБ и переходит в режим только для чтения.
+ */
+export async function pruneOldRows(): Promise<void> {
+  const res = await db().rpc('prune_old_rows');
+  if (res.error) throw new Error(`БД (prune_old_rows): ${res.error.message}`);
 }
 
 // ─── Логи ────────────────────────────────────────────────────────────────────
@@ -738,19 +946,17 @@ export async function addFeedback(entry: {
 }
 
 /**
- * Сколько человек прислал за последние часы.
+ * Сколько сообщений пришло с момента `sinceIso` — от одного человека или,
+ * без `userId`, от всех сразу.
  *
  * Писать может кто угодно, поэтому нужен потолок: иначе одному скучающему
  * хватит минуты, чтобы завалить владельца уведомлениями.
  */
-export async function feedbackFrom(userId: number, hours = 1): Promise<number> {
-  const since = new Date(Date.now() - hours * 3_600_000).toISOString();
-  const res = await db()
-    .from('feedback')
-    .select('id')
-    .eq('user_id', userId)
-    .gte('created_at', since);
-  return ((check(res, 'feedbackFrom') ?? []) as { id: number }[]).length;
+export async function feedbackSince(sinceIso: string, userId?: number): Promise<number> {
+  let query = db().from('feedback').select('id').gte('created_at', sinceIso);
+  if (userId !== undefined) query = query.eq('user_id', userId);
+  const res = await query;
+  return ((check(res, 'feedbackSince') ?? []) as { id: number }[]).length;
 }
 
 /** Сводка для владельца: сколько багов и идей пришло за сутки. */
@@ -1027,16 +1233,34 @@ export async function accessCounts(): Promise<Record<AccessStatus, number>> {
   };
 }
 
-/** Полный список заявок по статусу — для экрана «Доступ» в сводке владельца. */
-export async function accessList(status: AccessStatus, limit = 50): Promise<AccessRow[]> {
-  const res = await db()
-    .from('access')
-    .select('*')
-    .eq('status', status)
-    .order('decided_at', { ascending: false, nullsFirst: false })
-    .order('requested_at', { ascending: false })
-    .limit(limit);
+/**
+ * Список заявок по статусу — для разделов экрана «Доступ».
+ *
+ * Ждущие — от самой старой: кто раньше пришёл, того раньше и решают.
+ * Решённые — от самого свежего решения: обычно ищут того, кого только что
+ * одобрили или отклонили. Страницы режутся в памяти: людей сотни, а не
+ * миллионы, и один запрос проще пары «счётчик + страница».
+ */
+export async function accessList(status: AccessStatus, limit = 1000): Promise<AccessRow[]> {
+  let query = db().from('access').select('*').eq('status', status);
+  query =
+    status === 'pending'
+      ? query.order('requested_at', { ascending: true })
+      : query
+          .order('decided_at', { ascending: false, nullsFirst: false })
+          .order('requested_at', { ascending: false });
+  const res = await query.limit(limit);
   return (check(res, 'accessList') ?? []) as AccessRow[];
+}
+
+/**
+ * Сколько новых заявок пришло с момента `sinceIso`. Нужно для потолка
+ * уведомлений владельцу: волна заявок от ботов не должна превращаться
+ * в сотни сообщений ему в личку.
+ */
+export async function accessRequestsSince(sinceIso: string): Promise<number> {
+  const res = await db().from('access').select('user_id').gte('requested_at', sinceIso);
+  return ((check(res, 'accessRequestsSince') ?? []) as unknown[]).length;
 }
 
 /** Полный сброс подключённых чатов и заявок: начинаем с чистого листа. */

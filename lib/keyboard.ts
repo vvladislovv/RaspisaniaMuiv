@@ -8,7 +8,14 @@
 import type { Day } from './parse';
 import { shortDay } from './format';
 import { displayGroup } from './aliases';
+import type { AccessStatus } from './db';
 import type { InlineButton, InlineKeyboard } from './telegram';
+
+/** Один экран: текст сообщения и кнопки под ним. */
+export interface Screen {
+  text: string;
+  keyboard: InlineKeyboard;
+}
 
 export function chunk<T>(items: T[], size: number): T[][] {
   const out: T[][] = [];
@@ -16,7 +23,100 @@ export function chunk<T>(items: T[], size: number): T[][] {
   return out;
 }
 
+/**
+ * Страница списка. Номер приводится в допустимые границы: список мог
+ * сократиться (человека одобрили — он ушёл из «Ждут»), а номер в старой
+ * кнопке — указывать за конец.
+ */
+export function pageOf<T>(
+  items: T[],
+  page: number,
+  size: number,
+): { items: T[]; page: number; pages: number } {
+  const pages = Math.max(1, Math.ceil(items.length / size));
+  const wanted = Number.isInteger(page) ? page : 0;
+  const current = Math.min(Math.max(wanted, 0), pages - 1);
+  return { items: items.slice(current * size, (current + 1) * size), page: current, pages };
+}
+
 const TO_MENU = { text: '↩︎ Меню', callback_data: 'm' };
+const TO_ADMIN = { text: '↩︎ Сводка', callback_data: 'adm' };
+
+/** Разделы экрана «Доступ»: буква — то, что влезает в `callback_data`. */
+export type AccessSection = 'p' | 'a' | 'd';
+
+export const ACCESS_SECTIONS: Record<
+  AccessSection,
+  { status: AccessStatus; title: string; emoji: string }
+> = {
+  p: { status: 'pending', title: 'Ждут решения', emoji: '⏳' },
+  a: { status: 'approved', title: 'Одобрены', emoji: '✅' },
+  d: { status: 'denied', title: 'Отказано', emoji: '⛔️' },
+};
+
+export function isAccessSection(value: string | undefined): value is AccessSection {
+  return value === 'p' || value === 'a' || value === 'd';
+}
+
+/** Сколько человек на странице раздела: строка кнопок на каждого плюс навигация. */
+export const ACCESS_PAGE_SIZE = 8;
+
+/** Длинное имя на кнопке Telegram всё равно обрежет — делаем это сами и аккуратно. */
+const BUTTON_LABEL_MAX = 28;
+
+function buttonLabel(text: string): string {
+  const chars = Array.from(text);
+  return chars.length > BUTTON_LABEL_MAX ? `${chars.slice(0, BUTTON_LABEL_MAX - 1).join('')}…` : text;
+}
+
+/** Обзор доступа: три раздела вместо одной простыни на сотни людей. */
+export function accessOverviewKeyboard(counts: Record<AccessStatus, number>): InlineKeyboard {
+  return [
+    [{ text: `⏳ Ждут решения (${counts.pending})`, callback_data: 'acc:p:0' }],
+    [
+      { text: `✅ Одобрены (${counts.approved})`, callback_data: 'acc:a:0' },
+      { text: `⛔️ Отказано (${counts.denied})`, callback_data: 'acc:d:0' },
+    ],
+    [{ text: '🔄 Обновить', callback_data: 'admacc' }, TO_ADMIN],
+  ];
+}
+
+/**
+ * Страница раздела доступа: по строке кнопок на человека.
+ *
+ * Номер раздела и страницы едут в кнопке решения, чтобы после нажатия
+ * вернуться на ту же страницу, а не листать список заново.
+ */
+export function accessSectionKeyboard(
+  section: AccessSection,
+  people: { id: number; label: string }[],
+  page: number,
+  pages: number,
+): InlineKeyboard {
+  const where = `${section}:${page}`;
+  const rows: InlineKeyboard = people.map(({ id, label }) => {
+    const name = buttonLabel(label);
+    if (section === 'p') {
+      return [
+        { text: `✅ ${name}`, callback_data: `ok:${id}:${where}` },
+        { text: '⛔️', callback_data: `no:${id}:${where}` },
+      ];
+    }
+    if (section === 'a') return [{ text: `🚫 Отозвать: ${name}`, callback_data: `no:${id}:${where}` }];
+    return [{ text: `✅ Разрешить: ${name}`, callback_data: `ok:${id}:${where}` }];
+  });
+
+  if (pages > 1) {
+    const nav: InlineKeyboard[number] = [];
+    if (page > 0) nav.push({ text: '◀︎', callback_data: `acc:${section}:${page - 1}` });
+    nav.push({ text: `${page + 1} / ${pages}`, callback_data: `acc:${section}:${page}` });
+    if (page + 1 < pages) nav.push({ text: '▶︎', callback_data: `acc:${section}:${page + 1}` });
+    rows.push(nav);
+  }
+
+  rows.push([{ text: '↩︎ Доступ', callback_data: 'admacc' }, TO_ADMIN]);
+  return rows;
+}
 
 export interface MenuOptions {
   groups: string[];
@@ -91,6 +191,14 @@ export interface GroupSwitch {
   dateIso: string;
 }
 
+/** Переключатель групп в режиме недели: активная отмечена точками. */
+function groupSwitchRow(groupSwitch: GroupSwitch): InlineKeyboard[number] {
+  return groupSwitch.groups.map((group, index) => ({
+    text: index === groupSwitch.activeIndex ? `· ${displayGroup(group)} ·` : displayGroup(group),
+    callback_data: `wg:${index}:${groupSwitch.dateIso}`,
+  }));
+}
+
 export function scheduleKeyboard(
   days: Day[],
   active: string | null,
@@ -100,9 +208,11 @@ export function scheduleKeyboard(
   /** Группы, которых нет в файле: нужна кнопка, чтобы выбрать заново. */
   missingGroups: string[] = [],
 ): InlineKeyboard {
-  // Показывать нечего: ни дней, ни рабочих групп
+  // Показывать нечего: у этой группы ещё нет недели в базе. Переключатель
+  // групп всё равно нужен — у второй группы расписание может уже быть
   if (days.length === 0) {
     const rows: InlineKeyboard = [];
+    if (groupSwitch && groupSwitch.groups.length > 1) rows.push(groupSwitchRow(groupSwitch));
     if (missingGroups.length > 0) {
       rows.push([{ text: '👥 Выбрать группу', callback_data: 'grp' }]);
     }
@@ -147,17 +257,7 @@ export function scheduleKeyboard(
 
   // В режиме недели показываем расписание одной группы: две недели рядом
   // не читаются. Поэтому даём переключатель, если групп выбрано больше одной.
-  if (groupSwitch && groupSwitch.groups.length > 1) {
-    rows.push(
-      groupSwitch.groups.map((group, index) => ({
-        text:
-          index === groupSwitch.activeIndex
-            ? `· ${displayGroup(group)} ·`
-            : displayGroup(group),
-        callback_data: `wg:${index}:${groupSwitch.dateIso}`,
-      })),
-    );
-  }
+  if (groupSwitch && groupSwitch.groups.length > 1) rows.push(groupSwitchRow(groupSwitch));
 
   // Одна группа потерялась, а другая работает: расписание показываем и дни
   // листать даём, но кнопку «выбрать заново» ставим тут же, а не в меню
@@ -217,7 +317,10 @@ export function groupKeyboard(
   selected: string[] = [],
 ): InlineKeyboard {
   const pages = chunk(groups, GROUPS_PER_PAGE);
-  const current = pages[page] ?? [];
+  // Страница приходит из нажатия, а его можно подделать: «-5» или «99»
+  // не должны давать пустой список со стрелками в никуда
+  const shown = Math.min(Math.max(page, 0), Math.max(pages.length - 1, 0));
+  const current = pages[shown] ?? [];
 
   // Галочка показывает выбранные группы: нажатие снимает выбор, поэтому
   // человек видит, что выбрал, не выходя из списка
@@ -230,10 +333,10 @@ export function groupKeyboard(
   );
 
   const nav: InlineKeyboard[number] = [];
-  if (page > 0) nav.push({ text: '◀︎', callback_data: `p:${sheetIndex}:${page - 1}` });
+  if (shown > 0) nav.push({ text: '◀︎', callback_data: `p:${sheetIndex}:${shown - 1}` });
   nav.push({ text: '↩︎ Курсы', callback_data: 'grp' });
-  if (page + 1 < pages.length) {
-    nav.push({ text: '▶︎', callback_data: `p:${sheetIndex}:${page + 1}` });
+  if (shown + 1 < pages.length) {
+    nav.push({ text: '▶︎', callback_data: `p:${sheetIndex}:${shown + 1}` });
   }
   rows.push(nav);
   rows.push([

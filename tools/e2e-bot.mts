@@ -16,6 +16,7 @@ import { handleUpdate, type TgUpdate } from '../lib/bot';
 import { refreshPinned, tick } from '../lib/sync';
 import {
   getChat,
+  groupFileName,
   listGroups,
   replaceSchedules,
   setPinnedMessage,
@@ -23,8 +24,9 @@ import {
   upsertFile,
 } from '../lib/db';
 import { parseSchedule } from '../lib/parse';
-import { mskDateOffset } from '../lib/time';
-import { esc } from '../lib/format';
+import { weekBounds } from '../lib/sweep';
+import { dayNameOf, mskDateOffset, weekAnchor } from '../lib/time';
+import { esc, humanDate } from '../lib/format';
 
 const LOG = process.env.FAKE_TG_LOG ?? '/tmp/tg.json';
 const CHAT = -100777000;
@@ -216,6 +218,14 @@ async function resetFeedback(): Promise<void> {
   });
 }
 
+/** Сколько ошибок записано в журнал за всё время прогона. */
+async function errorLogs(): Promise<number> {
+  const res = await fetch(`${process.env.SUPABASE_URL}/rest/v1/logs?kind=eq.error&select=id`, {
+    headers: { apikey: 'fake', Authorization: 'Bearer fake' },
+  });
+  return ((await res.json()) as unknown[]).length;
+}
+
 /** Обнуляет счётчик обращений к базе. */
 async function resetDbHits(): Promise<void> {
   await fetch(`${process.env.SUPABASE_URL}/__stats`, { method: 'POST' });
@@ -236,12 +246,17 @@ async function resetRateLimit(): Promise<void> {
   });
 }
 
-/** Забывает скачанные файлы — следующая проверка сочтёт расписание изменившимся. */
+/**
+ * Забывает скачанные файлы — следующая проверка сочтёт расписание изменившимся.
+ * Дни удаляются вместе с файлами, как это делает `on delete cascade` в базе.
+ */
 async function forgetFiles(): Promise<void> {
-  await fetch(`${process.env.SUPABASE_URL}/rest/v1/files?id=gte.0`, {
-    method: 'DELETE',
-    headers: { apikey: 'fake', Authorization: 'Bearer fake' },
-  });
+  for (const table of ['files', 'schedules']) {
+    await fetch(`${process.env.SUPABASE_URL}/rest/v1/${table}?id=gte.0`, {
+      method: 'DELETE',
+      headers: { apikey: 'fake', Authorization: 'Bearer fake' },
+    });
+  }
 }
 
 /** Забывает отметки о разосланных алертах — иначе повтор прогона их подавит. */
@@ -286,6 +301,43 @@ async function goneTopics(topics: number[]): Promise<void> {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ topics }),
   });
+}
+
+/**
+ * Кладёт текущую неделю каждой группе — как это сделал бы обход сайта:
+ * своя запись в `files` на группу и Пн–Сб в `schedules`. Пары на
+ * понедельник–пятницу, суббота пустая.
+ */
+async function seedCatalogWeeks(names: string[]): Promise<number> {
+  const { monday } = weekBounds(weekAnchor());
+  for (const group of names) {
+    const days = Array.from({ length: 6 }, (_, i) => {
+      const date = new Date(`${monday}T00:00:00Z`);
+      date.setUTCDate(date.getUTCDate() + i);
+      const iso = date.toISOString().slice(0, 10);
+      const lessons =
+        i < 5
+          ? [
+              { pair: 1, time: '08:20-09:50', subject: `Пара 1 у ${group}`, teacher: 'Иванов Иван Иванович', room: '503', raw: '' },
+              { pair: 2, time: '10:00-11:30', subject: `Пара 2 у ${group}`, teacher: null, room: 'Д', raw: '' },
+            ]
+          : [];
+      return { date: iso, name: dayNameOf(iso), lessons };
+    });
+    const row = await upsertFile({
+      name: groupFileName(group),
+      url: `https://www.muiv.ru/studentu/spo/raspisanie/#group=${encodeURIComponent(group)}`,
+      title: group,
+      sha256: createHash('sha256').update(JSON.stringify(days)).digest('hex'),
+      size: JSON.stringify(days).length,
+      siteUpdated: null,
+      weekStart: monday,
+      parsedOk: true,
+      parseError: null,
+    });
+    await replaceSchedules(row.id, { weekStart: monday, groups: [{ group, sheet: '', days }] });
+  }
+  return names.length;
 }
 
 /**
@@ -339,6 +391,14 @@ if (siteReachable) {
 
 const groups = await listGroups();
 ok(groups.length > 50, `в базе ${groups.length} групп`);
+
+// Без сайта неделю групп каталога кладём сами — так, как это делает обход.
+// Последнюю группу оставляем пустой: на ней проверяется «ещё не загружено»
+const UNLOADED = groups[groups.length - 1].group;
+if (!siteReachable) {
+  const seeded = await seedCatalogWeeks(groups.map((g) => g.group).filter((g) => g !== UNLOADED));
+  ok(seeded === groups.length - 1, `у групп каталога есть текущая неделя: ${seeded}`);
+}
 
 // ─── Список разрешённых чатов ────────────────────────────────────────────────
 
@@ -839,8 +899,12 @@ screen = since(m);
 ok(texts(screen).join('').includes('Последняя проверка'), 'статус показывает время проверки');
 ok(texts(screen).join('').includes(esc(chosen[0])), 'статус показывает группу');
 ok(
-  texts(screen).join('').includes('Текущая неделя'),
-  'статус называет файл текущей недели, а не самый поздний',
+  texts(screen).join('').includes(esc(`неделя с ${humanDate(weekBounds(weekAnchor()).monday)}`)),
+  'статус говорит, какая неделя лежит в базе у своей группы',
+);
+ok(
+  !texts(screen).join('').includes('Текущая неделя'),
+  'и не называет чужой файл «текущей неделей»',
 );
 buttons = keyboardOf(screen);
 const offButton = find(buttons, 'Выключить');
@@ -1180,6 +1244,40 @@ ok(since(m).length > 0, 'неизвестная кнопка не роняет �
 await handleUpdate({} as TgUpdate);
 ok(true, 'пустой апдейт не роняет обработчик');
 
+// Подделанные нажатия: даты и числа из кнопки не должны доходить до базы
+// мусором и превращаться в ошибку с алертом владельцу
+{
+  const errorsBefore = await errorLogs();
+  for (const data of [
+    'day:abc',
+    'day:5',
+    'd:2026-13-45',
+    'd:../../etc',
+    'w:garbage',
+    'w:2026-02-30',
+    'wg:0:garbage',
+    'ob:xyz',
+    'p:0:-5',
+    'ok:abc',
+    'no:-1:p:0',
+    'acc:z:9',
+  ]) {
+    await resetRateLimit();
+    await handleUpdate(button(data));
+  }
+  ok((await errorLogs()) === errorsBefore, 'подделанные нажатия не дают ни одной ошибки');
+
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(button('w:2026-13-45'));
+  ok(
+    String(since(m).findLast((c) => c.method === 'answerCallbackQuery')?.body.text ?? '').includes(
+      'устарела',
+    ),
+    'на мусорную дату — понятный ответ',
+  );
+}
+
 // ─── Ограничение частоты ─────────────────────────────────────────────────────
 
 head('Ограничение частоты');
@@ -1496,12 +1594,17 @@ head('Кэш не протекает между одновременными в�
   const overlapped = await dbHits('groups_catalog');
   ok(overlapped === 2, `у каждого вызова свой кэш: чтений ${overlapped}`);
 
-  // Ничего не осталось висеть: вне вызова чтение снова идёт в базу
+  // Вне вызова (вебхук бота) каталог живёт в памяти пару минут: он нужен
+  // почти каждому нажатию, а меняется раз в сутки. Сброс — по записи каталога
+  const { forgetSharedCache } = await import('../lib/db');
+  forgetSharedCache();
   await resetDbHits();
   await read();
   await read();
-  const outside = await dbHits('groups_catalog');
-  ok(outside === 2, `вне вызова кэш не действует: чтений ${outside}`);
+  ok((await dbHits('groups_catalog')) === 1, 'вне вызова каталог читается один раз на пару минут');
+  forgetSharedCache();
+  await read();
+  ok((await dbHits('groups_catalog')) === 2, 'после сброса — снова из базы');
 }
 
 // ─── Баги и предложения ──────────────────────────────────────────────────────
@@ -1554,12 +1657,73 @@ head('Баги и предложения');
   await handleUpdate(message('просто болтаю', REPORTER, REPORTER, 'private'));
   ok(sent(since(m)).length === 0, 'без выбранного тега бот на текст не реагирует');
 
-  // Предложение приходит со своим тегом
+  // Без одобренного доступа — одно сообщение в день, и об этом говорят сразу,
+  // а не после того, как человек напишет длинный текст
   await resetRateLimit();
+  m = mark();
   await handleUpdate(privateButton('fb:idea', REPORTER));
+  out = since(m);
+  ok(texts(out).join('').includes('На сегодня всё'), 'без доступа второе за день не принимается');
+  ok(texts(out).join('').includes(esc('С одобренным доступом — до 3')), 'и сказано, как получить больше');
   await resetRateLimit();
   m = mark();
   await handleUpdate(message('Пусть показывает преподавателя', REPORTER, REPORTER, 'private'));
+  ok(sent(since(m)).length === 0, 'текст после отказа никуда не уходит');
+
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(message('/start bug', REPORTER, REPORTER, 'private'));
+  ok(texts(since(m)).join('').includes('На сегодня всё'), 'ссылка из группы тоже упирается в лимит');
+
+  // Ровно путь со скриншота 23.10: новый человек, заявка ждёт; «Баг» →
+  // текст → снова «Баг или идея» → «Баг» → текст. На проде старый код
+  // принял оба сообщения; теперь второе не принимается вовсе
+  {
+    const NEWCOMER = 7718;
+    await resetRateLimit();
+    await handleUpdate(message('/start', NEWCOMER, NEWCOMER, 'private'));
+    const steps: [string, TgUpdate][] = [
+      ['fb', privateButton('fb', NEWCOMER)],
+      ['fb:bug', privateButton('fb:bug', NEWCOMER)],
+      ['текст 1', message('фывафыва', NEWCOMER, NEWCOMER, 'private')],
+      ['fb', privateButton('fb', NEWCOMER)],
+      ['fb:bug', privateButton('fb:bug', NEWCOMER)],
+      ['текст 2', message('фывафывафыв', NEWCOMER, NEWCOMER, 'private')],
+    ];
+    m = mark();
+    const shown: string[] = [];
+    for (const [, update] of steps) {
+      await resetRateLimit();
+      const before = mark();
+      await handleUpdate(update);
+      shown.push(texts(since(before)).join(' | '));
+    }
+    out = since(m);
+    const toOwner = sent(out).filter(
+      (c) => c.body.chat_id === OWNER && String(c.body.text).includes('#баг'),
+    );
+    ok(toOwner.length === 1, `владельцу ушёл ровно один баг: ${toOwner.length}`);
+    ok(shown[3].includes('На сегодня всё'), 'после первого бага «Баг или идея» уже говорит «на сегодня всё»');
+    ok(!shown[4].includes('сломалось'), 'повторный «Баг» не открывает ввод текста');
+    ok(!shown[5].includes('Передал'), 'второй текст не передан');
+  }
+
+  // С одобренным доступом — три в день
+  const APPROVED = 4343;
+  const { decideAccess, setState } = await import('../lib/db');
+  await decideAccess(APPROVED, 'approved');
+
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(privateButton('fb', APPROVED));
+  ok(texts(since(m)).join('').includes(esc('Сегодня можно ещё: 3')), 'одобренному видно, сколько осталось');
+
+  // Предложение приходит со своим тегом
+  await resetRateLimit();
+  await handleUpdate(privateButton('fb:idea', APPROVED));
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(message('Пусть показывает преподавателя', APPROVED, APPROVED, 'private'));
   ok(
     String(sent(since(m)).find((c) => c.body.chat_id === OWNER)?.body.text ?? '').includes(
       '#предложение',
@@ -1567,32 +1731,53 @@ head('Баги и предложения');
     'у предложения свой тег',
   );
 
-  // Слишком длинное не проходит, ожидание не сбрасывается
+  // Слишком длинное не проходит и в лимит не засчитывается
   await resetRateLimit();
-  await handleUpdate(privateButton('fb:bug', REPORTER));
+  await handleUpdate(privateButton('fb:bug', APPROVED));
   await resetRateLimit();
   m = mark();
-  await handleUpdate(message('я'.repeat(1500), REPORTER, REPORTER, 'private'));
+  await handleUpdate(message('я'.repeat(1500), APPROVED, APPROVED, 'private'));
   out = since(m);
   ok(texts(out).join('').includes('Слишком длинно'), 'слишком длинное отклонено');
   ok(sent(out).every((c) => c.body.chat_id !== OWNER), 'и владельцу не ушло');
 
-  // Потолок: больше пяти в час бот не передаёт
-  await resetRateLimit();
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < 2; i++) {
     await resetRateLimit();
-    await handleUpdate(privateButton('fb:bug', REPORTER));
+    await handleUpdate(privateButton('fb:bug', APPROVED));
     await resetRateLimit();
-    await handleUpdate(message(`ещё баг ${i}`, REPORTER, REPORTER, 'private'));
+    await handleUpdate(message(`ещё баг ${i}`, APPROVED, APPROVED, 'private'));
   }
   await resetRateLimit();
-  await handleUpdate(privateButton('fb:bug', REPORTER));
+  m = mark();
+  await handleUpdate(privateButton('fb:bug', APPROVED));
+  out = since(m);
+  ok(texts(out).join('').includes('На сегодня всё'), 'четвёртое за день у одобренного не принимается');
+  ok(!texts(out).join('').includes('С одобренным доступом'), 'и про доступ ему не рассказывают');
+
+  // Тег выбран раньше, а лимит кончился в другом окне: текст всё равно не проходит
+  await setState(`fb:${APPROVED}`, { kind: 'bug', at: new Date().toISOString() });
   await resetRateLimit();
   m = mark();
-  await handleUpdate(message('шестой подряд', REPORTER, REPORTER, 'private'));
+  await handleUpdate(message('пятый подряд', APPROVED, APPROVED, 'private'));
   out = since(m);
-  ok(texts(out).join('').includes('Пока хватит'), 'потолок в час срабатывает');
-  ok(sent(out).every((c) => c.body.chat_id !== OWNER), 'сверх потолка владельца не дёргаем');
+  ok(texts(out).join('').includes('На сегодня всё'), 'лимит проверяется и при отправке текста');
+  ok(sent(out).every((c) => c.body.chat_id !== OWNER), 'сверх лимита владельца не дёргаем');
+
+  // Два сообщения в одно ожидание, доставленные параллельно, — принимается одно
+  const RACER = 4444;
+  await decideAccess(RACER, 'approved');
+  await setState(`fb:${RACER}`, { kind: 'bug', at: new Date().toISOString() });
+  await resetRateLimit();
+  m = mark();
+  await Promise.all([
+    handleUpdate(message('первое', RACER, RACER, 'private')),
+    handleUpdate(message('второе', RACER, RACER, 'private')),
+  ]);
+  out = since(m);
+  ok(
+    sent(out).filter((c) => c.body.chat_id === OWNER).length === 1,
+    'из двух параллельных сообщений в одно ожидание принято одно',
+  );
 
   // В группе кнопка ведёт ссылкой в личку: обычных сообщений бот там не видит
   await resetRateLimit();
@@ -1692,6 +1877,466 @@ head('Форум: расписание уходит в выбранную тем
     sent(out).every((c) => c.body.message_thread_id === undefined),
     'и тему в отправку не подставляем',
   );
+}
+
+// ─── Доступ: разделы и страницы ──────────────────────────────────────────────
+
+await resetRateLimit();
+head('Доступ: разделы со страницами');
+{
+  const { requestAccess, getAccess } = await import('../lib/db');
+  // Двадцать заявок — больше двух страниц по восемь
+  const WAVE = Array.from({ length: 20 }, (_, i) => 7000 + i);
+  for (const id of WAVE) await requestAccess(id, `wave${id}`, `Волна ${id}`);
+
+  m = mark();
+  await handleUpdate(privateButton('admacc', OWNER));
+  let out = since(m);
+  let kb = keyboardOf(out);
+  ok(!!find(kb, 'Ждут решения ('), 'в обзоре есть раздел «Ждут решения»');
+  ok(!!find(kb, 'Одобрены (') && !!find(kb, 'Отказано ('), 'и разделы одобренных и отказанных');
+  ok(kb.length <= 6, `в обзоре нет простыни из кнопок: ${kb.length}`);
+
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(privateButton('acc:p:0', OWNER));
+  out = since(m);
+  kb = keyboardOf(out);
+  const people = kb.filter((b) => b.callback_data?.startsWith('ok:'));
+  ok(people.length === 8, `на странице 8 человек: ${people.length}`);
+  ok(!!find(kb, '1 / '), 'видно, какая это страница');
+  ok(texts(out).join('').includes('Страница 1 из'), 'и в тексте тоже');
+  const nextPage = kb.find((b) => b.text === '▶︎');
+  ok(!!nextPage, 'есть кнопка на следующую страницу');
+
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(privateButton(nextPage!.callback_data, OWNER));
+  out = since(m);
+  kb = keyboardOf(out);
+  ok(texts(out).join('').includes('Страница 2 из'), 'листается на вторую страницу');
+  const pick = kb.find((b) => b.callback_data?.startsWith('ok:'))!;
+  ok(pick.callback_data.endsWith(':p:1'), `решение помнит раздел и страницу: ${pick.callback_data}`);
+
+  const pickedId = Number(pick.callback_data.split(':')[1]);
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(privateButton(pick.callback_data, OWNER));
+  out = since(m);
+  ok((await getAccess(pickedId))?.status === 'approved', 'человек одобрен со страницы раздела');
+  ok(texts(out).join('').includes('Страница 2 из'), 'после решения остаёмся на той же странице');
+  ok(
+    sent(out).some((c) => c.body.chat_id === pickedId && String(c.body.text).includes('Доступ открыт')),
+    'одобренному пришла обучалка',
+  );
+
+  // Двойное нажатие «Разрешить» не шлёт обучалку второй раз
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(privateButton(`ok:${pickedId}:p:1`, OWNER));
+  ok(
+    !sent(since(m)).some((c) => c.body.chat_id === pickedId),
+    'повторное одобрение не шлёт обучалку снова',
+  );
+
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(privateButton('acc:a:0', OWNER));
+  kb = keyboardOf(since(m));
+  ok(kb.some((b) => b.text.startsWith('🚫 Отозвать')), 'в одобренных — кнопка отозвать');
+
+  // Номер страницы за концом списка приводится к последней странице
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(privateButton('acc:p:99', OWNER));
+  ok(texts(since(m)).join('').includes('Страница 3 из 3'), 'страница за концом — последняя');
+
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(privateButton('acc:p:0', STRANGER));
+  ok(
+    !texts(since(m)).join('').includes('Ждут решения') &&
+      since(m).some((c) => c.method === 'answerCallbackQuery'),
+    'чужому разделы доступа не открываются',
+  );
+
+  // Все экраны укладываются в лимиты Telegram даже на сотнях людей
+  const { accessSectionScreen } = await import('../lib/admin');
+  for (const id of Array.from({ length: 300 }, (_, i) => 9000 + i)) {
+    await requestAccess(id, null, 'Очень длинное имя человека, который пришёл в бота'.repeat(2));
+  }
+  const big = await accessSectionScreen('p', 0);
+  ok(big.text.length < 4096, `текст страницы в лимите: ${big.text.length}`);
+  ok(big.keyboard.flat().length <= 100, `кнопок не больше 100: ${big.keyboard.flat().length}`);
+  ok(
+    big.keyboard.flat().every((b) => (b.callback_data ?? '').length <= 64),
+    'callback_data каждой кнопки не длиннее 64 байт',
+  );
+
+  await resetAccess();
+}
+
+// ─── Обходы доступа ──────────────────────────────────────────────────────────
+
+await resetRateLimit();
+head('Без одобрения бот не открывается никаким путём');
+{
+  const { decideAccess, getChat: chatOf, requestAccess } = await import('../lib/db');
+  const NEWBIE = 5151;
+  const DENIED = 5252;
+  await requestAccess(NEWBIE, 'newbie', 'Новичок');
+  await requestAccess(DENIED, 'denied', 'Отказ');
+  await decideAccess(DENIED, 'denied');
+
+  // Заблокировать и разблокировать бота в личке — это my_chat_member
+  for (const who of [NEWBIE, DENIED]) {
+    await resetRateLimit();
+    m = mark();
+    await handleUpdate(membership('member', who, who, 'private'));
+    ok((await chatOf(who)) === null, `разблокировка в личке не заводит чат (${who})`);
+    ok(sent(since(m)).length === 0, 'и меню не присылает');
+  }
+
+  // Подделанные нажатия в личке без доступа
+  for (const data of ['day:1', 'week', 'g:0', 'grp', 'st', 'about']) {
+    await resetRateLimit();
+    m = mark();
+    await handleUpdate(privateButton(data, DENIED));
+    ok(
+      String(since(m).findLast((c) => c.method === 'answerCallbackQuery')?.body.text ?? '') !==
+        '' && edited(since(m)).length === 0,
+      `«${data}» без доступа не открывается`,
+    );
+  }
+  ok((await chatOf(DENIED)) === null, 'подделанный выбор группы не завёл чат');
+
+  // Отзыв доступа работает сразу, без нового /start
+  const REVOKED = 5353;
+  await decideAccess(REVOKED, 'approved');
+  await resetRateLimit();
+  await handleUpdate(message('/start', REVOKED, REVOKED, 'private'));
+  ok((await chatOf(REVOKED))?.enabled === true, 'одобренный получил личку');
+  await resetRateLimit();
+  await handleUpdate(privateButton(`no:${REVOKED}:a:0`, OWNER));
+  ok((await chatOf(REVOKED))?.enabled === false, 'после отзыва его личка выключена из рассылки');
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(privateButton('day:1', REVOKED));
+  ok(edited(since(m)).length === 0, 'и старые кнопки больше не работают');
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(privateButton('m', REVOKED));
+  ok(texts(since(m)).join('').includes('Доступ не открыт'), '«Меню» показывает, что доступа нет');
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(privateButton('fb', REVOKED));
+  ok(texts(since(m)).join('').includes('Баг или предложение'), 'а баг сообщить по-прежнему можно');
+
+  // Группа без доступа: бот уходит, даже если писать туда ему нельзя
+  const MUTED = -100777700;
+  await failMethods(['sendMessage']);
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(membership('member', DENIED, MUTED));
+  ok(since(m).some((c) => c.method === 'leaveChat'), 'из чужой группы бот уходит и без сообщения');
+  await failMethods([]);
+
+  await resetAccess();
+}
+
+// ─── Счётчики команд и нажатий ───────────────────────────────────────────────
+
+await resetRateLimit();
+head('Нажатия одного не съедают /start у всей группы');
+{
+  for (let i = 0; i < 15; i++) await handleUpdate(button('m', STRANGER));
+  m = mark();
+  await handleUpdate(message('/start', STRANGER));
+  ok(sent(since(m)).length === 1, '/start отвечает и после пятнадцати нажатий');
+
+  const { recentLogs } = await import('../lib/db');
+  ok(
+    !(await recentLogs(200)).some((l) => l.message.startsWith('Нажатие ')),
+    'быстрые нажатия не пишутся в журнал строкой на каждое',
+  );
+}
+
+// ─── Нет данных — это не «пар нет» ───────────────────────────────────────────
+
+await resetRateLimit();
+await resetAlerts();
+head('Нет расписания в базе — это не «Пар нет»');
+{
+  const NODATA = -100777400;
+  const { db, getChat: chatOf } = await import('../lib/db');
+  const { sendTomorrow } = await import('../lib/sync');
+
+  await upsertChat(NODATA, 'Группа без скачанного расписания', OWNER);
+  await db().from('chats').update({ groups: [UNLOADED], enabled: true }).eq('chat_id', NODATA);
+  await setPinnedMessage(NODATA, null, null);
+
+  m = mark();
+  await handleUpdate(button('day:1', OWNER, NODATA));
+  let text = texts(since(m)).join('');
+  ok(text.includes(esc('ещё не загружено')), 'день без данных так и называется');
+  ok(!text.includes('Пар нет'), 'и не выдаётся за день без пар');
+
+  await resetRateLimit();
+  m = mark();
+  await handleUpdate(button('week', OWNER, NODATA));
+  text = texts(since(m)).join('');
+  ok(text.includes(esc('ещё не загружено')), 'неделя без данных — тоже');
+
+  // Рассылка такой чат придерживает, пока ждать ещё есть смысл
+  m = mark();
+  const waited = await sendTomorrow(Date.now() + 20_000, false);
+  ok(waited.waiting >= 1, `чат ждёт расписание: ${waited.waiting}`);
+  ok(sent(since(m)).every((c) => c.body.chat_id !== NODATA), 'в него ничего не ушло');
+  ok((await chatOf(NODATA))?.pinned_date !== mskDateOffset(1), 'и он не помечен отправленным');
+  ok(waited.pending >= waited.waiting, 'ждущие считаются недоставленными — тик вернётся к ним');
+
+  // Ждать больше некогда: уходит честное «не загружено», владелец узнаёт сам
+  m = mark();
+  const forced = await sendTomorrow(Date.now() + 20_000, true);
+  const toChat = sent(since(m)).filter((c) => c.body.chat_id === NODATA);
+  ok(forced.sent >= 1 && toChat.length === 1, 'после срока ожидания сообщение уходит');
+  ok(String(toChat[0]?.body.text ?? '').includes(esc('ещё не загружено')), 'с честным текстом');
+  ok(
+    sent(since(m)).some(
+      (c) => c.body.chat_id === OWNER && String(c.body.text).includes('Рассылка без расписания'),
+    ),
+    'владелец получил алерт, что у группы нет расписания',
+  );
+
+  await db().from('chats').update({ enabled: false }).eq('chat_id', NODATA);
+}
+
+// ─── Перерисовка закрепов только у изменившихся групп ────────────────────────
+
+await resetRateLimit();
+head('Закрепы перерисовываются только у изменившихся групп');
+{
+  const A = -100777500;
+  const B = -100777501;
+  const [groupA, groupB] = [groups[0].group, groups[1].group];
+  const { db, getState: stateOf } = await import('../lib/db');
+  const today = mskDateOffset(0);
+
+  for (const [chat, group] of [[A, groupA], [B, groupB]] as const) {
+    await upsertChat(chat, `Закреп ${group}`, OWNER);
+    await db().from('chats').update({ groups: [group], enabled: true }).eq('chat_id', chat);
+    await setPinnedMessage(chat, 5000 + Math.abs(chat % 100), today);
+  }
+
+  m = mark();
+  await refreshPinned([groupA]);
+  let editedChats = new Set(edited(since(m)).map((c) => Number(c.body.chat_id)));
+  ok(editedChats.has(A), 'чат изменившейся группы перерисован');
+  ok(!editedChats.has(B), 'чат другой группы не тронут');
+
+  // Время кончилось — недоделанное запоминается и идёт первым на следующем тике
+  m = mark();
+  await refreshPinned([groupB], Date.now() - 1);
+  ok(edited(since(m)).length === 0, 'после дедлайна ничего не правится');
+  ok(((await stateOf<string[]>('pinned_stale_groups')) ?? []).includes(groupB), 'группа запомнена');
+
+  m = mark();
+  await refreshPinned([]);
+  editedChats = new Set(edited(since(m)).map((c) => Number(c.body.chat_id)));
+  ok(editedChats.has(B), 'на следующем проходе её закреп перерисован');
+  ok((await stateOf<string[]>('pinned_stale_groups')) === null, 'и память об этом очищена');
+
+  await db().from('chats').update({ enabled: false }).in('chat_id', [A, B]);
+}
+
+// ─── Обход всех групп на заглушке сайта ──────────────────────────────────────
+
+await resetRateLimit();
+head('Обход всех групп: очередь, дедлайн, пустые недели');
+{
+  const { checkSite } = await import('../lib/sync');
+  const { activeChats, catalogEntries, db, getWeek, groupFileStatus, getState: stateOf } =
+    await import('../lib/db');
+  const { LAST_CHECK_KEY, SWEEP_ATTEMPTS_KEY } = await import('../lib/sweep');
+  type CheckRecord = import('../lib/sweep').CheckRecord;
+  type SiteAccess = import('../lib/sync').SiteAccess;
+  type BrowserSession = import('../lib/browser').BrowserSession;
+
+  const { monday } = weekBounds(weekAnchor());
+  const catalog = await catalogEntries();
+  const all = catalog.map((e) => e.group);
+  const [EMPTY, BROKEN, KEEP] = [all[2], all[3], all[5]];
+
+  const fetchedLog: string[] = [];
+  const emptyNow = new Set<string>([EMPTY]);
+  let delayMs = 0;
+  let catalogOverride: typeof catalog | null = null;
+
+  const weekFor = (group: string) =>
+    Array.from({ length: 5 }, (_, i) => {
+      const d = new Date(`${monday}T00:00:00Z`);
+      d.setUTCDate(d.getUTCDate() + i);
+      const iso = d.toISOString().slice(0, 10);
+      return {
+        date: iso,
+        name: dayNameOf(iso),
+        lessons: [{ pair: 1, time: '08:20-09:50', subject: `Обход ${group}`, teacher: null, room: null, raw: '' }],
+      };
+    });
+
+  const fakeSite: SiteAccess = {
+    openSession: async <T,>(_url: string, fn: (session: BrowserSession) => Promise<T>) =>
+      fn({ page: null as never }),
+    fetchCatalog: async () => catalogOverride ?? catalog,
+    fetchGroupSchedule: async (_page, entry) => {
+      fetchedLog.push(entry.group);
+      if (delayMs) await pause(delayMs);
+      if (entry.group === BROKEN) throw new Error('ajax.php вернул не JSON: <!DOCTYPE html>');
+      if (emptyNow.has(entry.group)) return [];
+      return weekFor(entry.group);
+    },
+  };
+
+  const clearSweepState = async () => {
+    await forgetFiles();
+    await db().from('app_state').delete().in('key', [SWEEP_ATTEMPTS_KEY, 'catalog_refreshed_date']);
+    fetchedLog.length = 0;
+  };
+
+  const subscribed = new Set(
+    (await activeChats()).flatMap((c) => c.groups).filter((g) => all.includes(g)),
+  );
+
+  // Холодный старт: в базе ни одной недели
+  await clearSweepState();
+  let result = await checkSite(Date.now() + 30_000, fakeSite);
+  let record = await stateOf<CheckRecord>(LAST_CHECK_KEY);
+  let files = await groupFileStatus();
+
+  ok(fetchedLog.length === all.length, `за проход скачаны все ${all.length} групп каталога`);
+  ok(files.size === all.length - 2, `в базе неделя у всех, кроме пустой и сломанной: ${files.size}`);
+  ok(!files.has(EMPTY), 'пустую неделю с сайта не записали');
+  ok(!files.has(BROKEN), 'сломанный ответ не записали');
+  ok(record?.sweep?.empty.includes(EMPTY) === true, 'в отчёте видно, у кого сайт не отдал пар');
+  ok(
+    record?.sweep?.failed.some((f) => f.group === BROKEN && f.reason.includes('не JSON')) === true,
+    'и кто не скачался и почему',
+  );
+  ok(result.changed.length === all.length - 2, 'изменения отмечены у всех записанных');
+  const lastSubscribed = Math.max(...[...subscribed].map((g) => fetchedLog.indexOf(g)));
+  const firstIdle = fetchedLog.findIndex((g) => !subscribed.has(g));
+  ok(subscribed.size > 0 && lastSubscribed < firstIdle, 'подписанные группы скачаны первыми');
+  {
+    const week = await getWeek(all[0], monday);
+    ok(week.days.length === 6, 'неделя дозаполнена до субботы');
+    ok(week.days[0].lessons.length === 1 && week.days[5].lessons.length === 0, 'пары на месте');
+  }
+  const attempts = (await stateOf<Record<string, string>>(SWEEP_ATTEMPTS_KEY)) ?? {};
+  ok(Object.keys(attempts).length === all.length, 'попытки запомнены у всех, включая пустые');
+
+  // Сразу второй проход: всё свежее, пустую и сломанную не дёргаем каждый тик
+  fetchedLog.length = 0;
+  result = await checkSite(Date.now() + 30_000, fakeSite);
+  record = await stateOf<CheckRecord>(LAST_CHECK_KEY);
+  ok(fetchedLog.length === 0, `второй проход подряд ничего не качает: ${fetchedLog.join(', ')}`);
+  ok(record?.sweep?.planned === 0, 'очередь пуста');
+
+  // Пустой ответ сайта не стирает уже загруженную неделю
+  emptyNow.add(KEEP);
+  const keepBefore = (await groupFileStatus()).get(KEEP);
+  await db()
+    .from('files')
+    .update({ last_seen: new Date(Date.now() - 3 * 3_600_000).toISOString() })
+    .eq('name', groupFileName(KEEP));
+  await db().from('app_state').delete().eq('key', SWEEP_ATTEMPTS_KEY);
+  const KEEPER = -100777600;
+  await upsertChat(KEEPER, 'Подписка на группу', OWNER);
+  await db().from('chats').update({ groups: [KEEP], enabled: true }).eq('chat_id', KEEPER);
+  fetchedLog.length = 0;
+  await checkSite(Date.now() + 30_000, fakeSite);
+  ok(fetchedLog[0] === KEEP, 'давно не проверенная подписанная группа пошла первой');
+  ok(
+    (await groupFileStatus()).get(KEEP)?.weekStart === keepBefore?.weekStart,
+    'неделя на месте после пустого ответа',
+  );
+  ok(
+    (await getWeek(KEEP, monday)).days.some((d) => d.lessons.length > 0),
+    'и пары никуда не делись',
+  );
+  emptyNow.delete(KEEP);
+  await db().from('chats').update({ enabled: false }).eq('chat_id', KEEPER);
+
+  // Дедлайн: сделанное сохраняется, следующий проход продолжает с того же места
+  await clearSweepState();
+  delayMs = 40;
+  const firstRun = await checkSite(Date.now() + 300, fakeSite);
+  const firstFetched = [...fetchedLog];
+  files = await groupFileStatus();
+  ok(
+    firstFetched.length > 0 && firstFetched.length < all.length,
+    `до дедлайна успели часть: ${firstFetched.length} из ${all.length}`,
+  );
+  ok(files.size > 0, `и она уже в базе: ${files.size}`);
+  ok(firstRun.filesOnSite === firstFetched.length - (firstFetched.includes(BROKEN) ? 1 : 0), 'отчёт сходится');
+
+  delayMs = 0;
+  fetchedLog.length = 0;
+  await checkSite(Date.now() + 30_000, fakeSite);
+  const overlap = fetchedLog.filter((g) => firstFetched.includes(g) && !subscribed.has(g));
+  ok(overlap.length === 0, `второй проход не качает заново уже скачанное: ${overlap.join(', ')}`);
+  {
+    const loaded = await groupFileStatus();
+    const missingNow = all.filter((g) => !loaded.has(g) && g !== EMPTY && g !== BROKEN);
+    ok(missingNow.length === 0, `за два прохода загружено всё, не хватает: ${missingNow.join(', ')}`);
+
+  }
+
+  // Курс пришёл с сайта пустым — это сбой, а не расформирование всех групп
+  await db().from('app_state').delete().eq('key', 'catalog_refreshed_date');
+  const lostYear = catalog[0].year;
+  catalogOverride = catalog.filter((e) => e.year !== lostYear);
+  await checkSite(Date.now() + 30_000, fakeSite);
+  ok(
+    (await catalogEntries()).some((e) => e.year === lostYear),
+    `каталог не потерял «${lostYear}» из-за пустого ответа`,
+  );
+  ok(
+    (await catalogEntries()).length === catalog.length,
+    'остальные курсы обновлены, ничего не пропало',
+  );
+  ok(
+    (await stateOf<string>('catalog_refreshed_date')) === mskDateOffset(0),
+    'и каталог не переспрашивается на каждом тике',
+  );
+  catalogOverride = null;
+}
+
+// ─── Тики не накладываются ───────────────────────────────────────────────────
+
+await resetRateLimit();
+head('Два тика разом не идут');
+{
+  const { acquireLock, releaseLock, db } = await import('../lib/db');
+
+  ok(await acquireLock('tick_lock', 75_000), 'замок взят');
+  m = mark();
+  const busy = await tick(true);
+  ok(busy.locked === true, 'второй тик видит замок и ничего не делает');
+  ok(sent(since(m)).length === 0, 'и ничего не рассылает');
+  ok(!(await acquireLock('tick_lock', 75_000)), 'второй раз тот же замок не берётся');
+  await releaseLock('tick_lock');
+
+  const free = await tick(true);
+  ok(!free.locked, 'после снятия замка тик идёт');
+  ok(await acquireLock('tick_lock', 75_000), 'и сам замок за собой снимает');
+
+  // Тик убили по таймауту, замок остался: через срок он протухает
+  await db()
+    .from('app_state')
+    .update({ updated_at: new Date(Date.now() - 120_000).toISOString() })
+    .eq('key', 'tick_lock');
+  ok(await acquireLock('tick_lock', 75_000), 'протухший замок не мешает следующему тику');
+  await releaseLock('tick_lock');
 }
 
 console.log(failures ? `\nПРОВАЛЕНО ПРОВЕРОК: ${failures}\n` : '\nВсе проверки прошли\n');
