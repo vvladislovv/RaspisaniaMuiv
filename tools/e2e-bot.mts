@@ -1675,6 +1675,39 @@ head('Баги и предложения');
   await handleUpdate(message('/start bug', REPORTER, REPORTER, 'private'));
   ok(texts(since(m)).join('').includes('На сегодня всё'), 'ссылка из группы тоже упирается в лимит');
 
+  // Ровно путь со скриншота 23.10: новый человек, заявка ждёт; «Баг» →
+  // текст → снова «Баг или идея» → «Баг» → текст. На проде старый код
+  // принял оба сообщения; теперь второе не принимается вовсе
+  {
+    const NEWCOMER = 7718;
+    await resetRateLimit();
+    await handleUpdate(message('/start', NEWCOMER, NEWCOMER, 'private'));
+    const steps: [string, TgUpdate][] = [
+      ['fb', privateButton('fb', NEWCOMER)],
+      ['fb:bug', privateButton('fb:bug', NEWCOMER)],
+      ['текст 1', message('фывафыва', NEWCOMER, NEWCOMER, 'private')],
+      ['fb', privateButton('fb', NEWCOMER)],
+      ['fb:bug', privateButton('fb:bug', NEWCOMER)],
+      ['текст 2', message('фывафывафыв', NEWCOMER, NEWCOMER, 'private')],
+    ];
+    m = mark();
+    const shown: string[] = [];
+    for (const [, update] of steps) {
+      await resetRateLimit();
+      const before = mark();
+      await handleUpdate(update);
+      shown.push(texts(since(before)).join(' | '));
+    }
+    out = since(m);
+    const toOwner = sent(out).filter(
+      (c) => c.body.chat_id === OWNER && String(c.body.text).includes('#баг'),
+    );
+    ok(toOwner.length === 1, `владельцу ушёл ровно один баг: ${toOwner.length}`);
+    ok(shown[3].includes('На сегодня всё'), 'после первого бага «Баг или идея» уже говорит «на сегодня всё»');
+    ok(!shown[4].includes('сломалось'), 'повторный «Баг» не открывает ввод текста');
+    ok(!shown[5].includes('Передал'), 'второй текст не передан');
+  }
+
   // С одобренным доступом — три в день
   const APPROVED = 4343;
   const { decideAccess, setState } = await import('../lib/db');
