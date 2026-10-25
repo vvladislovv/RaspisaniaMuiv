@@ -54,6 +54,10 @@ import {
   planSweep,
   weekBounds,
   weekOfGroup,
+  confirmEmptyWeek,
+  emptyWeek,
+  EMPTY_SEEN_KEY,
+  type EmptySeen,
   type CheckRecord,
   type SweepReport,
 } from './sweep';
@@ -75,14 +79,17 @@ function sha256(s: string): string {
  *
  * Расписание приходит по AJAX и не имеет ни адреса, ни своего веса в байтах,
  * поэтому запись в `files` ключуется именем группы (см. `groupFileName`).
- * Неделя без единой пары не пишется вовсе — см. `weekOfGroup`.
+ * Неделя без единой пары не пишется вовсе — см. `weekOfGroup` — пока сайт
+ * не продержал её пустой достаточно долго (`confirmedEmpty`, см. `confirmEmptyWeek`).
  */
 async function ingestGroup(
   groupName: string,
   rawDays: Day[],
+  confirmedEmpty = false,
 ): Promise<{ changed: boolean; empty: boolean }> {
   const name = groupFileName(groupName);
-  const days = weekOfGroup(rawDays, weekAnchor());
+  const anchor = weekAnchor();
+  const days = weekOfGroup(rawDays, anchor) ?? (confirmedEmpty ? emptyWeek(anchor) : null);
   if (!days) return { changed: false, empty: true };
 
   // `files.url` уникален в схеме, а у всех групп один SCHEDULE_URL —
@@ -268,6 +275,10 @@ export async function checkSite(
   // в одни и те же пустые группы (см. SweepCandidate.attemptedAt)
   const previousAttempts = (await getState<Record<string, string>>(SWEEP_ATTEMPTS_KEY)) ?? {};
   const attempts = new Map<string, string>();
+  const emptySeen = new Map(
+    Object.entries((await getState<Record<string, EmptySeen>>(EMPTY_SEEN_KEY)) ?? {}),
+  );
+  let emptySeenDirty = false;
   let catalogNames: Set<string> | null = null;
 
   // Отметку о проверке пишем в любом случае — даже если сайт не ответил.
@@ -280,6 +291,14 @@ export async function checkSite(
         ),
       );
       await setState(SWEEP_ATTEMPTS_KEY, merged);
+    }
+    if (emptySeenDirty) {
+      await setState(
+        EMPTY_SEEN_KEY,
+        Object.fromEntries(
+          [...emptySeen].filter(([group]) => !catalogNames || catalogNames.has(group)),
+        ),
+      );
     }
     const value: CheckRecord = {
       at: new Date().toISOString(),
@@ -342,12 +361,35 @@ export async function checkSite(
       );
       report.planned = plan.length;
 
+      const readyCount = catalog.filter((entry) => {
+        const weekStart = files.get(entry.group)?.weekStart;
+        return weekStart ? mondayOf(weekStart) === report.monday : false;
+      }).length;
+      const readyShare = catalog.length > 0 ? readyCount / catalog.length : 0;
+
       await forEachUntil(plan, FETCH_CONCURRENCY, deadline, async (group) => {
         const entry = byName.get(group);
         if (!entry) return;
         attempts.set(group, new Date().toISOString());
         try {
-          const ingested = await ingestGroup(group, await site.fetchGroupSchedule(session.page, entry));
+          const rawDays = await site.fetchGroupSchedule(session.page, entry);
+
+          // Пустую неделю одной группы при живом сайте (у остальных неделя
+          // уже есть) принимаем за настоящую не сразу, а продержав пустой
+          const hasWeek = weekOfGroup(rawDays, weekAnchor()) !== null;
+          let confirmedEmpty = false;
+          if (hasWeek) {
+            emptySeenDirty = emptySeen.delete(group) || emptySeenDirty;
+          } else {
+            const verdict = confirmEmptyWeek(emptySeen.get(group), report.monday, readyShare, Date.now());
+            confirmedEmpty = verdict.confirmed;
+            if (emptySeen.get(group) !== verdict.seen) {
+              emptySeen.set(group, verdict.seen);
+              emptySeenDirty = true;
+            }
+          }
+
+          const ingested = await ingestGroup(group, rawDays, confirmedEmpty);
           report.fetched++;
           if (ingested.changed) result.changed.push(group);
           if (ingested.empty) report.empty.push(group);

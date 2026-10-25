@@ -170,6 +170,58 @@ export function weekOfGroup(rawDays: Day[], anchorIso: string): Day[] | null {
   return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
 }
 
+/** Ключ в `app_state`: с какого момента сайт отдаёт группе пустую неделю. */
+export const EMPTY_SEEN_KEY = 'sweep_empty_seen';
+
+/**
+ * Сколько сайт должен подряд отдавать группе пустую неделю, чтобы поверить,
+ * что пар у неё правда нет: так живут заочники в межсессионные недели. Меньше
+ * нельзя — в воскресенье вечером колледж ещё выкладывает неделю по группам.
+ */
+export const EMPTY_CONFIRM_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Какая доля каталога должна уже лежать в базе на эту неделю. Это отличает
+ * «у группы пар нет» от «сайт сегодня отдаёт пустые таблицы»: при сбое пустой
+ * окажется не одна группа, а все.
+ */
+export const EMPTY_CONFIRM_READY_SHARE = 0.5;
+
+/** Когда впервые увидели пустую неделю группы. */
+export interface EmptySeen {
+  monday: string;
+  since: string;
+}
+
+/**
+ * Решение по группе, чью неделю сайт отдал без единой пары (см. `weekOfGroup`).
+ * Возвращает обновлённую отметку и подтверждение, что неделя правда пустая.
+ */
+export function confirmEmptyWeek(
+  seen: EmptySeen | undefined,
+  monday: string,
+  readyShare: number,
+  now: number,
+): { confirmed: boolean; seen: EmptySeen } {
+  const current = seen && seen.monday === monday ? seen : { monday, since: new Date(now).toISOString() };
+  const confirmed =
+    readyShare >= EMPTY_CONFIRM_READY_SHARE && now - Date.parse(current.since) >= EMPTY_CONFIRM_MS;
+  return { confirmed, seen: current };
+}
+
+/** Неделя Пн–Сб без единой пары — для группы, у которой пар подтверждённо нет. */
+export function emptyWeek(anchorIso: string): Day[] {
+  const { monday, saturday } = weekBounds(anchorIso);
+  const days: Day[] = [];
+  const cursor = new Date(`${monday}T00:00:00Z`);
+  while (cursor.toISOString().slice(0, 10) <= saturday) {
+    const date = cursor.toISOString().slice(0, 10);
+    days.push({ date, name: dayNameOf(date), lessons: [] });
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return days;
+}
+
 /**
  * Есть ли в базе неделя, куда попадает дата.
  *
