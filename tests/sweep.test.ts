@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  EMPTY_CONFIRM_MS,
+  confirmEmptyWeek,
+  emptyWeek,
   IDLE_REFRESH_MS,
   IDLE_RETRY_MS,
   SUBSCRIBED_REFRESH_MS,
@@ -290,4 +293,40 @@ test('в воскресенье загруженная следующая нед
   assert.equal(weekCovers({ week_start: '2026-10-19' }, '2026-10-25'), true);
   // А вот субботу следующая неделя не покрывает
   assert.equal(weekCovers({ week_start: '2026-10-26' }, '2026-10-24'), false);
+});
+
+test('confirmEmptyWeek: пустую неделю принимает, только продержав её пустой при живом сайте', () => {
+  const t0 = Date.parse('2026-10-24T22:00:00Z');
+  const first = confirmEmptyWeek(undefined, '2026-10-26', 0.9, t0);
+  assert.equal(first.confirmed, false);
+  assert.equal(first.seen.since, new Date(t0).toISOString());
+
+  const early = confirmEmptyWeek(first.seen, '2026-10-26', 0.9, t0 + EMPTY_CONFIRM_MS - 1);
+  assert.equal(early.confirmed, false);
+
+  const later = confirmEmptyWeek(first.seen, '2026-10-26', 0.9, t0 + EMPTY_CONFIRM_MS);
+  assert.equal(later.confirmed, true);
+});
+
+test('confirmEmptyWeek: не верит пустоте, если у остальных групп недели тоже нет', () => {
+  const t0 = Date.parse('2026-10-24T22:00:00Z');
+  const seen = { monday: '2026-10-26', since: new Date(t0).toISOString() };
+  const verdict = confirmEmptyWeek(seen, '2026-10-26', 0.1, t0 + 24 * 3600_000);
+  assert.equal(verdict.confirmed, false);
+});
+
+test('confirmEmptyWeek: отметка прошлой недели не засчитывается новой', () => {
+  const t0 = Date.parse('2026-10-26T10:00:00Z');
+  const stale = { monday: '2026-10-19', since: '2026-10-19T00:00:00.000Z' };
+  const verdict = confirmEmptyWeek(stale, '2026-10-26', 0.9, t0);
+  assert.equal(verdict.confirmed, false);
+  assert.equal(verdict.seen.monday, '2026-10-26');
+});
+
+test('emptyWeek даёт шесть пустых дней Пн–Сб', () => {
+  const week = emptyWeek('2026-10-27');
+  assert.deepEqual(week.map((d) => d.date), [
+    '2026-10-26', '2026-10-27', '2026-10-28', '2026-10-29', '2026-10-30', '2026-10-31',
+  ]);
+  assert.ok(week.every((d) => d.lessons.length === 0));
 });
