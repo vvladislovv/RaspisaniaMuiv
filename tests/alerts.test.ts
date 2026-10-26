@@ -23,3 +23,11 @@ test('лимит багов и предложений: 1 в день без до
   assert.equal(feedbackLimit(false), 1);
   assert.equal(feedbackLimit(true), 3);
 });
+
+test('исчезнувшая с сайта группа не считается аварией, пока каталог жив', async () => {
+  const { missingGroupsToAlert } = await import('../lib/sync');
+  // Каталог на месте: группу убрал колледж, человек сам увидит «выбери заново»
+  assert.deepEqual(missingGroupsToAlert(['к/з/д ОДЛ-26-11'], 300), []);
+  // Каталог пуст: пропало всё сразу — это сбой обхода сайта, молчать нельзя
+  assert.deepEqual(missingGroupsToAlert(['к/з/д ОДЛ-26-11'], 0), ['к/з/д ОДЛ-26-11']);
+});

@@ -176,6 +176,18 @@ async function maybeRefreshCatalog(session: BrowserSession, site: SiteAccess): P
 }
 
 /**
+ * Какие из пропавших подписанных групп считать сбоем для владельца.
+ *
+ * Если каталог загружен, а одной группы в нём нет, её убрал колледж: человек
+ * видит в боте «выбери заново», и будить владельца раз в двенадцать часов
+ * незачем. Пустой каталог — другое дело: это сбой обхода сайта, и пропадает
+ * сразу всё.
+ */
+export function missingGroupsToAlert(missing: string[], catalogSize: number): string[] {
+  return catalogSize > 0 ? [] : missing;
+}
+
+/**
  * Будить ли владельца на N-м подряд сбое одного файла.
  *
  * Чужой сервер иногда отвечает медленно, и следующая проверка через час
@@ -334,7 +346,7 @@ export async function checkSite(
     if (shouldAlertOnStreak(await bumpFailStreak(group))) alertDue.push({ group, reason });
   };
 
-  for (const name of resolution.missing) {
+  for (const name of missingGroupsToAlert(resolution.missing, resolution.catalogSize)) {
     await noteSubscribedFailure(name, 'Группы нет в каталоге сайта — возможно, переименована');
   }
 

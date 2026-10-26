@@ -1062,6 +1062,8 @@ export interface GroupResolution {
   missing: string[];
   /** Названия, которые изменились и требуют обновления в базе. */
   renamed: { from: string; to: string }[];
+  /** Сколько групп сейчас в каталоге: ноль значит, что каталог сам не загрузился. */
+  catalogSize: number;
 }
 
 /**
@@ -1077,7 +1079,12 @@ export async function resolveGroups(stored: string[]): Promise<GroupResolution> 
   }
   const exact = new Set(available.map((g) => g.group));
 
-  const resolution: GroupResolution = { actual: new Map(), missing: [], renamed: [] };
+  const resolution: GroupResolution = {
+    actual: new Map(),
+    missing: [],
+    renamed: [],
+    catalogSize: available.length,
+  };
 
   for (const name of stored) {
     if (exact.has(name)) {
