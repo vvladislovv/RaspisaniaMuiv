@@ -17,6 +17,7 @@ import { refreshPinned, tick } from '../lib/sync';
 import {
   getChat,
   groupFileName,
+  replaceGroupsCatalog,
   listGroups,
   replaceSchedules,
   setPinnedMessage,
@@ -387,6 +388,18 @@ if (siteReachable) {
 } else {
   console.log(`  ⚠ сайт недоступен (${first.check?.errors[0] ?? '—'}), беру локальный файл`);
   ok(await seedFromFixture(), 'база наполнена из фикстуры');
+}
+
+// Фикстура-xlsx каталог не заполняет, а без сайта брать его неоткуда:
+// кладём синтетический, чтобы сценарии ниже шли и без доступа к muiv.ru
+if (!siteReachable && (await listGroups()).length === 0) {
+  await replaceGroupsCatalog(
+    Array.from({ length: 60 }, (_, i) => ({
+      group: `к/о/к ТЕСТ-${String(i + 1).padStart(2, '0')}-09`,
+      year: `Курс ${(i % 4) + 1}`,
+      studyform: 'Очная',
+    })),
+  );
 }
 
 const groups = await listGroups();
@@ -2165,7 +2178,11 @@ head('Обход всех групп: очередь, дедлайн, пусты
   const { monday } = weekBounds(weekAnchor());
   const catalog = await catalogEntries();
   const all = catalog.map((e) => e.group);
-  const [EMPTY, BROKEN, KEEP] = [all[2], all[3], all[5]];
+  // Особые роли отдаём группам, на которые никто не подписан: подписанные
+  // без недели идут в обходе первыми и ломают сценарии про порядок очереди
+  const taken = new Set((await activeChats()).flatMap((c) => c.groups));
+  const spare = all.filter((g) => !taken.has(g));
+  const [EMPTY, BROKEN, KEEP] = [spare[2], spare[3], spare[5]];
 
   const fetchedLog: string[] = [];
   const emptyNow = new Set<string>([EMPTY]);
@@ -2254,7 +2271,7 @@ head('Обход всех групп: очередь, дедлайн, пусты
   await db().from('chats').update({ groups: [KEEP], enabled: true }).eq('chat_id', KEEPER);
   fetchedLog.length = 0;
   await checkSite(Date.now() + 30_000, fakeSite);
-  ok(fetchedLog[0] === KEEP, 'давно не проверенная подписанная группа пошла первой');
+  ok(fetchedLog[0] === KEEP, `давно не проверенная подписанная группа пошла первой: ${fetchedLog.slice(0, 4).join(' / ')} (ждали ${KEEP})`);
   ok(
     (await groupFileStatus()).get(KEEP)?.weekStart === keepBefore?.weekStart,
     'неделя на месте после пустого ответа',
