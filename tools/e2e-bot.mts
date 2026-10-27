@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { handleUpdate, type TgUpdate } from '../lib/bot';
 import { refreshPinned, tick } from '../lib/sync';
 import {
+  getAccess,
   getChat,
   groupFileName,
   replaceGroupsCatalog,
@@ -533,6 +534,47 @@ ok(
   ),
   'решать заявки может только владелец',
 );
+
+head('Одобренный человек заблокировал бота');
+await resetAlerts();
+await resetRateLimit();
+{
+  const BLOCKED = 444;
+  const SECOND = 445;
+  // Заявка пришла, пока бот был доступен, а заблокировали его уже после
+  await handleUpdate(message('/start', BLOCKED, BLOCKED, 'private'));
+  await handleUpdate(message('/start', SECOND, SECOND, 'private'));
+  await goneChats([BLOCKED, SECOND]);
+  const errorsBefore = await errorLogs();
+  const toOwner = (list: Call[]) =>
+    sent(list)
+      .filter((c) => c.body.chat_id === OWNER && !c.failed)
+      .map((c) => String(c.body.text))
+      .join('\n');
+
+  m = mark();
+  await handleUpdate(button(`ok:${BLOCKED}`, OWNER, OWNER));
+  const first = since(m);
+  ok((await getAccess(BLOCKED))?.status === 'approved', 'доступ открыт, хотя сообщение не дошло');
+  ok((await errorLogs()) === errorsBefore, 'недоставленное уведомление не пишется как ошибка бота');
+  ok(!toOwner(first).includes('Ошибка бота'), 'владельцу не приходит алерт об аварии');
+  ok(
+    toOwner(first).includes(`user${BLOCKED}`) && toOwner(first).includes('blocked by the user'),
+    'владелец видит, кому не дошло и что ответил Telegram',
+  );
+  ok(toOwner(first).includes('/start'), 'и что передать человеку');
+  ok(
+    first.some((c) => c.method === 'editMessageText' && !c.failed),
+    'экран владельца при этом обновляется',
+  );
+
+  // Второй в тот же час: часовой лимит алертов не должен прятать его
+  m = mark();
+  await handleUpdate(button(`ok:${SECOND}`, OWNER, OWNER));
+  ok(toOwner(since(m)).includes(`user${SECOND}`), 'про второго владелец тоже узнаёт');
+  ok((await errorLogs()) === errorsBefore, 'и в журнал ошибок он не попадает');
+  await goneChats([]);
+}
 
 head('Бот уже в группе, а чата в базе нет');
 await resetRateLimit();
