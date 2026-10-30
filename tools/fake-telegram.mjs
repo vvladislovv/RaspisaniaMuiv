@@ -146,7 +146,11 @@ http
           JSON.stringify({
             ok: false,
             error_code: 403,
-            description: 'Forbidden: bot is not a member of the supergroup chat',
+            // Личка и группа отказывают по-разному — как настоящий Telegram
+            description:
+              Number(body.chat_id) > 0
+                ? 'Forbidden: bot was blocked by the user'
+                : 'Forbidden: bot is not a member of the supergroup chat',
           }),
         );
         return;

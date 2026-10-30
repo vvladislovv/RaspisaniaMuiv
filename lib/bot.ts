@@ -434,6 +434,32 @@ function requestScreen(user: TgUser): Screen {
 }
 
 /**
+ * Владельцу: доступ открыт, но человеку об этом сообщить не вышло. Если не
+ * дойдёт и это, экран заявок всё равно должен обновиться, поэтому отказ
+ * пишем в журнал и идём дальше.
+ */
+async function tellOwnerUnreachable(
+  person: string,
+  userId: number,
+  error: TelegramError,
+): Promise<void> {
+  const text = [
+    `*${esc('Доступ открыт, но сообщение не дошло')}*`,
+    '',
+    `${esc(person)} · \`${userId}\``,
+    esc(`Telegram: ${error.description}`),
+    '',
+    esc('Пусть разблокирует бота и нажмёт /start: доступ уже работает.'),
+  ].join('\n');
+
+  try {
+    await sendMessage(env.adminTelegramId, text);
+  } catch (sendError) {
+    await logError('Сообщение владельцу о недоставленном одобрении', sendError, { userId });
+  }
+}
+
+/**
  * Экран одного дня сразу по всем выбранным группам: в один день пары обеих
  * групп читаются рядом, и переключать ничего не нужно.
  */
@@ -1136,7 +1162,8 @@ async function runCallback(
     }
 
     const approve = data.startsWith('ok:');
-    const before = (await getAccess(targetId))?.status ?? null;
+    const previous = await getAccess(targetId);
+    const before = previous?.status ?? null;
     await decideAccess(targetId, approve ? 'approved' : 'denied');
     // Отозвали доступ — расписание в его личку больше не шлём
     if (!approve) await setChatEnabled(targetId, false);
@@ -1163,7 +1190,19 @@ async function runCallback(
           { silent: false, keyboard },
         );
       } catch (error) {
-        await logError('Уведомление об одобрении', error, { userId: targetId });
+        // Человек заблокировал бота или закрыл аккаунт: доступ уже сохранён, а
+        // доставить сообщение нельзя. Это не поломка бота. «Ошибка бота» тут
+        // вредна вдвойне: она не говорит, кому не дошло, и раз в час гасится
+        // лимитом, так что остальных, кого одобрили подряд, владелец не увидит.
+        // Поэтому говорим владельцу прямо, кому и что передать.
+        if (error instanceof TelegramError && error.chatIsGone) {
+          await log('skip', `Одобрение без уведомления: ${error.description}`, {
+            details: { userId: targetId },
+          });
+          await tellOwnerUnreachable(describeUser({ ...previous, id: targetId }), targetId, error);
+        } else {
+          await logError('Уведомление об одобрении', error, { userId: targetId });
+        }
       }
     }
 
