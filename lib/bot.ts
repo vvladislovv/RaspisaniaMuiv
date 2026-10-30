@@ -39,6 +39,7 @@ import { log, logError } from './log';
 import {
   answerCallbackQuery,
   botUsername,
+  GROUP_ANONYMOUS_BOT_ID,
   leaveChat,
   editMessageText,
   isChatAdmin,
@@ -834,6 +835,12 @@ async function learnCreditEmoji(chatId: number, message: TgMessage): Promise<boo
 
 // ─── Команда /start ──────────────────────────────────────────────────────────
 
+const ANONYMOUS_ADMIN_TEXT =
+  'Ты пишешь как анонимный админ, и я не вижу, кто это. Выключи «Анонимность» в своих правах админа на минуту и напиши /start ещё раз — или добавь меня в группу кнопкой «➕ Добавить в группу» из личного чата со мной.';
+
+/** Что сказать, когда что-то сломалось: тишина хуже любой ошибки. */
+const RETRY_TEXT = 'Не получилось, попробуй ещё раз через минуту';
+
 function isStart(text: string): boolean {
   return /^\/start(?:@[\w_]+)?\b/i.test(text.trim());
 }
@@ -1045,6 +1052,14 @@ async function handleMessage(message: TgMessage): Promise<void> {
   const threadId = threadOf(message);
 
   if (!chat) {
+    // Анонимный админ пишет от имени служебного бота: узнать, одобрен ли он,
+    // нельзя. «Доступ не открыт» тут было бы враньём — человек мог быть одобрен
+    if (user?.id === GROUP_ANONYMOUS_BOT_ID) {
+      await log('skip', `/start от анонимного админа в чате ${chatId}`, { chatId });
+      await sendMessage(chatId, esc(ANONYMOUS_ADMIN_TEXT), { silent: true, threadId });
+      return;
+    }
+
     if (!user || !(await isApproved(user.id))) {
       await log('skip', `/start без доступа в чате ${chatId}`, {
         chatId,
@@ -1071,6 +1086,17 @@ async function handleMessage(message: TgMessage): Promise<void> {
     });
   } else {
     await log('command', '/start', { chatId, details: { userId: user?.id } });
+
+    // Бота выгнали и позвали снова, а событие «добавили» потерялось: чат так
+    // и остался выключенным, и расписание молча не приходило бы. Включить его
+    // обратно может только одобренный человек
+    if (!chat.enabled && user && (await isApproved(user.id))) {
+      await setChatEnabled(chatId, true);
+      await log('command', `Чат включён обратно через /start: ${chatId}`, {
+        chatId,
+        details: { userId: user.id },
+      });
+    }
   }
 
   const fresh = await getChat(chatId);
@@ -1684,6 +1710,10 @@ async function handleCallback(query: TgCallbackQuery): Promise<void> {
 
   try {
     await runCallback(query, ack);
+  } catch (error) {
+    // Без текста «часики» просто гаснут, и человек не понимает, нажалось ли
+    ack(RETRY_TEXT);
+    throw error;
   } finally {
     ack();
     await acking;
@@ -1737,6 +1767,25 @@ export async function handleUpdate(update: TgUpdate): Promise<void> {
 
     await logError('Обработка апдейта Telegram', error, {
       update: JSON.stringify(update).slice(0, 1000),
+    });
+    await tellFailure(update);
+  }
+}
+
+/** На /start при сбое отвечаем, что делать: иначе человек ждёт меню в тишине. */
+async function tellFailure(update: TgUpdate): Promise<void> {
+  const message = update.message;
+  if (!message || !isStart(message.text ?? '')) return;
+
+  try {
+    await sendMessage(message.chat.id, esc(RETRY_TEXT), {
+      silent: true,
+      threadId: threadOf(message),
+    });
+  } catch (error) {
+    await log('skip', `Не смог ответить о сбое в чате ${message.chat.id}`, {
+      chatId: message.chat.id,
+      details: { reason: error instanceof Error ? error.message : String(error) },
     });
   }
 }
