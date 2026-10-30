@@ -1,6 +1,7 @@
 /** Форматирование расписания в сообщения Telegram (MarkdownV2). */
 import type { Day, Lesson } from './parse';
 import { displayGroup } from './aliases';
+import { dayExamKind, examKind, EXAM_MARK, type ExamKind } from './exam';
 
 const MDV2_SPECIAL = /[_*[\]()~`>#+\-=|{}.!\\]/g;
 
@@ -94,6 +95,12 @@ export function roomLabel(raw: string): string | null {
   return room[0].toUpperCase() + room.slice(1);
 }
 
+/** Яркая пометка зачёта или экзамена: `🔴 ЭКЗАМЕН`. */
+function examBadge(kind: ExamKind): string {
+  const { dot, label } = EXAM_MARK[kind];
+  return `*${dot} ${label}*`;
+}
+
 /** Строки одной пары внутри цитаты. */
 function lessonLines(lesson: Lesson): string[] {
   const meta: string[] = [];
@@ -101,8 +108,9 @@ function lessonLines(lesson: Lesson): string[] {
   const room = lesson.room ? roomLabel(lesson.room) : null;
   if (room) meta.push(esc(room));
 
+  const kind = examKind(lesson);
   const lines = [
-    `*${lesson.pair}\\.* *${esc(prettyTime(lesson.time))}*`,
+    `*${lesson.pair}\\.* *${esc(prettyTime(lesson.time))}*` + (kind ? ` · ${examBadge(kind)}` : ''),
     esc(lesson.subject),
   ];
   if (meta.length > 0) lines.push(`_${meta.join(' · ')}_`);
@@ -297,9 +305,11 @@ export function formatWeek(days: Day[], opts: DayMessageOptions): string[] {
   ];
 
   const blocks = days.map((day) => {
+    const dayKind = dayExamKind(day);
     const title =
       `*${esc(day.name)}, ${esc(humanDate(day.date))}* — ` +
-      `${day.lessons.length} ${esc(pairsWord(day.lessons.length))}`;
+      `${day.lessons.length} ${esc(pairsWord(day.lessons.length))}` +
+      (dayKind ? ` · ${examBadge(dayKind)}` : '');
 
     if (day.lessons.length === 0) return quote([title, '_Пар нет_'], true);
 

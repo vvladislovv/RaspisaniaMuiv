@@ -469,19 +469,27 @@ export async function recentFiles(limit = 20): Promise<FileRow[]> {
  * подписан хотя бы один чат, а каталог всех групп университета обновляется
  * отдельно и реже (см. `upsertGroupsCatalog`).
  */
-export async function listGroups(): Promise<{ group: string; sheet: string | null }[]> {
+export async function listGroups(): Promise<
+  { group: string; sheet: string | null; form: string | null }[]
+> {
   return cached('listGroups', loadGroups);
 }
 
-async function loadGroups(): Promise<{ group: string; sheet: string | null }[]> {
+async function loadGroups(): Promise<
+  { group: string; sheet: string | null; form: string | null }[]
+> {
   const res = await db()
     .from('groups_catalog')
-    .select('group_name, year')
+    .select('group_name, year, studyform')
     .order('group_name', { ascending: true });
 
-  const rows = (check(res, 'listGroups') ?? []) as { group_name: string; year: string }[];
+  const rows = (check(res, 'listGroups') ?? []) as {
+    group_name: string;
+    year: string;
+    studyform: string | null;
+  }[];
   return rows
-    .map((r) => ({ group: r.group_name, sheet: r.year }))
+    .map((r) => ({ group: r.group_name, sheet: r.year, form: r.studyform }))
     .sort((a, b) => a.group.localeCompare(b.group, 'ru'));
 }
 

@@ -51,6 +51,8 @@ import {
   feedbackButton,
   feedbackCancelKeyboard,
   feedbackKindKeyboard,
+  formKeyboard,
+  formsOf,
   groupKeyboard,
   isAccessSection,
   menuKeyboard,
@@ -686,13 +688,68 @@ function aboutScreen(credit: CreditEmoji): Screen {
   };
 }
 
+/** Экран выбора формы обучения внутри курса. */
+function formScreen(
+  sheet: string,
+  sheetIndex: number,
+  inSheet: { form: string }[],
+  forms: string[],
+): Screen {
+  return {
+    text: `*${esc(sheet)}*\n${esc('Выбери форму обучения.')}`,
+    keyboard: formKeyboard(
+      sheetIndex,
+      forms.map((form) => ({ form, count: inSheet.filter((g) => g.form === form).length })),
+    ),
+  };
+}
+
+/** Экран списка групп курса (и формы), с подписью, что уже выбрано. */
+function groupScreen(opts: {
+  sheet: string;
+  sheetIndex: number;
+  groups: { group: string; index: number; form: string }[];
+  form: string | null;
+  formIndex: number | null;
+  backToForms: boolean;
+  page: number;
+  chosen: string[];
+  /** Сразу после нажатия: просим «Готово», а не объясняем, как выбирать. */
+  confirm: boolean;
+}): Screen {
+  const title = opts.form ? `${opts.sheet} · ${opts.form}` : opts.sheet;
+  const hint =
+    opts.chosen.length > 0
+      ? opts.confirm
+        ? `Выбрано: ${opts.chosen.map(displayGroup).join(', ')}. Нажми «Готово», когда закончишь.`
+        : `Выбрано: ${opts.chosen.map(displayGroup).join(', ')}. Нажми группу, чтобы добавить или убрать.`
+      : `Выбери группу. Можно до ${MAX_GROUPS} — расписание придёт по обеим.`;
+
+  return {
+    text: `*${esc(title)}*\n${esc(hint)}`,
+    keyboard: groupKeyboard(
+      opts.groups,
+      opts.sheetIndex,
+      opts.page,
+      opts.chosen,
+      opts.formIndex,
+      opts.backToForms,
+    ),
+  };
+}
+
 /** Соответствие «индекс → группа»: в callback_data влезает только номер. */
 async function groupIndex(): Promise<{
   sheets: string[];
-  groups: { group: string; sheet: string; index: number }[];
+  groups: { group: string; sheet: string; form: string; index: number }[];
 }> {
   const raw = await listGroups();
-  const groups = raw.map((g, index) => ({ group: g.group, sheet: g.sheet ?? 'Прочие', index }));
+  const groups = raw.map((g, index) => ({
+    group: g.group,
+    sheet: g.sheet ?? 'Прочие',
+    form: g.form ?? 'Прочие',
+    index,
+  }));
   const sheets = [...new Set(groups.map((g) => g.sheet))].sort((a, b) => a.localeCompare(b, 'ru'));
   return { sheets, groups };
 }
@@ -1066,7 +1123,11 @@ async function runCallback(
   // а до этого шага чат ещё не нужен — только смотрим списки.
   const isSetupFlow =
     ctx.isPrivate &&
-    (data.startsWith('ob:') || data === 'grp' || data.startsWith('s:') || data.startsWith('g:'));
+    (data.startsWith('ob:') ||
+      data === 'grp' ||
+      data.startsWith('s:') ||
+      data.startsWith('p:') ||
+      data.startsWith('g:'));
   if (
     !chat &&
     !isDecision &&
@@ -1391,8 +1452,10 @@ async function runCallback(
     return;
   }
 
+  // Курс → форма обучения → группы. Курс с одной формой пропускает средний
+  // экран. Номер формы в `p:` необязателен: так работают и старые кнопки.
   if (data.startsWith('s:') || data.startsWith('p:')) {
-    const [, sheetRaw, pageRaw] = data.split(':');
+    const [, sheetRaw, pageRaw, formRaw] = data.split(':');
     const sheetIndex = Number(sheetRaw);
     const sheet = sheets[sheetIndex];
 
@@ -1403,22 +1466,30 @@ async function runCallback(
     }
 
     ack();
-    const chosen = chat?.groups ?? [];
-    await edit({
-      text:
-        `*${esc(sheet)}*\n` +
-        esc(
-          chosen.length > 0
-            ? `Выбрано: ${chosen.join(', ')}. Нажми группу, чтобы добавить или убрать.`
-            : `Выбери группу. Можно до ${MAX_GROUPS} — расписание придёт по обеим.`,
-        ),
-      keyboard: groupKeyboard(
-        groups.filter((g) => g.sheet === sheet),
+    const inSheet = groups.filter((g) => g.sheet === sheet);
+    const forms = formsOf(inSheet);
+    const formIndex = formRaw === undefined ? null : Number(formRaw);
+
+    // Форм несколько, а выбрана не одна: сначала спрашиваем форму
+    if (forms.length > 1 && (formIndex === null || forms[formIndex] === undefined)) {
+      await edit(formScreen(sheet, sheetIndex, inSheet, forms));
+      return;
+    }
+
+    const form = formIndex === null ? null : (forms[formIndex] ?? null);
+    await edit(
+      groupScreen({
+        sheet,
         sheetIndex,
-        Number(pageRaw ?? 0) || 0,
-        chosen,
-      ),
-    });
+        groups: form === null ? inSheet : inSheet.filter((g) => g.form === form),
+        form,
+        formIndex: form === null ? null : formIndex,
+        backToForms: forms.length > 1,
+        page: Number(pageRaw ?? 0) || 0,
+        chosen: chat?.groups ?? [],
+        confirm: false,
+      }),
+    );
     return;
   }
 
@@ -1455,21 +1526,22 @@ async function runCallback(
     // видит результат мгновенно, а не после того, как отработает всё ниже.
     const fresh = await getChat(chatId);
     const sheetIndex = sheets.indexOf(picked.sheet);
-    await edit({
-      text:
-        `*${esc(picked.sheet)}*\n` +
-        esc(
-          (fresh?.groups ?? []).length > 0
-            ? `Выбрано: ${(fresh?.groups ?? []).join(', ')}. Нажми «Готово», когда закончишь.`
-            : `Выбери группу. Можно до ${MAX_GROUPS} — расписание придёт по обеим.`,
-        ),
-      keyboard: groupKeyboard(
-        groups.filter((g) => g.sheet === picked.sheet),
+    const inSheet = groups.filter((g) => g.sheet === picked.sheet);
+    const forms = formsOf(inSheet);
+    const formIndex = forms.indexOf(picked.form);
+    await edit(
+      groupScreen({
+        sheet: picked.sheet,
         sheetIndex,
-        0,
-        fresh?.groups ?? [],
-      ),
-    });
+        groups: inSheet.filter((g) => g.form === picked.form),
+        form: forms.length > 1 ? picked.form : null,
+        formIndex: forms.length > 1 ? formIndex : null,
+        backToForms: forms.length > 1,
+        page: 0,
+        chosen: fresh?.groups ?? [],
+        confirm: true,
+      }),
+    );
 
     // Расписание группы уже лежит в базе: тик держит неделю каждой группы
     // каталога. Браузер здесь не поднимаем — именно он под наплывом людей
