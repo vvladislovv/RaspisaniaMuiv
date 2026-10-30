@@ -1028,7 +1028,15 @@ m = mark();
 await handleUpdate(button('week'));
 screen = since(m);
 ok(edited(screen).length === 1, 'неделя открывается правкой');
-ok(texts(screen).join('').includes('**>'), 'дни оформлены раскрывающимися цитатами');
+{
+  // Заголовки дней вне цитат: соседние цитаты Telegram склеивает в одну
+  const weekText = texts(screen).join('');
+  const weekLines = weekText.split('\n');
+  const titles = weekLines.filter((line) => /^\*[А-Яа-я]+, \d+ [а-я]+\* — \d+ /.test(line));
+  ok(titles.length >= 2, `дни идут отдельными заголовками: ${titles.length}`);
+  ok(weekLines.some((line) => line.startsWith('>')), 'пары лежат в цитатах');
+  ok(!weekText.includes('||'), 'раскрывающихся цитат нет — дни не склеиваются');
+}
 
 buttons = keyboardOf(screen);
 const dayButtons = buttons.filter((b) => /^d:\d{4}-\d{2}-\d{2}$/.test(b.callback_data));

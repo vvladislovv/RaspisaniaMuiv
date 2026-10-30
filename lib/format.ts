@@ -101,19 +101,114 @@ function examBadge(kind: ExamKind): string {
   return `*${dot} ${label}*`;
 }
 
-/** Строки одной пары внутри цитаты. */
-function lessonLines(lesson: Lesson): string[] {
+/**
+ * Типы занятий, которые колледж пишет почти у каждой пары: «Семинары ИПЗ»
+ * стоит у 84% и ничего не говорит, только занимает строку на узком экране.
+ * «Вебинар» сюда не входит — это онлайн, и об этом знать нужно.
+ */
+const NOISE_TYPES = ['Семинары ИПЗ'];
+
+/**
+ * Название без лишнего хвоста. «Вебинар» убираем, только если им уже
+ * подписана аудитория («Д» → «Вебинар»): иначе он стоял бы в строке дважды.
+ */
+function cleanSubject(subject: string, room: string | null): string {
+  const online = room !== null && roomLabel(room) === 'Вебинар';
+  const parts = subject
+    .split(' · ')
+    .filter((part) => !NOISE_TYPES.includes(part.trim()) && !(online && part.trim() === 'Вебинар'));
+  return parts.length > 0 ? parts.join(' · ') : subject;
+}
+
+/** «8:20-09:50» → начало и конец; без дефиса конец пустой. */
+function splitTime(time: string): { start: string; end: string } {
+  const [start, end] = time.split(/\s*-\s*/);
+  return { start: start ?? time, end: end ?? '' };
+}
+
+/** Одна запись в сообщении: одна пара или несколько одинаковых подряд. */
+interface LessonBlock {
+  from: number;
+  to: number;
+  start: string;
+  end: string;
+  subject: string;
+  teacher: string | null;
+  room: string | null;
+  kind: ExamKind | null;
+}
+
+/**
+ * Склеивает пары, идущие подряд с тем же предметом, преподавателем и
+ * аудиторией: четверть пар в расписании — повтор предыдущей, и три блока по
+ * четыре строки читались хуже одного «3–5».
+ */
+function blocksOf(lessons: Lesson[]): LessonBlock[] {
+  const sorted = [...lessons].sort((a, b) => a.pair - b.pair);
+  const blocks: LessonBlock[] = [];
+
+  for (const lesson of sorted) {
+    const subject = cleanSubject(lesson.subject, lesson.room);
+    const { start, end } = splitTime(lesson.time);
+    const kind = examKind(lesson);
+    const prev = blocks.at(-1);
+
+    const continues =
+      prev !== undefined &&
+      lesson.pair === prev.to + 1 &&
+      subject === prev.subject &&
+      lesson.teacher === prev.teacher &&
+      lesson.room === prev.room;
+
+    if (prev && continues) {
+      blocks[blocks.length - 1] = {
+        ...prev,
+        to: lesson.pair,
+        end: end || prev.end,
+        kind: prev.kind === 'exam' || kind === 'exam' ? 'exam' : (prev.kind ?? kind),
+      };
+    } else {
+      blocks.push({
+        from: lesson.pair,
+        to: lesson.pair,
+        start,
+        end,
+        subject,
+        teacher: lesson.teacher,
+        room: lesson.room,
+        kind,
+      });
+    }
+  }
+
+  return blocks;
+}
+
+/** Строки одной записи: время, предмет, преподаватель и аудитория. */
+function blockLines(block: LessonBlock): string[] {
   const meta: string[] = [];
-  if (lesson.teacher) meta.push(esc(shortName(lesson.teacher)));
-  const room = lesson.room ? roomLabel(lesson.room) : null;
+  if (block.teacher) meta.push(esc(shortName(block.teacher)));
+  const room = block.room ? roomLabel(block.room) : null;
   if (room) meta.push(esc(room));
 
-  const kind = examKind(lesson);
+  const pairs = block.from === block.to ? `${block.from}` : `${block.from}–${block.to}`;
+  const time = block.end ? `${block.start}–${block.end}` : block.start;
+
   const lines = [
-    `*${lesson.pair}\\.* *${esc(prettyTime(lesson.time))}*` + (kind ? ` · ${examBadge(kind)}` : ''),
-    esc(lesson.subject),
+    `*${pairs}\\.* *${esc(prettyTime(time))}*` + (block.kind ? ` · ${examBadge(block.kind)}` : ''),
+    esc(block.subject),
   ];
   if (meta.length > 0) lines.push(`_${meta.join(' · ')}_`);
+  return lines;
+}
+
+/** Все пары дня для цитаты: между записями пустая строка, внутри — нет. */
+function dayLines(lessons: Lesson[]): string[] {
+  const lines: string[] = [];
+  blocksOf(lessons).forEach((block, index) => {
+    if (index > 0) lines.push('');
+    lines.push(...blockLines(block));
+  });
   return lines;
 }
 
@@ -169,12 +264,7 @@ function dayQuote(day: Day | null, noData = false): string {
   if (noData) return quote([`⏳ _${esc(NOT_LOADED_TEXT)}_`]);
   if (!day || day.lessons.length === 0) return quote([`_${esc('Пар нет')}_`]);
 
-  const lines: string[] = [];
-  day.lessons.forEach((lesson, index) => {
-    if (index > 0) lines.push('');
-    lines.push(...lessonLines(lesson));
-  });
-  return quote(lines);
+  return quote(dayLines(day.lessons));
 }
 
 /**
@@ -237,16 +327,7 @@ export function formatDay(day: Day, opts: DayMessageOptions): string {
   parts.push(`👥 *${esc(displayGroup(opts.group))}*`);
   parts.push('');
 
-  if (day.lessons.length === 0) {
-    parts.push(quote(['_Пар нет_']));
-  } else {
-    const lines: string[] = [];
-    day.lessons.forEach((lesson, index) => {
-      if (index > 0) lines.push('');
-      lines.push(...lessonLines(lesson));
-    });
-    parts.push(quote(lines));
-  }
+  parts.push(day.lessons.length === 0 ? quote(['_Пар нет_']) : quote(dayLines(day.lessons)));
 
   if (opts.siteUpdated) {
     parts.push('');
@@ -304,6 +385,9 @@ export function formatWeek(days: Day[], opts: DayMessageOptions): string[] {
     '',
   ];
 
+  // Заголовок дня стоит вне цитаты: соседние цитаты Telegram склеивает в одну,
+  // и дни на телефоне сливались в сплошную стену текста. Пустая строка в конце
+  // записи отделяет один день от другого.
   const blocks = days.map((day) => {
     const dayKind = dayExamKind(day);
     const title =
@@ -311,14 +395,8 @@ export function formatWeek(days: Day[], opts: DayMessageOptions): string[] {
       `${day.lessons.length} ${esc(pairsWord(day.lessons.length))}` +
       (dayKind ? ` · ${examBadge(dayKind)}` : '');
 
-    if (day.lessons.length === 0) return quote([title, '_Пар нет_'], true);
-
-    const lines = [title];
-    day.lessons.forEach((lesson, index) => {
-      if (index > 0) lines.push('');
-      lines.push(...lessonLines(lesson));
-    });
-    return quote(lines, true);
+    const body = day.lessons.length === 0 ? quote(['_Пар нет_']) : quote(dayLines(day.lessons));
+    return `${title}\n${body}\n`;
   });
 
   if (blocks.length === 0) blocks.push(quote([`⏳ _${esc(NOT_LOADED_TEXT)}_`]));
