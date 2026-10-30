@@ -534,6 +534,31 @@ ok(
   'решать заявки может только владелец',
 );
 
+head('Одобренный листает группы до первого /start');
+await resetRateLimit();
+{
+  // Сразу после одобрения записи о личке в базе ещё нет: человек идёт по
+  // «Выбрать группу» и листает список стрелкой ▶ — она не должна падать
+  ok((await getChat(STRANGER)) === null, 'записи о личке в базе нет');
+
+  const sheetCount = (await listGroups()).reduce(
+    (acc, g) => acc.add(g.sheet ?? 'Прочие'),
+    new Set<string>(),
+  ).size;
+  ok(sheetCount > 0, 'курсы в базе есть');
+
+  for (const data of ['grp', 's:0', 'p:0:1', 'p:0:0']) {
+    m = mark();
+    await handleUpdate(privateButton(data, STRANGER));
+    const answer = since(m).filter((c) => c.method === 'answerCallbackQuery');
+    ok(
+      !answer.some((c) => String(c.body.text ?? '').includes('Чат не подключён')),
+      `«${data}» не отвечает «Чат не подключён»`,
+    );
+    ok(edited(since(m)).length > 0, `«${data}» перерисовывает экран`);
+  }
+}
+
 head('Бот уже в группе, а чата в базе нет');
 await resetRateLimit();
 {

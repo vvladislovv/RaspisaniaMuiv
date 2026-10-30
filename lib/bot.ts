@@ -1040,7 +1040,11 @@ async function runCallback(
   // а до этого шага чат ещё не нужен — только смотрим списки.
   const isSetupFlow =
     ctx.isPrivate &&
-    (data.startsWith('ob:') || data === 'grp' || data.startsWith('s:') || data.startsWith('g:'));
+    (data.startsWith('ob:') ||
+      data === 'grp' ||
+      data.startsWith('s:') ||
+      data.startsWith('p:') ||
+      data.startsWith('g:'));
   if (
     !chat &&
     !isDecision &&

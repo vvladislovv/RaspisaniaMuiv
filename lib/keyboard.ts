@@ -8,6 +8,7 @@
 import type { Day } from './parse';
 import { shortDay } from './format';
 import { displayGroup } from './aliases';
+import { dayExamKind, EXAM_MARK } from './exam';
 import type { AccessStatus } from './db';
 import type { InlineButton, InlineKeyboard } from './telegram';
 
@@ -222,7 +223,11 @@ export function scheduleKeyboard(
 
   const rows: InlineKeyboard = chunk(
     days.map((day) => {
-      const label = shortDay(day.name) + (day.lessons.length === 0 ? ' ·' : '');
+      const kind = dayExamKind(day);
+      const label =
+        shortDay(day.name) +
+        (day.lessons.length === 0 ? ' ·' : '') +
+        (kind ? ` ${EXAM_MARK[kind].dot}` : '');
       return {
         text: active === day.date ? `· ${label} ·` : label,
         callback_data: `d:${day.date}`,
