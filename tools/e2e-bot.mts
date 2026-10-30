@@ -630,6 +630,61 @@ await resetRateLimit();
   );
 }
 
+head('Подключение чата: пути, на которых оно может сорваться');
+await resetRateLimit();
+{
+  // Бота выгнали и позвали снова: автоотправка должна включиться обратно
+  // сама, даже если событие «добавили» потерялось и осталась только /start
+  const KICKED = -100777501;
+  await handleUpdate(membership('member', OWNER, KICKED));
+  ok((await getChat(KICKED))?.enabled === true, 'бота добавили — чат включён');
+  await handleUpdate(membership('left', OWNER, KICKED));
+  ok((await getChat(KICKED))?.enabled === false, 'бота выгнали — автоотправка выключена');
+  await handleUpdate(message('/start', OWNER, KICKED));
+  ok((await getChat(KICKED))?.enabled === true, '/start одобренного включает чат обратно');
+
+  // В группе с несколькими ботами команда приходит как /start@имя_бота
+  const MENTION = -100777502;
+  await handleUpdate(message('/start@fake_bot', OWNER, MENTION));
+  ok((await getChat(MENTION)) !== null, '/start@имя_бота подключает чат');
+
+  // Анонимный админ пишет от имени служебного бота: узнать, кто он, нельзя.
+  // «Доступ не открыт» тут было бы враньём — человек может быть одобрен
+  const ANON = -100777503;
+  m = mark();
+  await handleUpdate(message('/start', 1087968824, ANON));
+  const anonSaid = texts(since(m)).join('');
+  ok((await getChat(ANON)) === null, 'от имени анонимного админа чат не подключается');
+  ok(anonSaid.includes('нонимн'), 'бот объясняет про анонимного админа');
+  ok(!anonSaid.includes('Доступ не открыт'), 'и не говорит, что доступа нет');
+
+  // База лежит: человек должен узнать, что делать, а не смотреть в тишину
+  const BROKEN = -100777504;
+  await resetRateLimit();
+  m = mark();
+  await flakyDb(60);
+  await handleUpdate(message('/start', OWNER, BROKEN));
+  await flakyDb(0);
+  ok(
+    sent(since(m)).some(
+      (c) => c.body.chat_id === BROKEN && String(c.body.text).includes('Не получилось'),
+    ),
+    '/start при сбое базы отвечает «Не получилось, попробуй ещё раз»',
+  );
+
+  await resetRateLimit();
+  m = mark();
+  await flakyDb(60);
+  await handleUpdate(button('m', OWNER, KICKED));
+  await flakyDb(0);
+  ok(
+    since(m).some(
+      (c) => c.method === 'answerCallbackQuery' && String(c.body.text ?? '').includes('Не получилось'),
+    ),
+    'нажатие при сбое базы отвечает всплывающим «Не получилось»',
+  );
+}
+
 head('Одобренный человек заблокировал бота');
 await resetAlerts();
 await resetRateLimit();
@@ -2491,6 +2546,99 @@ head('Два тика разом не идут');
     .eq('key', 'tick_lock');
   ok(await acquireLock('tick_lock', 75_000), 'протухший замок не мешает следующему тику');
   await releaseLock('tick_lock');
+}
+
+// ─── Обход всех кнопок ───────────────────────────────────────────────────────
+
+/**
+ * Нажимает каждую кнопку, до которой можно дойти от меню, и проверяет, что
+ * ни одна не молчит, не падает, не отвечает «Чат не подключён» и не ломает
+ * разметку (дублёр Telegram проверяет MarkdownV2 так же строго, как настоящий).
+ */
+async function crawlButtons(
+  label: string,
+  press: (data: string) => TgUpdate,
+  start: Button[],
+  skip: (data: string) => boolean = () => false,
+): Promise<{ pressed: number; problems: string[] }> {
+  const seen = new Set<string>();
+  const queue = start.filter((b) => !b.url).map((b) => b.callback_data);
+  const problems: string[] = [];
+  const LIMIT = 500;
+
+  while (queue.length > 0 && seen.size < LIMIT) {
+    const data = queue.shift()!;
+    if (seen.has(data) || skip(data)) continue;
+    seen.add(data);
+
+    await resetRateLimit();
+    const errorsBefore = await errorLogs();
+    const before = mark();
+    await handleUpdate(press(data));
+    const done = since(before);
+
+    const toast = String(
+      done.filter((c) => c.method === 'answerCallbackQuery').at(-1)?.body.text ?? '',
+    );
+    const rendered = edited(done).length > 0 || sent(done).length > 0;
+
+    if (!done.some((c) => c.method === 'answerCallbackQuery')) problems.push(`${data}: нет ответа на нажатие`);
+    if (/не подключ|Не получилось/i.test(toast)) problems.push(`${data}: «${toast}»`);
+    if (done.some((c) => c.failed)) problems.push(`${data}: Telegram отклонил вызов`);
+    if ((await errorLogs()) > errorsBefore) problems.push(`${data}: ошибка в журнале`);
+    if (!rendered && toast === '') problems.push(`${data}: ничего не показал`);
+
+    if (rendered) {
+      for (const b of keyboardOf(done)) if (!b.url && !seen.has(b.callback_data)) queue.push(b.callback_data);
+    }
+  }
+
+  console.log(`  ${label}: нажато ${seen.size}, проблем ${problems.length}`);
+  for (const line of problems.slice(0, 15)) console.error(`    · ${line}`);
+  return { pressed: seen.size, problems };
+}
+
+head('Обход всех кнопок');
+await resetRateLimit();
+{
+  // Владелец в личке: видны и экраны обычного человека, и сводка с доступом
+  m = mark();
+  await handleUpdate(message('/start', OWNER, OWNER, 'private'));
+  const ownerStart = keyboardOf(since(m));
+  const ownerPress = (data: string) => privateButton(data, OWNER);
+
+  // Первый проход выбирает группы, второй — уже с выбранными: так открываются
+  // «Завтра», «Сегодня», «Вся неделя» и переключатель групп
+  let pass = await crawlButtons('владелец, личка, 1-й проход', ownerPress, ownerStart);
+  ok(pass.pressed > 30, `обошёл много кнопок: ${pass.pressed}`);
+  ok(pass.problems.length === 0, 'ни одна кнопка не молчит, не падает и не ломает разметку');
+
+  m = mark();
+  await handleUpdate(privateButton('m', OWNER));
+  pass = await crawlButtons('владелец, личка, 2-й проход', ownerPress, keyboardOf(since(m)), (d) =>
+    d.startsWith('g:'),
+  );
+  ok(pass.problems.length === 0, 'и с выбранной группой: день, неделя, листание, переключатель');
+  ok(
+    ((await getChat(OWNER))?.groups ?? []).length > 0,
+    'группа действительно выбрана — день и неделя проверены с расписанием',
+  );
+
+  // Группа: подключённый чат, нажимает админ
+  const CRAWL_GROUP = -100777600;
+  m = mark();
+  await handleUpdate(message('/start', OWNER, CRAWL_GROUP));
+  const groupPress = (data: string) => button(data, OWNER, CRAWL_GROUP);
+  pass = await crawlButtons('группа, 1-й проход', groupPress, keyboardOf(since(m)));
+  ok(pass.pressed > 20, `обошёл кнопки группы: ${pass.pressed}`);
+  ok(pass.problems.length === 0, 'в группе тоже всё отвечает без ошибок');
+
+  m = mark();
+  await handleUpdate(button('m', OWNER, CRAWL_GROUP));
+  pass = await crawlButtons('группа, 2-й проход', groupPress, keyboardOf(since(m)), (d) =>
+    d.startsWith('g:'),
+  );
+  ok(pass.problems.length === 0, 'и в группе с выбранной группой');
 }
 
 console.log(failures ? `\nПРОВАЛЕНО ПРОВЕРОК: ${failures}\n` : '\nВсе проверки прошли\n');
