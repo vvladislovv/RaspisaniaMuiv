@@ -560,6 +560,76 @@ await resetRateLimit();
   }
 }
 
+head('Выбор группы: курс → форма → группы');
+await resetRateLimit();
+{
+  // На курсе две формы обучения: временно добавляем заочную группу, после
+  // сценария каталог возвращаем как был (лишнее удаляет replaceGroupsCatalog)
+  const original = (await listGroups()).map((g) => ({
+    group: g.group,
+    year: g.sheet ?? 'Прочие',
+    studyform: g.form ?? 'Очная',
+  }));
+  const MIXED = 'к/з/д ТЕСТ-ЗАОЧ-09';
+  const courseOne = original[0].year;
+  await replaceGroupsCatalog([...original, { group: MIXED, year: courseOne, studyform: 'Заочная' }]);
+
+  try {
+    m = mark();
+    await handleUpdate(privateButton('grp', STRANGER));
+    const courseButtons = keyboardOf(since(m));
+    const toCourse = (name: string) => courseButtons.find((b) => b.text === name)?.callback_data;
+    ok(!!toCourse(courseOne), `курс «${courseOne}» в списке курсов`);
+
+    // Курс с двумя формами сначала спрашивает форму
+    m = mark();
+    await handleUpdate(privateButton(toCourse(courseOne)!, STRANGER));
+    ok(texts(since(m)).join('').includes(esc('Выбери форму обучения')), 'сначала спрашивает форму');
+    const forms = keyboardOf(since(m));
+    const och = find(forms, 'Очная');
+    const zaoch = find(forms, 'Заочная');
+    ok(!!och && !!zaoch, 'есть очная и заочная');
+    ok(/·\s*\d+/.test(och?.text ?? ''), `у формы виден счётчик групп: ${och?.text}`);
+
+    // Заочная: короткое имя без кода формы, назад ведёт к формам
+    m = mark();
+    await handleUpdate(privateButton(zaoch!.callback_data, STRANGER));
+    const zList = keyboardOf(since(m));
+    ok(texts(since(m)).join('').includes(esc(`${courseOne} · Заочная`)), 'в заголовке курс и форма');
+    ok(!!zList.find((b) => b.text === 'ТЕСТ-ЗАОЧ-09'), 'имя без кода «к/з/д»');
+    ok(!zList.some((b) => b.text.includes('к/з/д')), 'кода формы на кнопках нет');
+    const back = find(zList, 'Формы');
+    ok(!!back, 'есть «Формы»');
+
+    m = mark();
+    await handleUpdate(privateButton(back!.callback_data, STRANGER));
+    ok(!!find(keyboardOf(since(m)), 'Заочная'), '«Формы» возвращает к выбору формы');
+
+    // Курс с одной формой экран форм пропускает
+    const otherCourse = courseButtons.find(
+      (b) => b.callback_data.startsWith('s:') && b.text !== courseOne,
+    );
+    m = mark();
+    await handleUpdate(privateButton(otherCourse!.callback_data, STRANGER));
+    ok(
+      !texts(since(m)).join('').includes(esc('Выбери форму обучения')),
+      'курс с одной формой сразу показывает группы',
+    );
+    ok(!!find(keyboardOf(since(m)), 'Курсы'), 'и «назад» ведёт к курсам');
+
+    // Старая кнопка без формы продолжает работать
+    m = mark();
+    await handleUpdate(privateButton(`p:${otherCourse!.callback_data.slice(2)}:0`, STRANGER));
+    ok(edited(since(m)).length > 0, 'старая кнопка листания без формы работает');
+  } finally {
+    await replaceGroupsCatalog(original);
+  }
+  ok(
+    !(await listGroups()).some((g) => g.group === MIXED),
+    'каталог возвращён как был',
+  );
+}
+
 head('Одобренный человек заблокировал бота');
 await resetAlerts();
 await resetRateLimit();

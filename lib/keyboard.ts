@@ -312,16 +312,75 @@ export function sheetKeyboard(sheets: string[]): InlineKeyboard {
   return rows;
 }
 
-const GROUPS_PER_PAGE = 24;
+/** Группа каталога с формой обучения и номером для `callback_data`. */
+export interface PickerGroup {
+  group: string;
+  index: number;
+  form: string;
+}
 
-/** Список групп курса с постраничной прокруткой. */
+/** Порядок форм обучения на экране; незнакомая форма (если появится) идёт в конце. */
+const FORM_ORDER = ['Очная', 'Заочная', 'Очно-заочная'];
+
+/** Формы, которые есть в списке групп курса, в привычном порядке. */
+export function formsOf(groups: { form: string }[]): string[] {
+  const rank = (form: string) => {
+    const i = FORM_ORDER.indexOf(form);
+    return i === -1 ? FORM_ORDER.length : i;
+  };
+  return [...new Set(groups.map((g) => g.form))].sort(
+    (a, b) => rank(a) - rank(b) || a.localeCompare(b, 'ru'),
+  );
+}
+
+/** Код формы обучения в начале имени: «к/о/к », «к/з/д », «к/оз/д ». */
+const FORM_CODE = /^к\/[а-яё/]+\s+/i;
+
+/**
+ * Имя группы для кнопки. Код формы срезаем: форма уже выбрана на прошлом
+ * экране, а на узкой кнопке он съедал место и имена были не отличить.
+ */
+export function shortGroupLabel(group: string): string {
+  return displayGroup(group).replace(FORM_CODE, '');
+}
+
+/** Дольше этого имя в две колонки на телефоне обрежется. */
+const PAIR_LABEL_MAX = 14;
+const PAIRS_PER_PAGE = 24;
+const SINGLES_PER_PAGE = 12;
+
+/** Выбор формы обучения: кнопка на форму со счётчиком групп. */
+export function formKeyboard(
+  sheetIndex: number,
+  forms: { form: string; count: number }[],
+): InlineKeyboard {
+  const rows: InlineKeyboard = forms.map(({ form, count }, formIndex) => [
+    { text: `${form} · ${count}`, callback_data: `p:${sheetIndex}:0:${formIndex}` },
+  ]);
+  rows.push([{ text: '↩︎ Курсы', callback_data: 'grp' }]);
+  rows.push([TO_MENU]);
+  return rows;
+}
+
+/**
+ * Список групп курса (и формы) с постраничной прокруткой.
+ *
+ * `formIndex` — номер формы в `formsOf`; `null` — формы не выбирали (одна
+ * форма на курсе или старая кнопка), тогда он не едет в `callback_data`.
+ * `backToForms` — вести «назад» к выбору формы, а не к курсам.
+ */
 export function groupKeyboard(
-  groups: { group: string; index: number }[],
+  groups: PickerGroup[] | { group: string; index: number }[],
   sheetIndex: number,
   page: number,
   selected: string[] = [],
+  formIndex: number | null = null,
+  backToForms = false,
 ): InlineKeyboard {
-  const pages = chunk(groups, GROUPS_PER_PAGE);
+  const labelOf = (g: { group: string }) => shortGroupLabel(g.group);
+  const paired = groups.every((g) => Array.from(labelOf(g)).length <= PAIR_LABEL_MAX);
+  const perRow = paired ? 2 : 1;
+  const pages = chunk(groups, paired ? PAIRS_PER_PAGE : SINGLES_PER_PAGE);
   // Страница приходит из нажатия, а его можно подделать: «-5» или «99»
   // не должны давать пустой список со стрелками в никуда
   const shown = Math.min(Math.max(page, 0), Math.max(pages.length - 1, 0));
@@ -331,18 +390,23 @@ export function groupKeyboard(
   // человек видит, что выбрал, не выходя из списка
   const rows: InlineKeyboard = chunk(
     current.map((g) => ({
-      text: selected.includes(g.group) ? `✓ ${displayGroup(g.group)}` : displayGroup(g.group),
+      text: selected.includes(g.group) ? `✓ ${labelOf(g)}` : labelOf(g),
       callback_data: `g:${g.index}`,
     })),
-    3,
+    perRow,
   );
 
+  const at = (target: number) =>
+    `p:${sheetIndex}:${target}` + (formIndex === null ? '' : `:${formIndex}`);
+
   const nav: InlineKeyboard[number] = [];
-  if (shown > 0) nav.push({ text: '◀︎', callback_data: `p:${sheetIndex}:${shown - 1}` });
-  nav.push({ text: '↩︎ Курсы', callback_data: 'grp' });
-  if (shown + 1 < pages.length) {
-    nav.push({ text: '▶︎', callback_data: `p:${sheetIndex}:${shown + 1}` });
-  }
+  if (shown > 0) nav.push({ text: '◀︎', callback_data: at(shown - 1) });
+  nav.push(
+    backToForms
+      ? { text: '↩︎ Формы', callback_data: `s:${sheetIndex}` }
+      : { text: '↩︎ Курсы', callback_data: 'grp' },
+  );
+  if (shown + 1 < pages.length) nav.push({ text: '▶︎', callback_data: at(shown + 1) });
   rows.push(nav);
   rows.push([
     selected.length > 0
