@@ -61,12 +61,13 @@ test('formatDay кладёт пары в цитату', () => {
   assert.match(quoted.join('\n'), /\*4\\\.\* \*13:45–15:15\*/);
 });
 
-test('formatWeek делает дни раскрывающимися цитатами', () => {
+test('formatWeek: заголовок дня вне цитаты, а пары дня — в цитате', () => {
   const chunks = formatWeek([day], { group: 'ИСП/П-24-11' });
   assert.equal(chunks.length, 1);
-  assert.match(chunks[0], /\*\*>/, 'должна быть раскрывающаяся цитата');
-  assert.match(chunks[0], /\|\|$/, 'цитата должна закрываться меткой раскрытия');
-  assert.match(chunks[0], /1 пара/);
+  const lines = chunks[0].split('\n');
+  const title = lines.find((line) => line.includes('1 пара'));
+  assert.ok(title && !title.startsWith('>'), 'заголовок дня не внутри цитаты');
+  assert.ok(lines.some((line) => line.startsWith('>')), 'пары дня лежат в цитате');
 });
 
 test('formatDay не задваивает «ауд.», если сайт уже положил префикс в ячейку', () => {
@@ -119,7 +120,8 @@ test('formatWeek режет длинную неделю на части в ли�
     lessons: Array.from({ length: 5 }, (_, i) => ({
       ...day.lessons[0],
       pair: i + 1,
-      subject: 'Очень длинное название предмета '.repeat(12),
+      // Разные предметы: одинаковые пары подряд склеиваются в одну запись
+      subject: `Очень длинное название предмета ${i} `.repeat(12),
     })),
   };
   const chunks = formatWeek(Array.from({ length: 6 }, () => fat), { group: 'ИСП/П-24-11' });
